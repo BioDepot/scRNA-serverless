@@ -66,6 +66,7 @@ set -euo pipefail
 
 # AWS Configuration
 AWS_REGION="${AWS_REGION:-us-east-2}"
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 SEED_AMI_ID="${SEED_AMI_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
 ROOT_VOL_GB="${ROOT_VOL_GB:-200}"
@@ -87,12 +88,16 @@ THREADS="${THREADS:-$(nproc)}"
 CLEANUP_AWS="${CLEANUP_AWS:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
 RUN_QC="${RUN_QC:-1}"
+DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-1}"
+LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./runs}"
 
 # FASTQ Configuration
 FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-0}"
 RUN_ID="${RUN_ID:-}"
+PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-7200}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 
 # Derived values (will be set later)
 RUN_MODE=0
@@ -179,7 +184,7 @@ init_resource_names() {
     ECR_REPO_NAME="scrna-serverless-${timestamp}-${random_suffix}"
     LAMBDA_FUNCTION_NAME="scrna-map-${timestamp}-${random_suffix}"
     LAMBDA_EXECUTION_ROLE_NAME="scrna-lambda-role-${timestamp}-${random_suffix}"
-    DOCKER_IMAGE_NAME="scrna-serverless:${timestamp}"
+    DOCKER_IMAGE_NAME="scrna-serverless-${run_id_clean}"
     
     # S3 bucket names (must be lowercase, no underscores, globally unique, include region)
     INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
@@ -373,6 +378,27 @@ SSHEOF
     
     RUN_EXIT=$?
     
+    # Download results from EC2 to local machine if run succeeded
+    if [[ $RUN_EXIT -eq 0 && $DOWNLOAD_RESULTS -eq 1 ]]; then
+        log_info "Downloading results from EC2 to local machine..."
+        
+        # Create tarball on EC2 (exclude large folders)
+        ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "ubuntu@$DRIVER_INSTANCE_IP" \
+            "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
+        
+        # Download tarball to local
+        mkdir -p "$LOCAL_RESULTS_DIR/$RUN_ID"
+        scp -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "ubuntu@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
+        
+        # Extract locally
+        log_info "Extracting results to $LOCAL_RESULTS_DIR/$RUN_ID/"
+        tar -xzf "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" -C "$LOCAL_RESULTS_DIR/$RUN_ID"
+        
+        log_info "Results downloaded to: $LOCAL_RESULTS_DIR/$RUN_ID/$RUN_ID/"
+    fi
+    
     # Revoke caller IP from SG if it was authorized
     if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
         manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
@@ -397,7 +423,7 @@ log_info "Dataset: $DATASET"
 log_info "Run ID: $RUN_ID"
 
 # Auto-detect AWS account ID if not set
-if [[ -z "$AWS_ACCOUNT_ID" ]]; then
+if [[ -z "${AWS_ACCOUNT_ID:-}" ]]; then
     log_info "Auto-detecting AWS account ID..."
     AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     log_info "AWS account ID: $AWS_ACCOUNT_ID"
@@ -601,10 +627,10 @@ aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
 log_info "FASTQs uploaded"
 
 ################################################################################
-# Step 5: Build and Push Lambda Image
+# Step 5: Prepare Lambda Build Context
 ################################################################################
 
-log_info "Step 5: Building Lambda docker image..."
+log_info "Step 5: Preparing Lambda build context..."
 
 BUILD_DIR="$RUN_DIR/lambda_build"
 mkdir -p "$BUILD_DIR"
@@ -618,26 +644,7 @@ cp -r /opt/scrna-seed/index_output_transcriptome "$BUILD_DIR/"
 # Sanitize Dockerfile: remove lines that COPY AWS credentials
 sed -i '/COPY.*aws.*credentials\|COPY.*\.aws\|COPY.*AWS_/d' "$BUILD_DIR/Dockerfile"
 
-log_info "Creating Lambda ECR repository..."
-
-ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-ECR_REPO="${ECR_REGISTRY}/${ECR_REPO_NAME}"
-
-aws ecr create-repository \
-    --repository-name "$ECR_REPO_NAME" \
-    --region "$AWS_REGION" 2>/dev/null || true
-
-log_info "Logging in to ECR..."
-aws ecr get-login-password --region "$AWS_REGION" | \
-    ${DOCKER} login --username AWS --password-stdin "$ECR_REGISTRY"
-
-log_info "Building docker image..."
-${DOCKER} build -t "${ECR_REPO}:latest" "$BUILD_DIR"
-
-log_info "Pushing to ECR..."
-${DOCKER} push "${ECR_REPO}:latest"
-
-log_info "Lambda image ready"
+log_info "Build context ready (set-up-resources.py will build and push image)"
 
 ################################################################################
 # Patcher Function: Patch set-up-resources.py Lambda sizes
@@ -686,6 +693,7 @@ for mem in "${MEM_CANDIDATES[@]}"; do
             --aws_account_id "$AWS_ACCOUNT_ID" \
             --dockerfile_dir "$BUILD_DIR" \
             --docker_image_name "$DOCKER_IMAGE_NAME" \
+            --ecr_repo_name "$ECR_REPO_NAME" \
             --lambda_function_name "$LAMBDA_FUNCTION_NAME" \
             --lambda_execution_role_name "$LAMBDA_EXECUTION_ROLE_NAME" \
             --s3_bucket_name "$INPUT_FASTQ_BUCKET" \
@@ -748,83 +756,40 @@ aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME" --regio
 log_info "Lambda function ready"
 
 ################################################################################
-# Step 7: Split and Upload FASTQs to Lambda Input
+# Step 7: Process FASTQs (split, upload, wait for Lambda, download)
 ################################################################################
 
-log_info "Step 7: Splitting FASTQs and uploading txt files..."
+log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download)..."
 
-bash /home/ubuntu/scrna-repo/split_and_upload.sh \
-    "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
-    "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
-    "$INPUT_FASTQ_BUCKET" \
-    "$OUTPUT_MAP_BUCKET" \
-    "$INPUT_TXT_BUCKET" \
-    "$DATASET"
+OUTPUT_DIR="$RUN_DIR/output"
+mkdir -p "$OUTPUT_DIR"
 
-# List uploaded input files
-log_info "Waiting for txt files to be uploaded..."
-INPUT_TXT_FILES=()
-for i in {1..60}; do
-    INPUT_TXT_FILES=($(aws s3 ls "s3://$INPUT_TXT_BUCKET/$DATASET/" --region "$AWS_REGION" | awk '{print $NF}' | grep "_input.txt"))
-    if [[ ${#INPUT_TXT_FILES[@]} -gt 0 ]]; then
-        break
+# Run process_fastq.py with timeout
+log_info "Running process_fastq.py with ${PROCESS_FASTQ_TIMEOUT_SEC}s timeout..."
+
+if ! timeout "${PROCESS_FASTQ_TIMEOUT_SEC}" python3 /home/ubuntu/scrna-repo/process_fastq.py \
+    --aws_region "$AWS_REGION" \
+    --bucket_name "$INPUT_FASTQ_BUCKET" \
+    --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
+    --output_bucket_name "$OUTPUT_MAP_BUCKET" \
+    --output_dir "$OUTPUT_DIR" \
+    --polling_interval "$POLL_INTERVAL_SECONDS"; then
+    
+    TIMEOUT_EXIT=$?
+    if [[ $TIMEOUT_EXIT -eq 124 ]]; then
+        die "process_fastq.py timed out after ${PROCESS_FASTQ_TIMEOUT_SEC}s. Increase PROCESS_FASTQ_TIMEOUT_SEC or check Lambda function."
+    else
+        die "process_fastq.py failed with exit code $TIMEOUT_EXIT"
     fi
-    sleep 2
-done
-
-if [[ ${#INPUT_TXT_FILES[@]} -eq 0 ]]; then
-    die "No input txt files found after upload"
 fi
 
-log_info "Found ${#INPUT_TXT_FILES[@]} input txt files"
+log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 
 ################################################################################
-# Step 8: Wait for Lambda Outputs
+# Step 8: Combine and Quantify
 ################################################################################
 
-log_info "Step 8: Waiting for Lambda outputs..."
-
-for txt_file in "${INPUT_TXT_FILES[@]}"; do
-    # Use basename to strip any S3 prefix from txt_file
-    job_folder="$(basename "${txt_file%_input.txt}")"
-    MARKER_KEY="piscem_output/${job_folder}/output.txt"
-    
-    log_info "Waiting for output marker: $MARKER_KEY"
-    
-    # Exponential backoff polling
-    POLL_TIMEOUT=1800  # 30 minutes
-    POLL_INTERVAL=10
-    ELAPSED=0
-    
-    while [[ $ELAPSED -lt $POLL_TIMEOUT ]]; do
-        if aws s3 ls "s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY" --region "$AWS_REGION" >/dev/null 2>&1; then
-            log_info "Output marker found for $job_folder"
-            break
-        fi
-        sleep "$POLL_INTERVAL"
-        ((ELAPSED += POLL_INTERVAL))
-    done
-    
-    # Verify marker exists after timeout
-    if ! aws s3 ls "s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY" --region "$AWS_REGION" >/dev/null 2>&1; then
-        die "Timed out waiting for marker: s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY"
-    fi
-done
-
-log_info "All Lambda outputs ready"
-
-################################################################################
-# Step 9: Download and Post-process Outputs
-################################################################################
-
-log_info "Step 9: Downloading Lambda outputs..."
-
-DOWNLOAD_DIR="$RUN_DIR/s3_output_map"
-mkdir -p "$DOWNLOAD_DIR"
-
-aws s3 sync "s3://$OUTPUT_MAP_BUCKET/piscem_output/" "$DOWNLOAD_DIR/" --region "$AWS_REGION"
-
-log_info "Installing alevin-fry and radtk..."
+log_info "Step 8: Installing tools and running combine + alevin-fry quant..."
 
 bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
 bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
@@ -834,31 +799,25 @@ log_info "Running combine scripts..."
 COMBINED_DIR="$RUN_DIR/combined"
 mkdir -p "$COMBINED_DIR"
 
-bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$DOWNLOAD_DIR" "$COMBINED_DIR"
-bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$DOWNLOAD_DIR" "$COMBINED_DIR"
+bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$OUTPUT_DIR" "$COMBINED_DIR"
+bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$OUTPUT_DIR" "$COMBINED_DIR"
 
-log_info "Running alevin-fry quant..."
+log_info "Running alevin-fry quant via alevin_process.sh..."
 
 ALEVIN_OUTPUT="$RUN_DIR/alevin_output"
 mkdir -p "$ALEVIN_OUTPUT"
 
-alevin-fry generate-permit-list -d fw -k -i "$COMBINED_DIR" -o "$ALEVIN_OUTPUT"
-alevin-fry collate -t "$THREADS" -i "$ALEVIN_OUTPUT" -r "$COMBINED_DIR"
-alevin-fry quant \
-    -t "$THREADS" \
-    -i "$ALEVIN_OUTPUT" \
-    -o "$ALEVIN_OUTPUT" \
-    --tg-map /opt/scrna-seed/reference/t2g.tsv \
-    --resolution cr-like \
-    --use-mtx
+TRANSCRIPTOME_GENE_MAPPING="/opt/scrna-seed/reference/t2g.tsv"
 
-log_info "Post-processing complete"
+bash /home/ubuntu/scrna-repo/alevin_process.sh "$COMBINED_DIR" "$ALEVIN_OUTPUT" "$TRANSCRIPTOME_GENE_MAPPING"
+
+log_info "Quantification complete"
 
 ################################################################################
-# Step 10: Upload Quant Outputs
+# Step 9: Upload Quant Outputs
 ################################################################################
 
-log_info "Step 10: Uploading quantification outputs to S3..."
+log_info "Step 9: Uploading quantification outputs to S3..."
 
 aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" \
     --region "$AWS_REGION"
@@ -866,7 +825,7 @@ aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" 
 log_info "Quant outputs uploaded"
 
 ################################################################################
-# Step 11: Optional QC Analysis
+# Step 10: Optional QC Analysis
 ################################################################################
 
 if [[ $RUN_QC -eq 1 ]]; then
@@ -891,14 +850,14 @@ if [[ $RUN_QC -eq 1 ]]; then
     
     log_info "QC analysis complete"
 else
-    log_info "Step 11: Skipping QC (RUN_QC=0)"
+    log_info "Step 10: Skipping QC (RUN_QC=0)"
 fi
 
 ################################################################################
-# Step 12: Save Run Metadata
+# Step 11: Save Run Metadata
 ################################################################################
 
-log_info "Step 12: Saving run metadata..."
+log_info "Step 11: Saving run metadata..."
 
 cat > "$RUN_DIR/run.env" <<EOF
 RUN_ID=$RUN_ID
@@ -923,7 +882,7 @@ log_info "Run metadata saved to $RUN_DIR/run.env"
 # Cleanup
 ################################################################################
 
-log_info "Step 13: Cleanup..."
+log_info "Step 12: Cleanup..."
 
 if [[ $CLEANUP_AWS -eq 1 ]]; then
     log_info "Cleaning up AWS resources..."
