@@ -231,12 +231,21 @@ def preprocess_and_analyze(adata: sc.AnnData) -> sc.AnnData:
     logger.info("Computing UMAP...")
     sc.tl.umap(adata)
     
-    # Leiden clustering
+    # Leiden clustering with fallback to Louvain
     logger.info("Running Leiden clustering...")
-    sc.tl.leiden(adata, key_added='leiden', flavor='igraph')
-    
-    cluster_count = adata.obs['leiden'].nunique()
-    logger.info(f"Found {cluster_count} Leiden clusters")
+    try:
+        sc.tl.leiden(adata, key_added='leiden', flavor='igraph')
+        cluster_count = adata.obs['leiden'].nunique()
+        logger.info(f"Found {cluster_count} Leiden clusters")
+    except Exception as e:
+        logger.warning(f"Leiden clustering failed ({str(e)[:50]}...), falling back to Louvain")
+        try:
+            sc.tl.louvain(adata, key_added='leiden')
+            cluster_count = adata.obs['leiden'].nunique()
+            logger.info(f"Found {cluster_count} Louvain clusters")
+        except Exception as e2:
+            logger.warning(f"Louvain clustering also failed ({str(e2)[:50]}...). Skipping clustering, will use other metadata for plots.")
+            adata.obs['leiden'] = 'unclustered'
     
     return adata
 
@@ -254,44 +263,56 @@ def generate_plots(adata: sc.AnnData, outdir: Path) -> None:
     # Set style
     sc.set_figure_params(dpi=100, facecolor='white')
     
-    # UMAP with Leiden clusters
+    # UMAP with clustering (leiden if available, else all same color)
     logger.info("Generating UMAP plot...")
     fig = plt.figure(figsize=(10, 8))
-    sc.pl.umap(adata, color='leiden', legend_loc='on data', title='UMAP with Leiden Clusters', 
-               show=False, size=30)
-    plt.tight_layout()
-    umap_path = outdir / 'umap_leiden.png'
-    plt.savefig(umap_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved: {umap_path}")
+    
+    color_by = 'leiden' if 'leiden' in adata.obs else None
+    title = 'UMAP with Leiden Clusters' if color_by else 'UMAP (no clustering)'
+    
+    try:
+        sc.pl.umap(adata, color=color_by, legend_loc='on data' if color_by else None, 
+                   title=title, show=False, size=30)
+        plt.tight_layout()
+        umap_path = outdir / 'umap_leiden.png'
+        plt.savefig(umap_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved: {umap_path}")
+    except Exception as e:
+        logger.warning(f"UMAP plot generation failed ({str(e)[:50]}...). Skipping.")
+        plt.close('all')
     
     # QC metrics violin plot
     logger.info("Generating QC violin plot...")
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    # n_counts violin
-    sns.violinplot(y=adata.obs['total_counts'], ax=axes[0])
-    axes[0].set_ylabel('Total Counts')
-    axes[0].set_title('UMI per Cell')
-    
-    # n_genes violin
-    sns.violinplot(y=adata.obs['n_genes_by_counts'], ax=axes[1])
-    axes[1].set_ylabel('Genes Detected')
-    axes[1].set_title('Genes per Cell')
-    
-    # MT% violin (if available)
-    if 'pct_mt' in adata.obs:
-        sns.violinplot(y=adata.obs['pct_mt'], ax=axes[2])
-        axes[2].set_ylabel('MT%')
-        axes[2].set_title('Mitochondrial %')
-    else:
-        axes[2].text(0.5, 0.5, 'No MT data', ha='center', va='center')
-    
-    plt.tight_layout()
-    qc_path = outdir / 'qc_violin.png'
-    plt.savefig(qc_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    logger.info(f"Saved: {qc_path}")
+    try:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # n_counts violin
+        sns.violinplot(y=adata.obs['total_counts'], ax=axes[0])
+        axes[0].set_ylabel('Total Counts')
+        axes[0].set_title('UMI per Cell')
+        
+        # n_genes violin
+        sns.violinplot(y=adata.obs['n_genes_by_counts'], ax=axes[1])
+        axes[1].set_ylabel('Genes Detected')
+        axes[1].set_title('Genes per Cell')
+        
+        # MT% violin (if available)
+        if 'pct_mt' in adata.obs:
+            sns.violinplot(y=adata.obs['pct_mt'], ax=axes[2])
+            axes[2].set_ylabel('MT%')
+            axes[2].set_title('Mitochondrial %')
+        else:
+            axes[2].text(0.5, 0.5, 'No MT data', ha='center', va='center')
+        
+        plt.tight_layout()
+        qc_path = outdir / 'qc_violin.png'
+        plt.savefig(qc_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved: {qc_path}")
+    except Exception as e:
+        logger.warning(f"QC violin plot generation failed ({str(e)[:50]}...). Skipping.")
+        plt.close('all')
 
 
 def main():

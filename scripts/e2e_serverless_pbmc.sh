@@ -14,7 +14,6 @@
 #
 # ENVIRONMENT VARIABLES (set before calling):
 #   SEED_AMI_ID            Required in driver mode. AMI with pre-installed reference data.
-#   AWS_ACCOUNT_ID         AWS account ID (auto-detected in run mode via AWS CLI; required in driver mode if not set)
 #   AWS_REGION             AWS region (default: us-east-2)
 #   INSTANCE_TYPE          EC2 instance type (default: m6id.16xlarge)
 #   ROOT_VOL_GB            EBS root volume size in GB (default: 200)
@@ -22,6 +21,8 @@
 #   KEY_PEM_PATH           Required in driver mode. Path to .pem file for SSH.
 #   SUBNET_ID              Required in driver mode. VPC subnet ID.
 #   SG_ID                  Required in driver mode. Security group ID.
+#   DRIVER_INSTANCE_ID     Optional: reuse existing EC2 instance (skip launch).
+#   AUTO_SSH_INGRESS       Auto-authorize caller IP in SG for SSH (default: 1)
 #
 #   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240)
 #   LAMBDA_EPHEMERAL_MB    Lambda /tmp ephemeral storage (default: 10240)
@@ -32,9 +33,9 @@
 #   RUN_QC                 Run QC analysis on outputs (default: 1)
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
-#   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar (NOT landing page).
+#   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar. Auto-set by DATASET if empty.
 #   WRITE_H5AD             Save h5ad output from QC (default: 0). Only matters if RUN_QC=1.
-#   RUN_ID                 Run identifier (auto-generated if empty)
+#   RUN_ID                 Run identifier (auto-generated if empty). Set to reuse prior resources.
 #
 # NOTE ON S3 BUCKET NAMES:
 #   S3 bucket names must be lowercase with no underscores. Auto-generated bucket names use:
@@ -54,7 +55,6 @@ set -euo pipefail
 ################################################################################
 
 # AWS Configuration
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
 SEED_AMI_ID="${SEED_AMI_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
@@ -63,6 +63,8 @@ KEY_NAME="${KEY_NAME:-}"
 KEY_PEM_PATH="${KEY_PEM_PATH:-}"
 SUBNET_ID="${SUBNET_ID:-}"
 SG_ID="${SG_ID:-}"
+DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
+AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
 
 # Lambda Configuration
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
@@ -110,6 +112,43 @@ log_error() {
 die() {
     log_error "$@"
     exit 1
+}
+
+get_caller_public_ip() {
+    # Detect caller's public IP for security group ingress
+    curl -s -m 5 http://checkip.amazonaws.com | tr -d ' \n' 2>/dev/null || echo ""
+}
+
+manage_sg_ingress() {
+    local action=$1  # "authorize" or "revoke"
+    local caller_ip=$2
+    
+    if [[ -z "$caller_ip" ]] || [[ "$caller_ip" == "127.0.0.1" ]]; then
+        log_info "Skipping SG ingress for local caller (cannot auto-auth localhost)"
+        return 0
+    fi
+    
+    local cidr="${caller_ip}/32"
+    
+    log_info "${action^} SSH (tcp/22) ingress for ${cidr}..."
+    
+    if [[ "$action" == "authorize" ]]; then
+        # Authorize: ignore if already exists
+        aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$cidr" 2>/dev/null && log_info "Authorized SG ingress" || log_info "SG ingress already exists or error (continuing)"
+    elif [[ "$action" == "revoke" ]]; then
+        # Revoke: ignore if doesn't exist
+        aws ec2 revoke-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$cidr" 2>/dev/null && log_info "Revoked SG ingress" || log_info "SG ingress doesn't exist or error (continuing)"
+    fi
 }
 
 ################################################################################
@@ -179,11 +218,42 @@ if [[ $RUN_MODE -eq 0 ]]; then
     [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set in driver mode"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set in driver mode"
-    [[ -n "$AWS_ACCOUNT_ID" ]] || die "AWS_ACCOUNT_ID must be set in driver mode (will be auto-detected in run mode)"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
     
-    log_info "Launching EC2 instance from AMI $SEED_AMI_ID..."
-    DRIVER_INSTANCE_ID=$(aws ec2 run-instances \
+    # Resume logic: check for existing instance
+    if [[ -z "$DRIVER_INSTANCE_ID" ]]; then
+        log_info "Checking for existing instance with tag scrna-e2e-$RUN_ID..."
+        DRIVER_INSTANCE_ID=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Name,Values=scrna-e2e-$RUN_ID" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text 2>/dev/null || echo "")
+    fi
+    
+    if [[ -n "$DRIVER_INSTANCE_ID" && "$DRIVER_INSTANCE_ID" != "None" ]]; then
+        log_info "Found existing instance: $DRIVER_INSTANCE_ID"
+        
+        # Get instance state
+        INSTANCE_STATE=$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --instance-ids "$DRIVER_INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text 2>/dev/null || echo "")
+        
+        log_info "Instance state: $INSTANCE_STATE"
+        
+        # If stopped, start it
+        if [[ "$INSTANCE_STATE" == "stopped" ]]; then
+            log_info "Starting stopped instance..."
+            aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null
+            log_info "Waiting for instance to reach running state..."
+            aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
+        elif [[ "$INSTANCE_STATE" != "running" && "$INSTANCE_STATE" != "pending" ]]; then
+            die "Instance is in state: $INSTANCE_STATE. Cannot resume."
+        fi
+    else
+        log_info "Launching new EC2 instance from AMI $SEED_AMI_ID..."
+        DRIVER_INSTANCE_ID=$(aws ec2 run-instances \
         --region "$AWS_REGION" \
         --image-id "$SEED_AMI_ID" \
         --instance-type "$INSTANCE_TYPE" \
@@ -195,10 +265,11 @@ if [[ $RUN_MODE -eq 0 ]]; then
         --query "Instances[0].InstanceId" \
         --output text)
     
-    log_info "Instance launched: $DRIVER_INSTANCE_ID"
-    
-    log_info "Waiting for instance to reach running state..."
-    aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
+        log_info "Instance launched: $DRIVER_INSTANCE_ID"
+        
+        log_info "Waiting for instance to reach running state..."
+        aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
+    fi
     
     log_info "Waiting for public IP..."
     for i in {1..20}; do
@@ -219,6 +290,17 @@ if [[ $RUN_MODE -eq 0 ]]; then
     fi
     
     log_info "Instance IP: $DRIVER_INSTANCE_IP"
+    
+    # Auto-authorize caller IP for SSH
+    if [[ $AUTO_SSH_INGRESS -eq 1 ]]; then
+        CALLER_IP=$(get_caller_public_ip)
+        if [[ -n "$CALLER_IP" ]]; then
+            manage_sg_ingress authorize "$CALLER_IP"
+            CALLER_IP_TO_REVOKE="$CALLER_IP"
+        else
+            log_info "Could not detect caller IP; skipping SG ingress"
+        fi
+    fi
     
     log_info "Waiting for SSH readiness..."
     sleep 20
@@ -247,9 +329,9 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "Running pipeline in --run mode on instance..."
     
     # Export environment variables and run --run mode
+    # Note: AWS_ACCOUNT_ID is NOT exported; it will be auto-detected in run mode
     ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         "ubuntu@$DRIVER_INSTANCE_IP" <<SSHEOF
-export AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID
 export AWS_REGION=$AWS_REGION
 export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
@@ -266,6 +348,11 @@ bash scripts/e2e_serverless_pbmc.sh $DATASET --run
 SSHEOF
     
     RUN_EXIT=$?
+    
+    # Revoke caller IP from SG if it was authorized
+    if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
+        manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
+    fi
     
     if [[ $TERMINATE_DRIVER_ON_EXIT -eq 1 ]]; then
         log_info "Terminating driver instance $DRIVER_INSTANCE_ID..."
@@ -359,19 +446,46 @@ log_info "Step 1: Preparing FASTQs..."
 FASTQ_DIR="$RUN_DIR/fastq"
 mkdir -p "$FASTQ_DIR"
 
+# Auto-set FASTQ_TAR_URL by dataset if not provided
+if [[ -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
+    case "$DATASET" in
+        pbmc1k)
+            FASTQ_TAR_URL="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar"
+            log_info "Auto-set FASTQ_TAR_URL for pbmc1k"
+            ;;
+        pbmc10k)
+            FASTQ_TAR_URL="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_10k_v3/pbmc_10k_v3_fastqs.tar"
+            log_info "Auto-set FASTQ_TAR_URL for pbmc10k"
+            ;;
+        *)
+            die "Unknown dataset: $DATASET"
+            ;;
+    esac
+fi
+
 # Obtain FASTQ tar
 if [[ -n "$FASTQ_TAR_PATH" ]]; then
     log_info "Extracting FASTQ tar from: $FASTQ_TAR_PATH"
-    tar -xzf "$FASTQ_TAR_PATH" -C "$FASTQ_DIR"
+    # Detect format and extract accordingly
+    if [[ "$FASTQ_TAR_PATH" =~ \.(tar\.gz|tgz)$ ]]; then
+        tar -xzf "$FASTQ_TAR_PATH" -C "$FASTQ_DIR"
+    else
+        tar -xf "$FASTQ_TAR_PATH" -C "$FASTQ_DIR"
+    fi
 elif [[ -n "$FASTQ_TAR_URL" ]]; then
     log_info "Downloading FASTQ tar from: $FASTQ_TAR_URL"
     # Validate URL is not a landing page (reject common patterns)
     if [[ "$FASTQ_TAR_URL" =~ (10xgenomics\.com|support\.10xgenomics\.com) ]]; then
-        if [[ ! "$FASTQ_TAR_URL" =~ \.tar\.gz$ ]]; then
-            die "FASTQ_TAR_URL must be a direct .tar.gz URL, not a landing page: $FASTQ_TAR_URL"
+        if [[ ! "$FASTQ_TAR_URL" =~ \.(tar|tar\.gz|tgz)$ ]]; then
+            die "FASTQ_TAR_URL must be a direct tar/tar.gz URL, not a landing page: $FASTQ_TAR_URL"
         fi
     fi
-    curl -L "$FASTQ_TAR_URL" | tar -xzf - -C "$FASTQ_DIR"
+    # Stream and extract: detect format and pipe accordingly
+    if [[ "$FASTQ_TAR_URL" =~ \.(tar\.gz|tgz)$ ]]; then
+        curl -L "$FASTQ_TAR_URL" | tar -xzf - -C "$FASTQ_DIR"
+    else
+        curl -L "$FASTQ_TAR_URL" | tar -xf - -C "$FASTQ_DIR"
+    fi
 else
     die "Either FASTQ_TAR_PATH or FASTQ_TAR_URL must be provided"
 fi
@@ -627,7 +741,7 @@ if [[ $RUN_QC -eq 1 ]]; then
     python3 -m venv "$QC_DIR/venv"
     source "$QC_DIR/venv/bin/activate"
     
-    pip install -q scanpy matplotlib seaborn
+    pip install -q scanpy matplotlib seaborn leidenalg igraph
     
     QC_ARGS=("$ALEVIN_OUTPUT" "--outdir" "$QC_DIR/out")
     if [[ $WRITE_H5AD -eq 1 ]]; then
@@ -654,6 +768,7 @@ RUN_ID=$RUN_ID
 DATASET=$DATASET
 AWS_REGION=$AWS_REGION
 AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID
+DRIVER_INSTANCE_ID=${DRIVER_INSTANCE_ID:-}
 INPUT_FASTQ_BUCKET=$INPUT_FASTQ_BUCKET
 INPUT_TXT_BUCKET=$INPUT_TXT_BUCKET
 OUTPUT_MAP_BUCKET=$OUTPUT_MAP_BUCKET
