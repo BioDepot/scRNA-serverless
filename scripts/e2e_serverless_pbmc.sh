@@ -61,22 +61,38 @@
 set -euo pipefail
 
 ################################################################################
+# User Configuration (Edit Once)
+# Set these defaults once, then override via env vars if needed
+################################################################################
+
+DEFAULT_AWS_REGION="us-east-2"
+DEFAULT_KEY_NAME=""
+DEFAULT_KEY_PEM_PATH=""
+DEFAULT_EC2_INSTANCE_PROFILE_NAME=""
+DEFAULT_SEED_AMI_ID=""           # Optional: set if you have a pre-built seed AMI
+SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name
+AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
+AUTO_CREATE_SG=1                   # Auto-create temporary security group
+AUTO_DETECT_SEED_AMI=1             # Auto-detect seed AMI by name prefix
+
+################################################################################
 # Default Configuration
 ################################################################################
 
 # AWS Configuration
-AWS_REGION="${AWS_REGION:-us-east-2}"
+AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
-SEED_AMI_ID="${SEED_AMI_ID:-}"
+SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
 ROOT_VOL_GB="${ROOT_VOL_GB:-200}"
-KEY_NAME="${KEY_NAME:-}"
-KEY_PEM_PATH="${KEY_PEM_PATH:-}"
+KEY_NAME="${KEY_NAME:-$DEFAULT_KEY_NAME}"
+KEY_PEM_PATH="${KEY_PEM_PATH:-$DEFAULT_KEY_PEM_PATH}"
 SUBNET_ID="${SUBNET_ID:-}"
 SG_ID="${SG_ID:-}"
 DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
-EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-}"
+EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PROFILE_NAME}"
 AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
+CREATED_SG_ID=""                  # Track SG created by this script for cleanup
 
 # Lambda Configuration
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
@@ -137,6 +153,18 @@ need_cmd() {
 get_caller_public_ip() {
     # Detect caller's public IP for security group ingress
     curl -s -m 5 http://checkip.amazonaws.com | tr -d ' \n' 2>/dev/null || echo ""
+}
+
+normalize_pem_path() {
+    # On Windows Git Bash, convert D:\path\to\key.pem to /d/path/to/key.pem
+    local pem_path="$1"
+    if [[ "$pem_path" =~ ^[A-Z]:\\(.*)$ ]]; then
+        # D:\path\to\file.pem -> /d/path/to/file.pem
+        local drive="${pem_path:0:1}"
+        local rest="${pem_path:2}"
+        pem_path="/${drive,,}${rest//\\/\/}"
+    fi
+    echo "$pem_path"
 }
 
 manage_sg_ingress() {
@@ -232,12 +260,106 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "Dataset: $DATASET"
     log_info "Run ID: $RUN_ID"
     
+    # Normalize KEY_PEM_PATH for Windows Git Bash
+    KEY_PEM_PATH=$(normalize_pem_path "$KEY_PEM_PATH")
+    
+    # Auto-detect seed AMI by name prefix if not set
+    if [[ -z "$SEED_AMI_ID" && $AUTO_DETECT_SEED_AMI -eq 1 ]]; then
+        log_info "Auto-detecting seed AMI with prefix: $SEED_AMI_NAME_PREFIX"
+        SEED_AMI_ID=$(aws ec2 describe-images \
+            --region "$AWS_REGION" \
+            --owners self \
+            --filters "Name=name,Values=${SEED_AMI_NAME_PREFIX}*" "Name=state,Values=available" \
+            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$SEED_AMI_ID" || "$SEED_AMI_ID" == "None" ]]; then
+            log_error "No seed AMI found with prefix: $SEED_AMI_NAME_PREFIX"
+            log_error "Options:"
+            log_error "  1. Set SEED_AMI_ID explicitly (e.g., SEED_AMI_ID=ami-xxxxx)"
+            log_error "  2. Set DEFAULT_SEED_AMI_ID in this script"
+            log_error "  3. Build and share seed AMI: bash scripts/build_seed_ami.sh"
+            log_error "  4. Disable auto-detect: AUTO_DETECT_SEED_AMI=0 and set SEED_AMI_ID manually"
+            die "Seed AMI not found and AUTO_DETECT_SEED_AMI=1"
+        fi
+        log_info "Found seed AMI: $SEED_AMI_ID"
+    fi
+    
+    # Auto-pick subnet from default VPC if not set
+    if [[ -z "$SUBNET_ID" && $AUTO_PICK_SUBNET -eq 1 ]]; then
+        log_info "Auto-picking subnet from default VPC..."
+        
+        # Find default VPC
+        VPC_ID=$(aws ec2 describe-vpcs \
+            --region "$AWS_REGION" \
+            --filters "Name=isDefault,Values=true" \
+            --query 'Vpcs[0].VpcId' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+            die "No default VPC found in region $AWS_REGION. Set SUBNET_ID explicitly or disable AUTO_PICK_SUBNET=0."
+        fi
+        
+        # Pick subnet with most available IPs
+        SUBNET_ID=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets | sort_by(@, &AvailableIpAddressCount) | [-1].SubnetId' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
+            die "No subnets found in default VPC $VPC_ID. Set SUBNET_ID explicitly."
+        fi
+        
+        log_info "Auto-selected subnet: $SUBNET_ID (VPC: $VPC_ID)"
+    fi
+    
+    # Auto-create temporary security group if not set
+    if [[ -z "$SG_ID" && $AUTO_CREATE_SG -eq 1 ]]; then
+        log_info "Auto-creating temporary security group..."
+        
+        # Get VPC ID (already found above, or find it now)
+        if [[ -z "${VPC_ID:-}" ]]; then
+            VPC_ID=$(aws ec2 describe-vpcs \
+                --region "$AWS_REGION" \
+                --filters "Name=isDefault,Values=true" \
+                --query 'Vpcs[0].VpcId' \
+                --output text 2>/dev/null || echo "")
+        fi
+        
+        if [[ -z "$VPC_ID" || "$VPC_ID" == "None" ]]; then
+            die "Cannot create SG: no default VPC found."
+        fi
+        
+        # Create SG
+        SG_ID=$(aws ec2 create-security-group \
+            --region "$AWS_REGION" \
+            --group-name "scrna-driver-ssh-$RUN_ID" \
+            --description "scrna serverless driver ssh (temporary)" \
+            --vpc-id "$VPC_ID" \
+            --query 'GroupId' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+            die "Failed to create security group."
+        fi
+        
+        CREATED_SG_ID="$SG_ID"
+        log_info "Created temporary security group: $SG_ID"
+        
+        # Tag it
+        aws ec2 create-tags \
+            --region "$AWS_REGION" \
+            --resources "$SG_ID" \
+            --tags "Key=Name,Value=scrna-driver-ssh-$RUN_ID" 2>/dev/null || true
+    fi
+    
     # Validate driver mode requirements
-    [[ -n "$SEED_AMI_ID" ]] || die "SEED_AMI_ID must be set in driver mode"
+    [[ -n "$SEED_AMI_ID" ]] || die "SEED_AMI_ID must be set (use AUTO_DETECT_SEED_AMI=1 or set it explicitly)"
     [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
     [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
-    [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set in driver mode"
-    [[ -n "$SG_ID" ]] || die "SG_ID must be set in driver mode"
+    [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set (use AUTO_PICK_SUBNET=1 or set it explicitly)"
+    [[ -n "$SG_ID" ]] || die "SG_ID must be set (use AUTO_CREATE_SG=1 or set it explicitly)"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
     [[ -n "$EC2_INSTANCE_PROFILE_NAME" ]] || die "EC2_INSTANCE_PROFILE_NAME is required for reviewer-proof execution (no credentials baked into AMI)."
     
@@ -402,6 +524,14 @@ SSHEOF
     # Revoke caller IP from SG if it was authorized
     if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
         manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
+    fi
+    
+    # Delete temporary SG if we created it
+    if [[ -n "$CREATED_SG_ID" ]]; then
+        log_info "Deleting temporary security group: $CREATED_SG_ID"
+        # Wait a moment for any pending operations
+        sleep 5
+        aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
     fi
     
     if [[ $TERMINATE_DRIVER_ON_EXIT -eq 1 ]]; then
