@@ -32,7 +32,10 @@
 #   AUTO_SSH_INGRESS       Auto-authorize caller IP in SG for SSH (default: 1)
 #
 #   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240)
+#                          Paper uses 10240MB, but some accounts are capped (e.g., 3008MB).
+#                          Set explicitly or rely on automatic fallback.
 #   LAMBDA_EPHEMERAL_MB    Lambda /tmp ephemeral storage (default: 10240)
+#                          Some accounts limit this. Script will fallback if needed.
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
 #   THREADS                Number of CPU threads (default: nproc)
 #   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
@@ -656,12 +659,40 @@ python3 /home/ubuntu/scrna-repo/set-up-resources.py \
 
 log_info "Updating Lambda function configuration..."
 
-aws lambda update-function-configuration \
-    --function-name "$LAMBDA_FUNCTION_NAME" \
-    --region "$AWS_REGION" \
-    --memory-size "$LAMBDA_MEMORY_MB" \
-    --timeout "$LAMBDA_TIMEOUT_SEC" \
-    --ephemeral-storage Size="$LAMBDA_EPHEMERAL_MB" >/dev/null 2>&1 || true
+# Try memory/ephemeral combinations until one succeeds
+MEM_CANDIDATES=("$LAMBDA_MEMORY_MB" 3008 2048 1536 1024 512)
+EPH_CANDIDATES=("$LAMBDA_EPHEMERAL_MB" 10240 512)
+
+CONFIG_SUCCESS=0
+for mem in "${MEM_CANDIDATES[@]}"; do
+    for eph in "${EPH_CANDIDATES[@]}"; do
+        log_info "Attempting Lambda config: memory=${mem}MB, ephemeral=${eph}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
+        
+        if aws lambda update-function-configuration \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --region "$AWS_REGION" \
+            --memory-size "$mem" \
+            --timeout "$LAMBDA_TIMEOUT_SEC" \
+            --ephemeral-storage Size="$eph" 2>&1; then
+            
+            LAMBDA_MEMORY_MB="$mem"
+            LAMBDA_EPHEMERAL_MB="$eph"
+            log_info "Lambda configured: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
+            CONFIG_SUCCESS=1
+            break 2
+        else
+            log_info "Failed with memory=${mem}MB, ephemeral=${eph}MB (trying next combination...)"
+        fi
+    done
+done
+
+if [[ $CONFIG_SUCCESS -eq 0 ]]; then
+    die "Unable to configure Lambda. Set LAMBDA_MEMORY_MB/LAMBDA_EPHEMERAL_MB to values allowed in your account. Example: LAMBDA_MEMORY_MB=3008 LAMBDA_EPHEMERAL_MB=512"
+fi
+
+# Wait for Lambda function update to complete
+log_info "Waiting for Lambda function update to complete..."
+aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION"
 
 log_info "Lambda function ready"
 
