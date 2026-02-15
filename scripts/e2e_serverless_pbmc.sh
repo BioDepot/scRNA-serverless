@@ -97,7 +97,7 @@ FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-0}"
 RUN_ID="${RUN_ID:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-7200}"
-POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 
 # Derived values (will be set later)
 RUN_MODE=0
@@ -647,12 +647,20 @@ sed -i '/COPY.*aws.*credentials\|COPY.*\.aws\|COPY.*AWS_/d' "$BUILD_DIR/Dockerfi
 log_info "Build context ready (set-up-resources.py will build and push image)"
 
 ################################################################################
-# Patcher Function: Patch set-up-resources.py Lambda sizes
+# Helper: Create patched copies of scripts (avoid editing tracked files)
 ################################################################################
 
+# Create temp directory for patched scripts
+TMP_SCRIPTS_DIR="$RUN_DIR/tmp_scripts"
+mkdir -p "$TMP_SCRIPTS_DIR"
+
+# Copy set-up-resources.py to temp location
+cp /home/ubuntu/scrna-repo/set-up-resources.py "$TMP_SCRIPTS_DIR/set-up-resources.py"
+SETUP_RESOURCES_SCRIPT="$TMP_SCRIPTS_DIR/set-up-resources.py"
+
 patch_set_up_resources_lambda_sizes() {
-    local mem="$1" eph="$2" path="/home/ubuntu/scrna-repo/set-up-resources.py"
-    python3 - "$path" "$mem" "$eph" <<'PY'
+    local mem="$1" eph="$2"
+    python3 - "$SETUP_RESOURCES_SCRIPT" "$mem" "$eph" <<'PY'
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 mem = sys.argv[2]
@@ -688,7 +696,7 @@ for mem in "${MEM_CANDIDATES[@]}"; do
             PYTHON_CMD="sudo -E python3"
         fi
         
-        if $PYTHON_CMD /home/ubuntu/scrna-repo/set-up-resources.py \
+        if $PYTHON_CMD "$SETUP_RESOURCES_SCRIPT" \
             --aws_region "$AWS_REGION" \
             --aws_account_id "$AWS_ACCOUNT_ID" \
             --dockerfile_dir "$BUILD_DIR" \
@@ -764,10 +772,28 @@ log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download).
 OUTPUT_DIR="$RUN_DIR/output"
 mkdir -p "$OUTPUT_DIR"
 
-# Run process_fastq.py with timeout
+# Create patched copy of process_fastq.py for dynamic region
+TMP_PF_DIR="$RUN_DIR/tmp_process_fastq"
+mkdir -p "$TMP_PF_DIR"
+cp /home/ubuntu/scrna-repo/process_fastq.py "$TMP_PF_DIR/"
+cp /home/ubuntu/scrna-repo/split_and_upload.sh "$TMP_PF_DIR/"
+
+# Patch process_fastq.py to use dynamic region instead of hardcoded us-east-2
+python3 - "$TMP_PF_DIR/process_fastq.py" "$AWS_REGION" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+region = sys.argv[2]
+txt = p.read_text()
+# Replace hardcoded region_name="us-east-2" with dynamic region
+txt = re.sub(r'region_name\s*=\s*["\']us-east-2["\']', f'region_name="{region}"', txt)
+p.write_text(txt)
+PY
+
+# Run process_fastq.py with timeout from temp directory
 log_info "Running process_fastq.py with ${PROCESS_FASTQ_TIMEOUT_SEC}s timeout..."
 
-if ! timeout "${PROCESS_FASTQ_TIMEOUT_SEC}" python3 /home/ubuntu/scrna-repo/process_fastq.py \
+cd "$TMP_PF_DIR"
+if ! timeout "${PROCESS_FASTQ_TIMEOUT_SEC}" python3 "$TMP_PF_DIR/process_fastq.py" \
     --aws_region "$AWS_REGION" \
     --bucket_name "$INPUT_FASTQ_BUCKET" \
     --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
@@ -782,6 +808,7 @@ if ! timeout "${PROCESS_FASTQ_TIMEOUT_SEC}" python3 /home/ubuntu/scrna-repo/proc
         die "process_fastq.py failed with exit code $TIMEOUT_EXIT"
     fi
 fi
+cd "$RUN_DIR"
 
 log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 
@@ -790,6 +817,9 @@ log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 ################################################################################
 
 log_info "Step 8: Installing tools and running combine + alevin-fry quant..."
+
+# Increase file descriptor limit for combine scripts
+ulimit -n 2048
 
 bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
 bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
