@@ -14,6 +14,7 @@
 #
 # ENVIRONMENT VARIABLES (set before calling):
 #   SEED_AMI_ID            Required in driver mode. AMI with pre-installed reference data.
+#   AWS_ACCOUNT_ID         AWS account ID (auto-detected in run mode via AWS CLI; required in driver mode if not set)
 #   AWS_REGION             AWS region (default: us-east-2)
 #   INSTANCE_TYPE          EC2 instance type (default: m6id.16xlarge)
 #   ROOT_VOL_GB            EBS root volume size in GB (default: 200)
@@ -28,11 +29,17 @@
 #   THREADS                Number of CPU threads (default: nproc)
 #   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
+#   RUN_QC                 Run QC analysis on outputs (default: 1)
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
 #   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar (NOT landing page).
-#   WRITE_H5AD             Save h5ad output from QC (default: 0)
+#   WRITE_H5AD             Save h5ad output from QC (default: 0). Only matters if RUN_QC=1.
 #   RUN_ID                 Run identifier (auto-generated if empty)
+#
+# NOTE ON S3 BUCKET NAMES:
+#   S3 bucket names must be lowercase with no underscores. Auto-generated bucket names use:
+#     scrna-{input|output}-{type}-{ACCOUNT_ID}-{RUN_ID_CLEAN}
+#   where RUN_ID_CLEAN removes underscores and uses hyphens in timestamps.
 #
 # FASTQ_TAR_URL IMPORTANT:
 #   Must be a direct downloadable URL to a tar file. 
@@ -47,7 +54,7 @@ set -euo pipefail
 ################################################################################
 
 # AWS Configuration
-AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:?ERROR: AWS_ACCOUNT_ID must be set}"
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 AWS_REGION="${AWS_REGION:-us-east-2}"
 SEED_AMI_ID="${SEED_AMI_ID:-}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
@@ -66,6 +73,7 @@ LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
 THREADS="${THREADS:-$(nproc)}"
 CLEANUP_AWS="${CLEANUP_AWS:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
+RUN_QC="${RUN_QC:-1}"
 
 # FASTQ Configuration
 FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
@@ -78,6 +86,14 @@ RUN_MODE=0
 DATASET=""
 DRIVER_INSTANCE_ID=""
 DRIVER_INSTANCE_IP=""
+ECR_REPO_NAME=""
+LAMBDA_FUNCTION_NAME=""
+LAMBDA_EXECUTION_ROLE_NAME=""
+DOCKER_IMAGE_NAME=""
+INPUT_FASTQ_BUCKET=""
+INPUT_TXT_BUCKET=""
+OUTPUT_MAP_BUCKET=""
+OUTPUT_QUANT_BUCKET=""
 
 ################################################################################
 # Helper Functions
@@ -94,6 +110,28 @@ log_error() {
 die() {
     log_error "$@"
     exit 1
+}
+
+################################################################################
+# Initialize Resource Names (called after AWS_ACCOUNT_ID is known)
+################################################################################
+
+init_resource_names() {
+    local timestamp=$(date +%Y-%m-%d-%H-%M-%S)
+    local random_suffix=$(head -c 4 /dev/urandom | xxd -p)
+    local run_id_clean="${RUN_ID//_/-}"  # Replace underscores with hyphens for S3 compatibility
+    
+    # ECR and Lambda names
+    ECR_REPO_NAME="scrna-serverless-${timestamp}-${random_suffix}"
+    LAMBDA_FUNCTION_NAME="scrna-map-${timestamp}-${random_suffix}"
+    LAMBDA_EXECUTION_ROLE_NAME="scrna-lambda-role-${timestamp}-${random_suffix}"
+    DOCKER_IMAGE_NAME="scrna-serverless:${timestamp}"
+    
+    # S3 bucket names (must be lowercase, no underscores, globally unique)
+    INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${run_id_clean}"
+    INPUT_TXT_BUCKET="scrna-input-txt-${AWS_ACCOUNT_ID}-${run_id_clean}"
+    OUTPUT_MAP_BUCKET="scrna-output-map-${AWS_ACCOUNT_ID}-${run_id_clean}"
+    OUTPUT_QUANT_BUCKET="scrna-output-quant-${AWS_ACCOUNT_ID}-${run_id_clean}"
 }
 
 ################################################################################
@@ -119,26 +157,12 @@ if [[ $# -gt 1 && "$2" == "--run" ]]; then
 fi
 
 ################################################################################
-# Generate Run ID and Resource Names
+# Generate Run ID
 ################################################################################
 
 if [[ -z "$RUN_ID" ]]; then
     RUN_ID="pbmc-$(date +%s)-$(head -c 4 /dev/urandom | xxd -p)"
 fi
-
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-UNIQUE_SUFFIX="${TIMESTAMP}_${RANDOM}"
-
-# Resource names (must be globally unique)
-ECR_REPO_NAME="scrna-serverless-${UNIQUE_SUFFIX}"
-LAMBDA_FUNCTION_NAME="scrna-map-${UNIQUE_SUFFIX}"
-EVENTBRIDGE_RULE_NAME="scrna-rule-${UNIQUE_SUFFIX}"
-
-# S3 bucket names (must be lowercase, globally unique)
-INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${UNIQUE_SUFFIX,,}"
-INPUT_TXT_BUCKET="scrna-input-txt-${AWS_ACCOUNT_ID}-${UNIQUE_SUFFIX,,}"
-OUTPUT_MAP_BUCKET="scrna-output-map-${AWS_ACCOUNT_ID}-${UNIQUE_SUFFIX,,}"
-OUTPUT_QUANT_BUCKET="scrna-output-quant-${AWS_ACCOUNT_ID}-${UNIQUE_SUFFIX,,}"
 
 ################################################################################
 # Mode: Driver (Launch EC2 and run pipeline)
@@ -155,6 +179,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
     [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set in driver mode"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set in driver mode"
+    [[ -n "$AWS_ACCOUNT_ID" ]] || die "AWS_ACCOUNT_ID must be set in driver mode (will be auto-detected in run mode)"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
     
     log_info "Launching EC2 instance from AMI $SEED_AMI_ID..."
@@ -259,6 +284,46 @@ fi
 log_info "======== E2E Serverless scRNA Pipeline (RUN MODE) ========"
 log_info "Dataset: $DATASET"
 log_info "Run ID: $RUN_ID"
+
+# Auto-detect AWS account ID if not set
+if [[ -z "$AWS_ACCOUNT_ID" ]]; then
+    log_info "Auto-detecting AWS account ID..."
+    AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    log_info "AWS account ID: $AWS_ACCOUNT_ID"
+fi
+
+# Initialize resource names now that AWS_ACCOUNT_ID is known
+init_resource_names
+
+# Setup NVMe storage if available
+log_info "Setting up NVMe storage..."
+
+NVMe_DEVICE=$(lsblk -d -n -l | grep nvme | awk '{print $1}' | head -1)
+if [[ -n "$NVMe_DEVICE" ]]; then
+    NVMe_PATH="/dev/$NVMe_DEVICE"
+    MOUNT_POINT="/mnt/nvme"
+    
+    if ! mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        log_info "Found NVMe device: $NVMe_PATH"
+        if [[ -b "$NVMe_PATH" ]]; then
+            # Check if filesystem exists; if not, create one
+            if ! sudo blkid "$NVMe_PATH" >/dev/null 2>&1; then
+                log_info "Creating ext4 filesystem on $NVMe_PATH..."
+                sudo mkfs.ext4 -F "$NVMe_PATH"
+            fi
+            
+            log_info "Mounting $NVMe_PATH to $MOUNT_POINT..."
+            sudo mkdir -p "$MOUNT_POINT"
+            sudo mount "$NVMe_PATH" "$MOUNT_POINT"
+            sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
+        fi
+    else
+        log_info "$MOUNT_POINT already mounted"
+    fi
+else
+    log_info "No NVMe device found; using default storage"
+    mkdir -p /mnt/nvme
+fi
 
 # Create run directory
 RUN_DIR="/mnt/nvme/runs/$RUN_ID"
@@ -389,8 +454,7 @@ sed -i '/COPY.*aws.*credentials\|COPY.*\.aws\|COPY.*AWS_/d' "$BUILD_DIR/Dockerfi
 
 log_info "Creating Lambda ECR repository..."
 
-AWS_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-ECR_REGISTRY="${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_REPO="${ECR_REGISTRY}/${ECR_REPO_NAME}"
 
 aws ecr create-repository \
@@ -416,12 +480,12 @@ log_info "Lambda image ready"
 log_info "Step 6: Setting up Lambda function and EventBridge..."
 
 python3 /home/ubuntu/scrna-repo/set-up-resources.py \
-    --region "$AWS_REGION" \
-    --account_id "$AWS_ACCOUNT" \
+    --aws_region "$AWS_REGION" \
+    --aws_account_id "$AWS_ACCOUNT_ID" \
     --dockerfile_dir "$BUILD_DIR" \
-    --ecr_repo_name "$ECR_REPO_NAME" \
+    --docker_image_name "$DOCKER_IMAGE_NAME" \
     --lambda_function_name "$LAMBDA_FUNCTION_NAME" \
-    --eventbridge_rule_name "$EVENTBRIDGE_RULE_NAME" \
+    --lambda_execution_role_name "$LAMBDA_EXECUTION_ROLE_NAME" \
     --s3_bucket_name "$INPUT_FASTQ_BUCKET" \
     --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
     --s3_output_bucket_name "$OUTPUT_MAP_BUCKET" \
@@ -554,7 +618,7 @@ log_info "Quant outputs uploaded"
 # Step 11: Optional QC Analysis
 ################################################################################
 
-if [[ $WRITE_H5AD -eq 1 ]]; then
+if [[ $RUN_QC -eq 1 ]]; then
     log_info "Step 11: Running QC analysis..."
     
     QC_DIR="$RUN_DIR/analysis"
@@ -565,16 +629,18 @@ if [[ $WRITE_H5AD -eq 1 ]]; then
     
     pip install -q scanpy matplotlib seaborn
     
-    python3 /home/ubuntu/scrna-repo/scripts/qc_scanpy.py \
-        "$ALEVIN_OUTPUT" \
-        --outdir "$QC_DIR/out" \
-        --write-h5ad
+    QC_ARGS=("$ALEVIN_OUTPUT" "--outdir" "$QC_DIR/out")
+    if [[ $WRITE_H5AD -eq 1 ]]; then
+        QC_ARGS+=("--write-h5ad")
+    fi
+    
+    python3 /home/ubuntu/scrna-repo/scripts/qc_scanpy.py "${QC_ARGS[@]}"
     
     deactivate
     
     log_info "QC analysis complete"
 else
-    log_info "Step 11: Skipping QC (WRITE_H5AD=0)"
+    log_info "Step 11: Skipping QC (RUN_QC=0)"
 fi
 
 ################################################################################
@@ -587,14 +653,14 @@ cat > "$RUN_DIR/run.env" <<EOF
 RUN_ID=$RUN_ID
 DATASET=$DATASET
 AWS_REGION=$AWS_REGION
-AWS_ACCOUNT_ID=$AWS_ACCOUNT
+AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID
 INPUT_FASTQ_BUCKET=$INPUT_FASTQ_BUCKET
 INPUT_TXT_BUCKET=$INPUT_TXT_BUCKET
 OUTPUT_MAP_BUCKET=$OUTPUT_MAP_BUCKET
 OUTPUT_QUANT_BUCKET=$OUTPUT_QUANT_BUCKET
 ECR_REPO=$ECR_REPO_NAME
 LAMBDA_FUNCTION=$LAMBDA_FUNCTION_NAME
-EVENTBRIDGE_RULE=$EVENTBRIDGE_RULE_NAME
+LAMBDA_EXECUTION_ROLE=$LAMBDA_EXECUTION_ROLE_NAME
 RUN_DIR=$RUN_DIR
 BASENAME_WITH_LANE=$BASENAME_WITH_LANE
 EOF
@@ -614,8 +680,12 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
     aws lambda delete-function --function-name "$LAMBDA_FUNCTION_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
     
-    # Delete EventBridge rule
-    aws events delete-rule --name "$EVENTBRIDGE_RULE_NAME" \
+    # Delete IAM execution role (detach policies first)
+    aws iam list-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+        --query 'PolicyNames[]' --output text | \
+        xargs -I {} aws iam delete-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" --policy-name {} 2>/dev/null || true
+    
+    aws iam delete-role --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
     
     # Delete ECR repository
@@ -644,9 +714,11 @@ log_info "Dataset: $DATASET"
 log_info "Output directory: $RUN_DIR"
 log_info "Quantification output: s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/"
 
-if [[ $WRITE_H5AD -eq 1 ]]; then
+if [[ $RUN_QC -eq 1 ]]; then
     log_info "QC plots: $RUN_DIR/analysis/out/"
-    log_info "H5AD file: $RUN_DIR/analysis/out/pbmc_adata.h5ad"
+    if [[ $WRITE_H5AD -eq 1 ]]; then
+        log_info "H5AD file: $RUN_DIR/analysis/out/pbmc_adata.h5ad"
+    fi
 fi
 
 log_info "Run.env: $RUN_DIR/run.env"
