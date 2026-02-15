@@ -42,7 +42,7 @@ MAKE_PUBLIC="${MAKE_PUBLIC:-0}"
 AMI_NAME_PREFIX="${AMI_NAME_PREFIX:-scrna-seed}"
 SSH_MAX_ATTEMPTS="${SSH_MAX_ATTEMPTS:-90}"
 SSH_SLEEP_SECONDS="${SSH_SLEEP_SECONDS:-10}"
-KEEP_INSTANCE_ON_FAIL="${KEEP_INSTANCE_ON_FAIL:-0}"
+KEEP_INSTANCE_ON_EXIT="${KEEP_INSTANCE_ON_EXIT:-0}"
 AMI_WAIT_MAX_ATTEMPTS="${AMI_WAIT_MAX_ATTEMPTS:-240}"
 AMI_WAIT_DELAY="${AMI_WAIT_DELAY:-15}"
 
@@ -172,8 +172,8 @@ cleanup() {
             return
         fi
         
-        if [[ ${KEEP_INSTANCE_ON_FAIL} -eq 1 && ${exit_code} -ne 0 ]]; then
-            echo "DEBUG: KEEP_INSTANCE_ON_FAIL=1, preserving instance for debugging"
+        if [[ ${KEEP_INSTANCE_ON_EXIT} -eq 1 && ${exit_code} -ne 0 ]]; then
+            echo "DEBUG: KEEP_INSTANCE_ON_EXIT=1, preserving instance for debugging"
             echo "Instance ID: ${INSTANCE_ID}"
             echo "Instance IP: ${INSTANCE_IP}"
             echo "To terminate manually, run:"
@@ -582,8 +582,8 @@ if [[ ${WAIT_EXIT_CODE} -eq 0 ]]; then
     echo "AMI is available: ${AMI_ID}"
     AMI_AVAILABLE=1
     
-    # Terminate instance if KEEP_INSTANCE_ON_FAIL is not set to 1
-    if [[ ${KEEP_INSTANCE_ON_FAIL} -ne 1 ]]; then
+    # Terminate instance if KEEP_INSTANCE_ON_EXIT is not set to 1
+    if [[ ${KEEP_INSTANCE_ON_EXIT} -ne 1 ]]; then
         echo "Terminating instance ${INSTANCE_ID}..."
         aws ec2 terminate-instances \
             --instance-ids "${INSTANCE_ID}" \
@@ -593,7 +593,11 @@ if [[ ${WAIT_EXIT_CODE} -eq 0 ]]; then
         # Prevent cleanup() from trying to terminate again
         INSTANCE_ID=""
     else
-        echo "KEEP_INSTANCE_ON_FAIL=1 is set. Instance ${INSTANCE_ID} left in stopped state."
+        echo "KEEP_INSTANCE_ON_EXIT=1 is set. Instance ${INSTANCE_ID} left in stopped state."
+        echo "To terminate manually after AMI is available, run:"
+        echo "  aws ec2 terminate-instances --instance-ids ${INSTANCE_ID} --region ${AWS_REGION}"
+        # Preserve instance on exit
+        PRESERVE_INSTANCE_ON_EXIT=1
     fi
 else
     echo "WARN: Wait for AMI timed out after ${AMI_WAIT_MAX_ATTEMPTS} attempts (exit code: ${WAIT_EXIT_CODE})."
