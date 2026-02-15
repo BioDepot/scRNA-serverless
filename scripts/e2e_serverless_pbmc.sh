@@ -864,17 +864,22 @@ if [[ $RUN_QC -eq 1 ]]; then
     QC_DIR="$RUN_DIR/analysis"
     mkdir -p "$QC_DIR/out"
     
-    python3 -m venv "$QC_DIR/venv"
-    source "$QC_DIR/venv/bin/activate"
+    # Create isolated venv for QC
+    python3 -m venv "$RUN_DIR/venv_qc"
+    source "$RUN_DIR/venv_qc/bin/activate"
     
-    pip install -q scanpy matplotlib seaborn leidenalg igraph
+    # Upgrade pip, setuptools, wheel explicitly
+    python -m pip install -q --upgrade pip setuptools wheel
+    
+    # Install all QC dependencies explicitly
+    pip install -q numpy pandas scipy matplotlib seaborn anndata scanpy python-igraph leidenalg
     
     QC_ARGS=("$ALEVIN_OUTPUT" "--outdir" "$QC_DIR/out")
     if [[ $WRITE_H5AD -eq 1 ]]; then
         QC_ARGS+=("--write-h5ad")
     fi
     
-    python3 /home/ubuntu/scrna-repo/scripts/qc_scanpy.py "${QC_ARGS[@]}"
+    python scripts/qc_scanpy.py "${QC_ARGS[@]}"
     
     deactivate
     
@@ -921,13 +926,55 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
     aws lambda delete-function --function-name "$LAMBDA_FUNCTION_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
     
-    # Delete IAM execution role (detach policies first)
-    aws iam list-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
-        --query 'PolicyNames[]' --output text | \
-        xargs -I {} aws iam delete-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" --policy-name {} 2>/dev/null || true
-    
-    aws iam delete-role --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+    # Delete Lambda CloudWatch log group
+    aws logs delete-log-group --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
+    
+    # Delete EventBridge rule and targets
+    EVENT_RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"
+    
+    # First, list and remove all targets from the rule
+    TARGETS=$(aws events list-targets-by-rule \
+        --rule "$EVENT_RULE_NAME" \
+        --region "$AWS_REGION" \
+        --query 'Targets[].Id' \
+        --output text 2>/dev/null || true)
+    
+    if [[ -n "$TARGETS" ]]; then
+        aws events remove-targets \
+            --rule "$EVENT_RULE_NAME" \
+            --ids $TARGETS \
+            --region "$AWS_REGION" 2>/dev/null || true
+    fi
+    
+    # Then delete the rule itself
+    aws events delete-rule \
+        --name "$EVENT_RULE_NAME" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    
+    # Delete IAM execution role (detach all policies first)
+    # Detach managed policies
+    aws iam list-attached-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+        --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null | \
+        tr '\t' '\n' | while read -r policy_arn; do
+            if [[ -n "$policy_arn" ]]; then
+                aws iam detach-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+                    --policy-arn "$policy_arn" 2>/dev/null || true
+            fi
+        done
+    
+    # Delete inline policies
+    aws iam list-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+        --query 'PolicyNames[]' --output text 2>/dev/null | \
+        tr '\t' '\n' | while read -r policy_name; do
+            if [[ -n "$policy_name" ]]; then
+                aws iam delete-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+                    --policy-name "$policy_name" 2>/dev/null || true
+            fi
+        done
+    
+    # Finally delete the role
+    aws iam delete-role --role-name "$LAMBDA_EXECUTION_ROLE_NAME" 2>/dev/null || true
     
     # Delete ECR repository
     aws ecr delete-repository --repository-name "$ECR_REPO_NAME" \
