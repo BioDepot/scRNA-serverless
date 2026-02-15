@@ -640,22 +640,73 @@ ${DOCKER} push "${ECR_REPO}:latest"
 log_info "Lambda image ready"
 
 ################################################################################
+# Patcher Function: Patch set-up-resources.py Lambda sizes
+################################################################################
+
+patch_set_up_resources_lambda_sizes() {
+    local mem="$1" eph="$2" path="/home/ubuntu/scrna-repo/set-up-resources.py"
+    python3 - "$path" "$mem" "$eph" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+mem = sys.argv[2]
+eph = sys.argv[3]
+txt = p.read_text()
+txt = re.sub(r"MemorySize\s*=\s*\d+", f"MemorySize={mem}", txt)
+txt = re.sub(r"EphemeralStorage\s*=\s*\{'Size':\s*\d+\}", f"EphemeralStorage={{'Size': {eph}}}", txt)
+p.write_text(txt)
+PY
+}
+
+################################################################################
 # Step 6: Setup Lambda and EventBridge (using set-up-resources.py)
 ################################################################################
 
 log_info "Step 6: Setting up Lambda function and EventBridge..."
 
-python3 /home/ubuntu/scrna-repo/set-up-resources.py \
-    --aws_region "$AWS_REGION" \
-    --aws_account_id "$AWS_ACCOUNT_ID" \
-    --dockerfile_dir "$BUILD_DIR" \
-    --docker_image_name "$DOCKER_IMAGE_NAME" \
-    --lambda_function_name "$LAMBDA_FUNCTION_NAME" \
-    --lambda_execution_role_name "$LAMBDA_EXECUTION_ROLE_NAME" \
-    --s3_bucket_name "$INPUT_FASTQ_BUCKET" \
-    --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
-    --s3_output_bucket_name "$OUTPUT_MAP_BUCKET" \
-    --final_output_bucket_name "$OUTPUT_QUANT_BUCKET"
+# Try memory/ephemeral combinations during Lambda creation
+MEM_CANDIDATES=(10240 3008 2048 1536 1024 512)
+EPH_CANDIDATES=(10240 512)
+
+CREATE_SUCCESS=0
+for mem in "${MEM_CANDIDATES[@]}"; do
+    for eph in "${EPH_CANDIDATES[@]}"; do
+        log_info "Attempting Lambda creation: memory=${mem}MB, ephemeral=${eph}MB"
+        
+        # Patch set-up-resources.py with current candidate sizes
+        patch_set_up_resources_lambda_sizes "$mem" "$eph"
+        
+        # Run set-up-resources.py (use sudo -E if docker needs sudo)
+        PYTHON_CMD="python3"
+        if [[ "$DOCKER" == "sudo docker" ]]; then
+            PYTHON_CMD="sudo -E python3"
+        fi
+        
+        if $PYTHON_CMD /home/ubuntu/scrna-repo/set-up-resources.py \
+            --aws_region "$AWS_REGION" \
+            --aws_account_id "$AWS_ACCOUNT_ID" \
+            --dockerfile_dir "$BUILD_DIR" \
+            --docker_image_name "$DOCKER_IMAGE_NAME" \
+            --lambda_function_name "$LAMBDA_FUNCTION_NAME" \
+            --lambda_execution_role_name "$LAMBDA_EXECUTION_ROLE_NAME" \
+            --s3_bucket_name "$INPUT_FASTQ_BUCKET" \
+            --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
+            --s3_output_bucket_name "$OUTPUT_MAP_BUCKET" \
+            --final_output_bucket_name "$OUTPUT_QUANT_BUCKET" 2>&1; then
+            
+            LAMBDA_MEMORY_MB="$mem"
+            LAMBDA_EPHEMERAL_MB="$eph"
+            log_info "Lambda created successfully: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB"
+            CREATE_SUCCESS=1
+            break 2
+        else
+            log_info "Failed with memory=${mem}MB, ephemeral=${eph}MB (trying next combination...)"
+        fi
+    done
+done
+
+if [[ $CREATE_SUCCESS -eq 0 ]]; then
+    die "Unable to create Lambda with any memory/ephemeral combination. Check account limits."
+fi
 
 log_info "Updating Lambda function configuration..."
 
@@ -734,8 +785,9 @@ log_info "Found ${#INPUT_TXT_FILES[@]} input txt files"
 log_info "Step 8: Waiting for Lambda outputs..."
 
 for txt_file in "${INPUT_TXT_FILES[@]}"; do
-    JOB_BASE="${txt_file/_input.txt/}"
-    MARKER_KEY="piscem_output/${JOB_BASE}/output.txt"
+    # Use basename to strip any S3 prefix from txt_file
+    job_folder="$(basename "${txt_file%_input.txt}")"
+    MARKER_KEY="piscem_output/${job_folder}/output.txt"
     
     log_info "Waiting for output marker: $MARKER_KEY"
     
@@ -746,7 +798,7 @@ for txt_file in "${INPUT_TXT_FILES[@]}"; do
     
     while [[ $ELAPSED -lt $POLL_TIMEOUT ]]; do
         if aws s3 ls "s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY" --region "$AWS_REGION" >/dev/null 2>&1; then
-            log_info "Output marker found for $JOB_BASE"
+            log_info "Output marker found for $job_folder"
             break
         fi
         sleep "$POLL_INTERVAL"
