@@ -6,6 +6,12 @@
 #
 # USAGE:
 #   # Driver mode (default): launch EC2 instance, run pipeline on it
+#   export SEED_AMI_ID=ami-xxxxx
+#   export KEY_NAME=my-keypair
+#   export KEY_PEM_PATH=/path/to/key.pem
+#   export SUBNET_ID=subnet-xxxxx
+#   export SG_ID=sg-xxxxx
+#   export EC2_INSTANCE_PROFILE_NAME=my-instance-profile  # REQUIRED
 #   bash scripts/e2e_serverless_pbmc.sh pbmc1k
 #   bash scripts/e2e_serverless_pbmc.sh pbmc10k
 #
@@ -22,6 +28,7 @@
 #   SUBNET_ID              Required in driver mode. VPC subnet ID.
 #   SG_ID                  Required in driver mode. Security group ID.
 #   DRIVER_INSTANCE_ID     Optional: reuse existing EC2 instance (skip launch).
+#   EC2_INSTANCE_PROFILE_NAME  Required for reviewer-proof runs (grants AWS permissions to driver EC2)
 #   AUTO_SSH_INGRESS       Auto-authorize caller IP in SG for SSH (default: 1)
 #
 #   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240)
@@ -64,6 +71,7 @@ KEY_PEM_PATH="${KEY_PEM_PATH:-}"
 SUBNET_ID="${SUBNET_ID:-}"
 SG_ID="${SG_ID:-}"
 DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
+EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-}"
 AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
 
 # Lambda Configuration
@@ -86,7 +94,7 @@ RUN_ID="${RUN_ID:-}"
 # Derived values (will be set later)
 RUN_MODE=0
 DATASET=""
-DRIVER_INSTANCE_ID=""
+DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
 DRIVER_INSTANCE_IP=""
 ECR_REPO_NAME=""
 LAMBDA_FUNCTION_NAME=""
@@ -112,6 +120,10 @@ log_error() {
 die() {
     log_error "$@"
     exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1
 }
 
 get_caller_public_ip() {
@@ -166,11 +178,11 @@ init_resource_names() {
     LAMBDA_EXECUTION_ROLE_NAME="scrna-lambda-role-${timestamp}-${random_suffix}"
     DOCKER_IMAGE_NAME="scrna-serverless:${timestamp}"
     
-    # S3 bucket names (must be lowercase, no underscores, globally unique)
-    INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${run_id_clean}"
-    INPUT_TXT_BUCKET="scrna-input-txt-${AWS_ACCOUNT_ID}-${run_id_clean}"
-    OUTPUT_MAP_BUCKET="scrna-output-map-${AWS_ACCOUNT_ID}-${run_id_clean}"
-    OUTPUT_QUANT_BUCKET="scrna-output-quant-${AWS_ACCOUNT_ID}-${run_id_clean}"
+    # S3 bucket names (must be lowercase, no underscores, globally unique, include region)
+    INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    INPUT_TXT_BUCKET="scrna-input-txt-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    OUTPUT_MAP_BUCKET="scrna-output-map-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    OUTPUT_QUANT_BUCKET="scrna-output-quant-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
 }
 
 ################################################################################
@@ -219,6 +231,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set in driver mode"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set in driver mode"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
+    [[ -n "$EC2_INSTANCE_PROFILE_NAME" ]] || die "EC2_INSTANCE_PROFILE_NAME is required for reviewer-proof execution (no credentials baked into AMI)."
     
     # Resume logic: check for existing instance
     if [[ -z "$DRIVER_INSTANCE_ID" ]]; then
@@ -253,6 +266,13 @@ if [[ $RUN_MODE -eq 0 ]]; then
         fi
     else
         log_info "Launching new EC2 instance from AMI $SEED_AMI_ID..."
+        
+        # Build IAM instance profile args if provided
+        IAM_PROFILE_ARGS=()
+        if [[ -n "${EC2_INSTANCE_PROFILE_NAME}" ]]; then
+            IAM_PROFILE_ARGS=(--iam-instance-profile "Name=${EC2_INSTANCE_PROFILE_NAME}")
+        fi
+        
         DRIVER_INSTANCE_ID=$(aws ec2 run-instances \
         --region "$AWS_REGION" \
         --image-id "$SEED_AMI_ID" \
@@ -260,6 +280,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
         --key-name "$KEY_NAME" \
         --subnet-id "$SUBNET_ID" \
         --security-group-ids "$SG_ID" \
+        "${IAM_PROFILE_ARGS[@]}" \
         --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
         --query "Instances[0].InstanceId" \
@@ -424,15 +445,43 @@ log_info "Run directory: $RUN_DIR"
 
 log_info "Step 0: Bootstrapping tools..."
 
-# Check if this is the first run
-if ! command -v python3 &> /dev/null; then
+# Check for required tools and install missing ones
+REQUIRED_TOOLS=(python3 pip3 aws docker jq curl tar gzip git)
+MISSING_TOOLS=()
+
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! need_cmd "$tool"; then
+        MISSING_TOOLS+=("$tool")
+    fi
+done
+
+if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
+    log_info "Installing missing tools: ${MISSING_TOOLS[*]}"
     sudo apt-get update
-    sudo apt-get install -y \
-        python3 python3-venv python3-pip \
-        git jq curl tar gzip \
-        awscli docker.io
     
-    sudo usermod -aG docker ubuntu
+    INSTALL_PKGS=()
+    for tool in "${MISSING_TOOLS[@]}"; do
+        case "$tool" in
+            python3) INSTALL_PKGS+=(python3 python3-venv python3-pip) ;;
+            pip3) INSTALL_PKGS+=(python3-pip) ;;
+            aws) INSTALL_PKGS+=(awscli) ;;
+            docker) INSTALL_PKGS+=(docker.io) ;;
+            *) INSTALL_PKGS+=("$tool") ;;
+        esac
+    done
+    
+    sudo apt-get install -y "${INSTALL_PKGS[@]}"
+    
+    # Add user to docker group if docker was installed
+    if [[ " ${MISSING_TOOLS[*]} " =~ " docker " ]]; then
+        sudo usermod -aG docker ubuntu
+    fi
+fi
+
+# Detect if docker needs sudo
+DOCKER="docker"
+if ! docker ps >/dev/null 2>&1; then
+    DOCKER="sudo docker"
 fi
 
 log_info "Tools ready"
@@ -577,13 +626,13 @@ aws ecr create-repository \
 
 log_info "Logging in to ECR..."
 aws ecr get-login-password --region "$AWS_REGION" | \
-    docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    ${DOCKER} login --username AWS --password-stdin "$ECR_REGISTRY"
 
 log_info "Building docker image..."
-docker build -t "${ECR_REPO}:latest" "$BUILD_DIR"
+${DOCKER} build -t "${ECR_REPO}:latest" "$BUILD_DIR"
 
 log_info "Pushing to ECR..."
-docker push "${ECR_REPO}:latest"
+${DOCKER} push "${ECR_REPO}:latest"
 
 log_info "Lambda image ready"
 
@@ -672,6 +721,11 @@ for txt_file in "${INPUT_TXT_FILES[@]}"; do
         sleep "$POLL_INTERVAL"
         ((ELAPSED += POLL_INTERVAL))
     done
+    
+    # Verify marker exists after timeout
+    if ! aws s3 ls "s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY" --region "$AWS_REGION" >/dev/null 2>&1; then
+        die "Timed out waiting for marker: s3://$OUTPUT_MAP_BUCKET/$MARKER_KEY"
+    fi
 done
 
 log_info "All Lambda outputs ready"
@@ -687,6 +741,11 @@ mkdir -p "$DOWNLOAD_DIR"
 
 aws s3 sync "s3://$OUTPUT_MAP_BUCKET/piscem_output/" "$DOWNLOAD_DIR/" --region "$AWS_REGION"
 
+log_info "Installing alevin-fry and radtk..."
+
+bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
+bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
+
 log_info "Running combine scripts..."
 
 COMBINED_DIR="$RUN_DIR/combined"
@@ -694,11 +753,6 @@ mkdir -p "$COMBINED_DIR"
 
 bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$DOWNLOAD_DIR" "$COMBINED_DIR"
 bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$DOWNLOAD_DIR" "$COMBINED_DIR"
-
-log_info "Installing alevin-fry and radtk..."
-
-bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
-bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
 
 log_info "Running alevin-fry quant..."
 

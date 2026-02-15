@@ -25,8 +25,9 @@ import argparse
 import os
 import sys
 import logging
+import gzip
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, IO
 
 import numpy as np
 import scanpy as sc
@@ -40,6 +41,23 @@ logging.basicConfig(
     format='[%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def open_maybe_gzip(path: Path, mode: str = 'rt') -> Union[IO, gzip.GzipFile]:
+    """
+    Open a file, using gzip if it has .gz extension.
+    
+    Args:
+        path: Path to file
+        mode: File open mode ('rt' for text, 'rb' for binary)
+        
+    Returns:
+        File handle
+    """
+    if str(path).endswith('.gz'):
+        return gzip.open(path, mode)
+    else:
+        return open(path, mode)
 
 
 def find_matrix_file(quants_dir: Path) -> Path:
@@ -110,12 +128,16 @@ def load_mtx_data(quants_dir: Path) -> sc.AnnData:
     
     # Load matrix (MTX is cells x genes, we need to transpose)
     logger.info("Reading matrix...")
-    matrix = mmread(str(matrix_file))
+    if str(matrix_file).endswith('.gz'):
+        with gzip.open(matrix_file, 'rb') as fh:
+            matrix = mmread(fh)
+    else:
+        matrix = mmread(str(matrix_file))
     matrix = matrix.T.tocsr()  # Transpose: genes x cells -> cells x genes
     
     # Load features (genes)
     logger.info("Reading features...")
-    with open(feature_file, 'r') as f:
+    with open_maybe_gzip(feature_file, 'rt') as f:
         # Try reading as TSV first (might have description column), then fallback to plain text
         genes = []
         for line in f:
@@ -124,7 +146,7 @@ def load_mtx_data(quants_dir: Path) -> sc.AnnData:
     
     # Load barcodes (cells)
     logger.info("Reading barcodes...")
-    with open(barcode_file, 'r') as f:
+    with open_maybe_gzip(barcode_file, 'rt') as f:
         barcodes = [line.strip() for line in f]
     
     logger.info(f"Matrix shape: {matrix.shape}")
