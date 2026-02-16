@@ -60,6 +60,9 @@
 
 set -euo pipefail
 
+# Cleanup temp files on exit
+trap 'rm -f "$FASTQ_DIR"/*.tmp 2>/dev/null' EXIT INT TERM
+
 ################################################################################
 # User Configuration (Edit Once)
 # Set these defaults once, then override via env vars if needed
@@ -722,16 +725,21 @@ BASENAME_WITH_LANE="${FIRST_R1/_R1_001.fastq.gz/}"
 
 log_info "BASENAME_WITH_LANE: $BASENAME_WITH_LANE"
 
-# Concatenate all R1 files
+# Concatenate all R1 files (use temp file to avoid overwrites)
 log_info "Concatenating R1 files..."
-cat "${R1_FILES[@]}" > "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz"
+tmp_r1="$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz.tmp"
+cat "${R1_FILES[@]}" > "$tmp_r1"
+mv -f "$tmp_r1" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz"
 
 # Find and concatenate R2 files
 R2_FILES=($(find "$FASTQ_DIR" -name "*R2_001.fastq.gz" | sort))
 [[ ${#R2_FILES[@]} -gt 0 ]] || die "No R2_001.fastq.gz files found"
 
+# Concatenate all R2 files (use temp file to avoid overwrites)
 log_info "Concatenating R2 files..."
-cat "${R2_FILES[@]}" > "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz"
+tmp_r2="$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz.tmp"
+cat "${R2_FILES[@]}" > "$tmp_r2"
+mv -f "$tmp_r2" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz"
 
 log_info "FASTQ files ready"
 
@@ -1074,27 +1082,33 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
     aws logs delete-log-group --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
     
-    # Delete EventBridge rule and targets
-    EVENT_RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"
+    # Delete EventBridge rules targeting this Lambda (discover rules dynamically)
+    log_info "Discovering EventBridge rules targeting Lambda..."
+    LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
+        --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
     
-    # First, list and remove all targets from the rule
-    TARGETS=$(aws events list-targets-by-rule \
-        --rule "$EVENT_RULE_NAME" \
-        --region "$AWS_REGION" \
-        --query 'Targets[].Id' \
-        --output text 2>/dev/null || true)
-    
-    if [[ -n "$TARGETS" ]]; then
-        aws events remove-targets \
-            --rule "$EVENT_RULE_NAME" \
-            --ids $TARGETS \
-            --region "$AWS_REGION" 2>/dev/null || true
+    if [[ -n "$LAMBDA_ARN" ]]; then
+        RULES=$(aws events list-rule-names-by-target --target-arn "$LAMBDA_ARN" \
+            --region "$AWS_REGION" --query 'RuleNames[]' --output text 2>/dev/null || echo "")
+        
+        if [[ -n "$RULES" ]]; then
+            for rule in $RULES; do
+                log_info "Removing targets from rule: $rule"
+                # List and remove all targets from the rule
+                TARGETS=$(aws events list-targets-by-rule --rule "$rule" \
+                    --region "$AWS_REGION" --query 'Targets[].Id' --output text 2>/dev/null || echo "")
+                
+                if [[ -n "$TARGETS" ]]; then
+                    aws events remove-targets --rule "$rule" --ids $TARGETS \
+                        --region "$AWS_REGION" 2>/dev/null || true
+                fi
+                
+                # Delete the rule
+                log_info "Deleting rule: $rule"
+                aws events delete-rule --name "$rule" --region "$AWS_REGION" 2>/dev/null || true
+            done
+        fi
     fi
-    
-    # Then delete the rule itself
-    aws events delete-rule \
-        --name "$EVENT_RULE_NAME" \
-        --region "$AWS_REGION" 2>/dev/null || true
     
     # Delete IAM execution role (detach all policies first)
     # Detach managed policies
