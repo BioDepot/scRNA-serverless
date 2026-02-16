@@ -60,8 +60,8 @@
 
 set -euo pipefail
 
-# Cleanup temp files on exit
-trap 'rm -f "$FASTQ_DIR"/*.tmp 2>/dev/null' EXIT INT TERM
+# Cleanup temp files on exit (safe under set -u)
+trap '[[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true' EXIT INT TERM
 
 ################################################################################
 # User Configuration (Edit Once)
@@ -480,16 +480,20 @@ if [[ $RUN_MODE -eq 0 ]]; then
     
     log_info "Copying repository to instance..."
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    tar -czf "/tmp/scrna-repo-$$.tar.gz" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
+    TARBALL_LOCAL="/tmp/scrna-repo-${RUN_ID}.tar.gz"
+    TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
+    
+    tar -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
     
     scp -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "/tmp/scrna-repo-$$.tar.gz" "ubuntu@$DRIVER_INSTANCE_IP:/tmp/"
+        "$TARBALL_LOCAL" "ubuntu@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
     
-    rm -f "/tmp/scrna-repo-$$.tar.gz"
+    rm -f "$TARBALL_LOCAL"
     
     log_info "Extracting repository on instance..."
+    TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
     ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "ubuntu@$DRIVER_INSTANCE_IP" "cd /tmp && tar -xzf scrna-repo-$$.tar.gz && mv scRNA-serverless /home/ubuntu/scrna-repo"
+        "ubuntu@$DRIVER_INSTANCE_IP" "rm -rf /home/ubuntu/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/ubuntu/scrna-repo && rm -f ${TARBALL_REMOTE}"
     
     log_info "Running pipeline in --run mode on instance..."
     
