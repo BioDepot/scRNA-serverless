@@ -121,6 +121,7 @@ POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 
 # Derived values (will be set later)
 RUN_MODE=0
+DRY_RUN_MODE=0
 DATASET=""
 DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
 DRIVER_INSTANCE_IP=""
@@ -239,9 +240,10 @@ init_resource_names() {
 
 if [[ $# -lt 1 ]]; then
     cat >&2 <<EOF
-Usage: $0 <dataset> [--run]
+Usage: $0 <dataset> [--run|--dry-run]
   dataset: pbmc1k or pbmc10k
   --run: Execute in run mode on EC2 (default: driver mode)
+  --dry-run: Validate requirements without creating AWS resources
 EOF
     exit 1
 fi
@@ -251,8 +253,149 @@ if [[ "$DATASET" != "pbmc1k" && "$DATASET" != "pbmc10k" ]]; then
     die "Unknown dataset: $DATASET (must be pbmc1k or pbmc10k)"
 fi
 
-if [[ $# -gt 1 && "$2" == "--run" ]]; then
-    RUN_MODE=1
+if [[ $# -gt 1 ]]; then
+    if [[ "$2" == "--run" ]]; then
+        RUN_MODE=1
+    elif [[ "$2" == "--dry-run" ]]; then
+        DRY_RUN_MODE=1
+    fi
+fi
+
+################################################################################
+# Dry-Run Validation
+################################################################################
+
+validate_dry_run() {
+    local pass=0
+    local fail=0
+    
+    log_info "========== DRY-RUN VALIDATION =========="
+    log_info ""
+    
+    # AWS CLI
+    log_info "[CHECK 1/7] AWS CLI..."
+    if ! need_cmd aws; then
+        log_error "  FAIL: AWS CLI not found"
+        ((fail++))
+    else
+        log_info "  PASS: AWS CLI installed"
+        ((pass++))
+    fi
+    
+    # AWS Auth
+    log_info "[CHECK 2/7] AWS authentication..."
+    if ! aws sts get-caller-identity --region "$AWS_REGION" >/dev/null 2>&1; then
+        log_error "  FAIL: AWS authentication failed"
+        ((fail++))
+    else
+        CALLER=$(aws sts get-caller-identity --region "$AWS_REGION" --query Arn --output text)
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)
+        log_info "  PASS: Authenticated as $CALLER"
+        ((pass++))
+    fi
+    
+    # Docker
+    log_info "[CHECK 3/7] Docker..."
+    if ! need_cmd docker; then
+        log_error "  FAIL: Docker not installed"
+        ((fail++))
+    else
+        if ! docker ps >/dev/null 2>&1; then
+            log_error "  FAIL: Docker not accessible (run: docker ps)"
+            ((fail++))
+        else
+            log_info "  PASS: Docker working"
+            ((pass++))
+        fi
+    fi
+    
+    # Seed AMI
+    if [[ $RUN_MODE -eq 0 ]]; then
+        log_info "[CHECK 4/7] Seed AMI..."
+        if ! aws ec2 describe-images --image-ids "$SEED_AMI_ID" --region "$AWS_REGION" >/dev/null 2>&1; then
+            log_error "  FAIL: AMI not found: $SEED_AMI_ID"
+            ((fail++))
+        else
+            log_info "  PASS: Seed AMI accessible"
+            ((pass++))
+        fi
+    else
+        log_info "[CHECK 4/7] (skipped, run mode)"
+    fi
+    
+    # PEM file
+    if [[ $RUN_MODE -eq 0 && -n "$KEY_PEM_PATH" ]]; then
+        log_info "[CHECK 5/7] PEM file..."
+        if [[ ! -f "$KEY_PEM_PATH" ]]; then
+            log_error "  FAIL: PEM not found: $KEY_PEM_PATH"
+            ((fail++))
+        else
+            log_info "  PASS: PEM file exists"
+            ((pass++))
+        fi
+    else
+        log_info "[CHECK 5/7] (skipped)"
+    fi
+    
+    # FASTQ URL
+    log_info "[CHECK 6/7] FASTQ URL..."
+    local fastq_url="$FASTQ_TAR_URL"
+    if [[ -z "$fastq_url" ]]; then
+        case "$DATASET" in
+            pbmc1k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar" ;;
+            pbmc10k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_10k_v3/pbmc_10k_v3_fastqs.tar" ;;
+        esac
+    fi
+    if ! curl -s -I -m 10 "$fastq_url" 2>/dev/null | head -1 | grep -q "200\|302"; then
+        log_error "  FAIL: FASTQ URL not reachable"
+        ((fail++))
+    else
+        log_info "  PASS: FASTQ URL reachable"
+        ((pass++))
+    fi
+    
+    # Instance Profile  
+    if [[ $RUN_MODE -eq 0 ]]; then
+        log_info "[CHECK 7/7] EC2 instance profile..."
+        if [[ -z "$EC2_INSTANCE_PROFILE_NAME" ]]; then
+            log_error "  FAIL: EC2_INSTANCE_PROFILE_NAME not set"
+            ((fail++))
+        elif ! aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
+            log_error "  FAIL: Instance profile not found: $EC2_INSTANCE_PROFILE_NAME"
+            ((fail++))
+        else
+            log_info "  PASS: Instance profile exists"
+            ((pass++))
+        fi
+    else
+        log_info "[CHECK 7/7] (skipped, run mode)"
+    fi
+    
+    log_info ""
+    log_info "========== RESULT =========="
+    log_info "PASSED: $pass | FAILED: $fail"
+    log_info ""
+    
+    if [[ $fail -eq 0 ]]; then
+        log_info "All checks passed! Ready to run:"
+        log_info "  export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=1 WRITE_H5AD=1"
+        log_info "  bash scripts/e2e_serverless_pbmc.sh $DATASET 2>&1 | tee pbmc1k.log"
+        return 0
+    else
+        log_error "$fail check(s) failed. See errors above."
+        return 1
+    fi
+}
+
+################################################################################
+# Handle Dry-Run Mode
+################################################################################
+
+if [[ $DRY_RUN_MODE -eq 1 ]]; then
+    if ! validate_dry_run; then
+        exit 1
+    fi
+    exit 0
 fi
 
 ################################################################################
