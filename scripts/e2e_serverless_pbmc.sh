@@ -71,6 +71,7 @@ DEFAULT_KEY_PEM_PATH=""
 DEFAULT_EC2_INSTANCE_PROFILE_NAME=""
 DEFAULT_SEED_AMI_ID=""           # Optional: set if you have a pre-built seed AMI
 SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name
+SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher account ID
 AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
 AUTO_CREATE_SG=1                   # Auto-create temporary security group
 AUTO_DETECT_SEED_AMI=1             # Auto-detect seed AMI by name prefix
@@ -150,6 +151,14 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+rand_hex() {
+    # Generate random 4-byte hex string without xxd (portable across platforms)
+    python3 - <<'PY'
+import os,binascii
+print(binascii.hexlify(os.urandom(4)).decode())
+PY
+}
+
 get_caller_public_ip() {
     # Detect caller's public IP for security group ingress
     curl -s -m 5 http://checkip.amazonaws.com | tr -d ' \n' 2>/dev/null || echo ""
@@ -205,7 +214,7 @@ manage_sg_ingress() {
 
 init_resource_names() {
     local timestamp=$(date +%Y-%m-%d-%H-%M-%S)
-    local random_suffix=$(head -c 4 /dev/urandom | xxd -p)
+    local random_suffix=$(rand_hex)
     local run_id_clean="${RUN_ID//_/-}"  # Replace underscores with hyphens for S3 compatibility
     
     # ECR and Lambda names
@@ -248,7 +257,7 @@ fi
 ################################################################################
 
 if [[ -z "$RUN_ID" ]]; then
-    RUN_ID="pbmc-$(date +%s)-$(head -c 4 /dev/urandom | xxd -p)"
+    RUN_ID="pbmc-$(date +%s)-$(rand_hex)"
 fi
 
 ################################################################################
@@ -265,21 +274,23 @@ if [[ $RUN_MODE -eq 0 ]]; then
     
     # Auto-detect seed AMI by name prefix if not set
     if [[ -z "$SEED_AMI_ID" && $AUTO_DETECT_SEED_AMI -eq 1 ]]; then
-        log_info "Auto-detecting seed AMI with prefix: $SEED_AMI_NAME_PREFIX"
+        log_info "Auto-detecting seed AMI with prefix: $SEED_AMI_NAME_PREFIX (owner: $SEED_AMI_OWNER)"
         SEED_AMI_ID=$(aws ec2 describe-images \
             --region "$AWS_REGION" \
-            --owners self \
+            --owners "$SEED_AMI_OWNER" \
             --filters "Name=name,Values=${SEED_AMI_NAME_PREFIX}*" "Name=state,Values=available" \
             --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
             --output text 2>/dev/null || echo "")
         
         if [[ -z "$SEED_AMI_ID" || "$SEED_AMI_ID" == "None" ]]; then
-            log_error "No seed AMI found with prefix: $SEED_AMI_NAME_PREFIX"
-            log_error "Options:"
-            log_error "  1. Set SEED_AMI_ID explicitly (e.g., SEED_AMI_ID=ami-xxxxx)"
-            log_error "  2. Set DEFAULT_SEED_AMI_ID in this script"
-            log_error "  3. Build and share seed AMI: bash scripts/build_seed_ami.sh"
-            log_error "  4. Disable auto-detect: AUTO_DETECT_SEED_AMI=0 and set SEED_AMI_ID manually"
+            log_error "No seed AMI found with prefix: $SEED_AMI_NAME_PREFIX (owner: $SEED_AMI_OWNER)"
+            log_error "Options for reviewers:"
+            log_error "  1. Set SEED_AMI_OWNER to the publisher's AWS account ID (e.g., SEED_AMI_OWNER=123456789012)"
+            log_error "  2. Set SEED_AMI_ID explicitly (e.g., SEED_AMI_ID=ami-xxxxx)"
+            log_error "Options for authors:"
+            log_error "  1. Set DEFAULT_SEED_AMI_ID in this script"
+            log_error "  2. Build and share seed AMI: bash scripts/build_seed_ami.sh"
+            log_error "  3. Disable auto-detect: AUTO_DETECT_SEED_AMI=0 and set SEED_AMI_ID manually"
             die "Seed AMI not found and AUTO_DETECT_SEED_AMI=1"
         fi
         log_info "Found seed AMI: $SEED_AMI_ID"
@@ -526,19 +537,22 @@ SSHEOF
         manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
     fi
     
-    # Delete temporary SG if we created it
-    if [[ -n "$CREATED_SG_ID" ]]; then
-        log_info "Deleting temporary security group: $CREATED_SG_ID"
-        # Wait a moment for any pending operations
-        sleep 5
-        aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
-    fi
-    
     if [[ $TERMINATE_DRIVER_ON_EXIT -eq 1 ]]; then
         log_info "Terminating driver instance $DRIVER_INSTANCE_ID..."
         aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
+        
+        # Wait for instance to terminate before cleaning up SG
+        log_info "Waiting for instance to terminate..."
+        aws ec2 wait instance-terminated --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" 2>/dev/null || true
+        
+        # Only delete created SG after instance is terminated
+        if [[ -n "$CREATED_SG_ID" ]]; then
+            log_info "Deleting temporary security group: $CREATED_SG_ID"
+            aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
+        fi
     else
         log_info "Driver instance $DRIVER_INSTANCE_ID left running (TERMINATE_DRIVER_ON_EXIT=0)"
+        log_info "Note: Temporary SG $CREATED_SG_ID is still in use. Clean it up manually when done."
     fi
     
     exit $RUN_EXIT
