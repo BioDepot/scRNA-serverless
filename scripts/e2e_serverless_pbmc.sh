@@ -69,12 +69,12 @@ DEFAULT_AWS_REGION="us-east-2"
 DEFAULT_KEY_NAME=""
 DEFAULT_KEY_PEM_PATH=""
 DEFAULT_EC2_INSTANCE_PROFILE_NAME=""
-DEFAULT_SEED_AMI_ID=""           # Optional: set if you have a pre-built seed AMI
-SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name
+DEFAULT_SEED_AMI_ID="ami-0b80485dc95b72c33"  # Author's seed AMI (hardcoded for reproducibility)
+SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name (for reviewers)
 SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher account ID
 AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
 AUTO_CREATE_SG=1                   # Auto-create temporary security group
-AUTO_DETECT_SEED_AMI=1             # Auto-detect seed AMI by name prefix
+AUTO_DETECT_SEED_AMI=0             # For authors: disabled (use hardcoded AMI). For reviewers: set to 1
 
 ################################################################################
 # Default Configuration
