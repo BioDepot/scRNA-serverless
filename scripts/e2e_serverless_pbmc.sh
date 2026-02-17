@@ -78,9 +78,6 @@ SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher acco
 AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
 AUTO_CREATE_SG=1                   # Auto-create temporary security group
 AUTO_DETECT_SEED_AMI=0             # For authors: disabled (use hardcoded AMI). For reviewers: set to 1
-AUTO_CREATE_KEYPAIR="${AUTO_CREATE_KEYPAIR:-1}"   # Auto-create EC2 keypair if missing
-AUTO_FIX_PEM_PERMS="${AUTO_FIX_PEM_PERMS:-1}"     # Fix PEM permissions on Windows via icacls
-OVERWRITE_PEM="${OVERWRITE_PEM:-0}"               # Allow overwriting existing PEM (safety off by default)
 
 ################################################################################
 # Default Configuration
@@ -241,52 +238,31 @@ ensure_keypair_and_pem() {
     [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
     [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
 
-    # Normalize to a bash-usable path (so -f, ssh -i, scp, etc work)
+    # Normalize to bash-usable path for Git Bash
     KEY_PEM_PATH="$(normalize_path_for_bash "$KEY_PEM_PATH")"
-
     local pem="$KEY_PEM_PATH"
-    mkdir -p "$(dirname "$pem")" 2>/dev/null || true
 
-    local keypair_exists=0
-    if aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
-        keypair_exists=1
-    fi
+    [[ -f "$pem" ]] || die "PEM file not found at '$pem'. Set KEY_PEM_PATH to the downloaded .pem file."
 
-    if [[ ! -f "$pem" ]]; then
-        if [[ $keypair_exists -eq 1 ]]; then
-            die "AWS keypair '$KEY_NAME' exists but PEM file is missing at '$pem'. AWS cannot re-download the private key. Choose a NEW KEY_NAME and rerun."
-        fi
-        [[ "$AUTO_CREATE_KEYPAIR" -eq 1 ]] || die "PEM missing and AUTO_CREATE_KEYPAIR=0. Create keypair+PEM manually or set AUTO_CREATE_KEYPAIR=1."
+    aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1 \
+        || die "AWS keypair '$KEY_NAME' not found in region '$AWS_REGION'. Create/import it in EC2 → Key Pairs."
 
-        log_info "Creating new keypair '$KEY_NAME' and writing PEM to '$pem'..."
-        aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$pem"
-        chmod 600 "$pem" 2>/dev/null || true
+    need_cmd ssh-keygen || die "ssh-keygen not found (required for PEM/keypair fingerprint validation)."
 
-        if is_windows_host && [[ "$AUTO_FIX_PEM_PERMS" -eq 1 ]]; then
-            local win_pem
-            win_pem="$(win_path_from_bash "$pem")"
-            fix_pem_perms_windows "$win_pem"
-        fi
+    local aws_fp local_fp
+    aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
+        --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
 
-        log_info "Keypair created and PEM saved."
-        return 0
-    fi
+    local_fp="$(ssh-keygen -E md5 -lf "$pem" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
 
-    # PEM exists locally
-    if [[ $keypair_exists -eq 0 ]]; then
-        if [[ "$OVERWRITE_PEM" -eq 1 && "$AUTO_CREATE_KEYPAIR" -eq 1 ]]; then
-            log_info "Local PEM exists but AWS keypair '$KEY_NAME' does not. OVERWRITE_PEM=1: recreating keypair and overwriting PEM..."
-            aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$pem"
-            chmod 600 "$pem" 2>/dev/null || true
-            if is_windows_host && [[ "$AUTO_FIX_PEM_PERMS" -eq 1 ]]; then
-                fix_pem_perms_windows "$(win_path_from_bash "$pem")"
-            fi
-        else
-            die "Local PEM exists at '$pem' but AWS keypair '$KEY_NAME' is missing. This will cause SSH key mismatch. Either choose a NEW KEY_NAME or set OVERWRITE_PEM=1 to recreate keypair and overwrite PEM."
-        fi
-    fi
+    aws_fp="${aws_fp,,}"
+    local_fp="${local_fp,,}"
 
-    log_info "Keypair '$KEY_NAME' verified (PEM exists, AWS keypair exists)."
+    [[ -n "$aws_fp" ]] || die "Could not read AWS key fingerprint for '$KEY_NAME'."
+    [[ -n "$local_fp" ]] || die "Could not read local PEM fingerprint via ssh-keygen for '$pem'."
+
+    [[ "$local_fp" == "$aws_fp" ]] || die "PEM does not match AWS keypair. Choose a NEW KEY_NAME or recreate the keypair+PEM."
+    log_info "Keypair/PEM fingerprint match confirmed for '$KEY_NAME'."
 }
 
 manage_sg_ingress() {
@@ -466,17 +442,39 @@ validate_dry_run() {
         log_info "[CHECK 4/7] (skipped, run mode)"
     fi
     
-    # PEM file
+    # Keypair + PEM
     if [[ $RUN_MODE -eq 0 ]]; then
-        log_info "[CHECK 5/7] PEM file..."
-        if [[ -n "$KEY_PEM_PATH" && -f "$KEY_PEM_PATH" ]]; then
-            log_info "  PASS: PEM file exists: $KEY_PEM_PATH"
-            ((pass++))
-        elif [[ "$AUTO_CREATE_KEYPAIR" -eq 1 ]]; then
-            log_info "  WARN: PEM not found at '${KEY_PEM_PATH:-<empty>}' but AUTO_CREATE_KEYPAIR=1 (will create on real run)"
-        else
-            log_error "  FAIL: PEM not found at '${KEY_PEM_PATH:-<empty>}' and AUTO_CREATE_KEYPAIR=0"
+        log_info "[CHECK 5/7] Keypair + PEM..."
+        if [[ -z "$KEY_NAME" ]]; then
+            log_error "  FAIL: KEY_NAME not set"
             ((fail++))
+        elif [[ -z "$KEY_PEM_PATH" ]]; then
+            log_error "  FAIL: KEY_PEM_PATH not set"
+            ((fail++))
+        else
+            pem_check="$(normalize_path_for_bash "$KEY_PEM_PATH")"
+            if [[ ! -f "$pem_check" ]]; then
+                log_error "  FAIL: PEM not found: $pem_check"
+                ((fail++))
+            elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
+                log_error "  FAIL: AWS keypair not found: $KEY_NAME"
+                ((fail++))
+            else
+                aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
+                    --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
+                local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
+                aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
+                if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
+                    log_error "  FAIL: Could not compute fingerprints for mismatch detection"
+                    ((fail++))
+                elif [[ "$aws_fp" != "$local_fp" ]]; then
+                    log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
+                    ((fail++))
+                else
+                    log_info "  PASS: Keypair + PEM present and match"
+                    ((pass++))
+                fi
+            fi
         fi
     else
         log_info "[CHECK 5/7] (skipped, run mode)"
@@ -720,8 +718,10 @@ if [[ $RUN_MODE -eq 0 ]]; then
             --tags "Key=Name,Value=scrna-driver-ssh-$RUN_ID" 2>/dev/null || true
     fi
     
-    # Validate driver mode requirements (KEY_NAME/KEY_PEM_PATH already validated by ensure_keypair_and_pem)
+    # Validate driver mode requirements (KEY_NAME/KEY_PEM_PATH/PEM validated by ensure_keypair_and_pem)
     [[ -n "$SEED_AMI_ID" ]] || die "SEED_AMI_ID must be set (use AUTO_DETECT_SEED_AMI=1 or set it explicitly)"
+    [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
+    [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set (use AUTO_PICK_SUBNET=1 or set it explicitly)"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set (use AUTO_CREATE_SG=1 or set it explicitly)"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
@@ -877,6 +877,16 @@ if [[ $RUN_MODE -eq 0 ]]; then
         log_error ""
         log_error "To test manually from PowerShell:"
         log_error '  ssh -i $env:KEY_PEM_PATH -o StrictHostKeyChecking=no ubuntu@'"$DRIVER_INSTANCE_IP" '"echo OK"'
+        log_error ""
+        log_error "Instance KeyName:"
+        aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" \
+          --query 'Reservations[0].Instances[0].KeyName' --output text 2>/dev/null >&2 || true
+        log_error ""
+        log_error "Security Group: $SG_ID"
+        log_error "SG inbound rules for tcp/22:"
+        aws ec2 describe-security-groups --region "$AWS_REGION" --group-ids "$SG_ID" \
+          --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\` && ToPort==\`22\`]" \
+          --output json 2>/dev/null >&2 || true
         log_error ""
         log_error "Most common causes: wrong keypair/PEM mismatch, SG inbound 22 wrong IP, subnet not public, or your network blocks outbound 22."
         die "Cannot SSH to driver instance."
