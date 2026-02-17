@@ -684,16 +684,37 @@ if [[ $RUN_MODE -eq 0 ]]; then
         fi
     fi
     
+    # Wait for EC2 status checks (not just "running")
+    log_info "Waiting for EC2 status checks (instance-status-ok)..."
+    aws ec2 wait instance-status-ok --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
+    
     log_info "Waiting for SSH readiness..."
-    sleep 20
-    for i in {1..30}; do
-        if ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=5 "ubuntu@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
-            log_info "SSH is ready"
+    SSH_READY=0
+    
+    SSH_OPTS=(
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout=10
+        -o ServerAliveInterval=5
+        -o ServerAliveCountMax=2
+        -i "$KEY_PEM_PATH"
+    )
+    
+    for i in $(seq 1 60); do
+        if ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
+            SSH_READY=1
             break
         fi
-        sleep 2
+        sleep 5
     done
+    
+    if [[ "$SSH_READY" -ne 1 ]]; then
+        log_error "SSH never became reachable on $DRIVER_INSTANCE_IP:22 (instance $DRIVER_INSTANCE_ID)."
+        log_error "Most common causes: wrong keypair/PEM mismatch, SG inbound 22 wrong IP, subnet not public, or your network blocks outbound 22."
+        die "Cannot SSH to driver instance."
+    fi
+    
+    log_info "SSH is ready"
     
     log_info "Copying repository to instance..."
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -702,22 +723,20 @@ if [[ $RUN_MODE -eq 0 ]]; then
     
     tar -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
     
-    scp -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "$TARBALL_LOCAL" "ubuntu@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
+    scp "${SSH_OPTS[@]}" "$TARBALL_LOCAL" "ubuntu@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
     
     rm -f "$TARBALL_LOCAL"
     
     log_info "Extracting repository on instance..."
     TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
-    ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "ubuntu@$DRIVER_INSTANCE_IP" "rm -rf /home/ubuntu/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/ubuntu/scrna-repo && rm -f ${TARBALL_REMOTE}"
+    ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" \
+        "rm -rf /home/ubuntu/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/ubuntu/scrna-repo && rm -f ${TARBALL_REMOTE}"
     
     log_info "Running pipeline in --run mode on instance..."
     
     # Export environment variables and run --run mode
     # Note: AWS_ACCOUNT_ID is NOT exported; it will be auto-detected in run mode
-    ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-        "ubuntu@$DRIVER_INSTANCE_IP" <<SSHEOF
+    ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" <<SSHEOF
 export AWS_REGION=$AWS_REGION
 export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
@@ -740,13 +759,12 @@ SSHEOF
         log_info "Downloading results from EC2 to local machine..."
         
         # Create tarball on EC2 (exclude large folders)
-        ssh -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            "ubuntu@$DRIVER_INSTANCE_IP" \
+        ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" \
             "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
         
         # Download tarball to local
         mkdir -p "$LOCAL_RESULTS_DIR/$RUN_ID"
-        scp -i "$KEY_PEM_PATH" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        scp "${SSH_OPTS[@]}" \
             "ubuntu@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
         
         # Extract locally
