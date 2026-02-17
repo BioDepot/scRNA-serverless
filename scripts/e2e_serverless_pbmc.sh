@@ -516,9 +516,9 @@ if [[ $RUN_MODE -eq 0 ]]; then
         log_info "Found seed AMI: $SEED_AMI_ID"
     fi
     
-    # Auto-pick subnet from default VPC if not set
+    # Auto-pick a truly public subnet from default VPC if not set
     if [[ -z "$SUBNET_ID" && $AUTO_PICK_SUBNET -eq 1 ]]; then
-        log_info "Auto-picking subnet from default VPC..."
+        log_info "Auto-picking public subnet from default VPC..."
         
         # Find default VPC
         VPC_ID=$(aws ec2 describe-vpcs \
@@ -531,18 +531,82 @@ if [[ $RUN_MODE -eq 0 ]]; then
             die "No default VPC found in region $AWS_REGION. Set SUBNET_ID explicitly or disable AUTO_PICK_SUBNET=0."
         fi
         
-        # Pick subnet with most available IPs
-        SUBNET_ID=$(aws ec2 describe-subnets \
+        # Get main route table for VPC (fallback for subnets without explicit association)
+        MAIN_RT=$(aws ec2 describe-route-tables \
             --region "$AWS_REGION" \
-            --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'Subnets | sort_by(@, &AvailableIpAddressCount) | [-1].SubnetId' \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=true" \
+            --query 'RouteTables[0].RouteTableId' \
             --output text 2>/dev/null || echo "")
         
-        if [[ -z "$SUBNET_ID" || "$SUBNET_ID" == "None" ]]; then
-            die "No subnets found in default VPC $VPC_ID. Set SUBNET_ID explicitly."
+        # List all subnets with MapPublicIpOnLaunch=true
+        CANDIDATE_SUBNETS=$(aws ec2 describe-subnets \
+            --region "$AWS_REGION" \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=map-public-ip-on-launch,Values=true" \
+            --query 'Subnets[*].[SubnetId,AvailableIpAddressCount,AvailabilityZone]' \
+            --output text 2>/dev/null || echo "")
+        
+        if [[ -z "$CANDIDATE_SUBNETS" ]]; then
+            # Show all subnets for diagnosis
+            log_error "No subnets with MapPublicIpOnLaunch=true in VPC $VPC_ID."
+            log_error "All subnets in this VPC:"
+            aws ec2 describe-subnets --region "$AWS_REGION" \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'Subnets[*].[SubnetId,MapPublicIpOnLaunch,AvailableIpAddressCount,AvailabilityZone]' \
+                --output table 2>/dev/null || true
+            die "Set SUBNET_ID explicitly to a public subnet."
         fi
         
-        log_info "Auto-selected subnet: $SUBNET_ID (VPC: $VPC_ID)"
+        # For each candidate, verify it has a route to an internet gateway
+        BEST_SUBNET=""
+        BEST_IPS=0
+        
+        while IFS=$'\t' read -r sid ips az; do
+            # Find route table: explicit association first, then main
+            RT=$(aws ec2 describe-route-tables \
+                --region "$AWS_REGION" \
+                --filters "Name=association.subnet-id,Values=$sid" \
+                --query 'RouteTables[0].RouteTableId' \
+                --output text 2>/dev/null || echo "None")
+            
+            if [[ -z "$RT" || "$RT" == "None" ]]; then
+                RT="$MAIN_RT"
+            fi
+            
+            if [[ -z "$RT" || "$RT" == "None" ]]; then
+                log_info "  Subnet $sid ($az): no route table found, skipping"
+                continue
+            fi
+            
+            # Check for 0.0.0.0/0 -> igw-*
+            IGW_ROUTE=$(aws ec2 describe-route-tables \
+                --region "$AWS_REGION" \
+                --route-table-ids "$RT" \
+                --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0'].GatewayId" \
+                --output text 2>/dev/null || echo "")
+            
+            if [[ "$IGW_ROUTE" == igw-* ]]; then
+                log_info "  Subnet $sid ($az): public (IGW route via $RT, $ips IPs)"
+                if [[ $ips -gt $BEST_IPS ]]; then
+                    BEST_SUBNET="$sid"
+                    BEST_IPS=$ips
+                fi
+            else
+                log_info "  Subnet $sid ($az): no IGW default route (rt=$RT), skipping"
+            fi
+        done <<< "$CANDIDATE_SUBNETS"
+        
+        if [[ -z "$BEST_SUBNET" ]]; then
+            log_error "No truly public subnet found in VPC $VPC_ID."
+            log_error "A public subnet needs: MapPublicIpOnLaunch=true AND a 0.0.0.0/0 route to an igw-*."
+            log_error "Candidate subnets checked:"
+            echo "$CANDIDATE_SUBNETS" | while IFS=$'\t' read -r sid ips az; do
+                log_error "  $sid  IPs=$ips  AZ=$az  MapPublic=true  (missing IGW route)"
+            done
+            die "Set SUBNET_ID explicitly to a known public subnet."
+        fi
+        
+        SUBNET_ID="$BEST_SUBNET"
+        log_info "Auto-selected public subnet: $SUBNET_ID (VPC: $VPC_ID, available IPs: $BEST_IPS)"
     fi
     
     # Auto-create temporary security group if not set
