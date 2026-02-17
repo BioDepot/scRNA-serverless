@@ -180,6 +180,46 @@ normalize_pem_path() {
     echo "$pem_path"
 }
 
+# If running under WSL / MSYS bash, sometimes PowerShell env vars don't appear.
+# This helper pulls them from Windows via cmd.exe when missing.
+win_env() {
+    local var="$1"
+    if command -v cmd.exe >/dev/null 2>&1; then
+        local val
+        val="$(cmd.exe /c "echo %${var}%" 2>/dev/null | tr -d '\r')"
+        # If undefined, cmd.exe returns the literal %VAR%
+        if [[ "$val" == "%${var}%" ]]; then
+            val=""
+        fi
+        printf '%s' "$val"
+    else
+        printf '%s' ""
+    fi
+}
+
+maybe_import_windows_env() {
+    local var="$1"
+    local current="${!var:-}"
+    if [[ -z "$current" ]]; then
+        local pulled
+        pulled="$(win_env "$var")"
+        if [[ -n "$pulled" ]]; then
+            export "$var=$pulled"
+        fi
+    fi
+}
+
+normalize_windows_path_to_wsl() {
+    local p="$1"
+    # Convert "D:\foo\bar.pem" -> "/mnt/d/foo/bar.pem"
+    if [[ "$p" =~ ^([A-Za-z]):\\ ]]; then
+        local drive="${BASH_REMATCH[1],,}"
+        p="${p//\\/\/}"
+        p="/mnt/${drive}/${p:3}"
+    fi
+    printf '%s' "$p"
+}
+
 manage_sg_ingress() {
     local action=$1  # "authorize" or "revoke"
     local caller_ip=$2
@@ -262,6 +302,31 @@ if [[ $# -gt 1 ]]; then
 fi
 
 ################################################################################
+# Windows Environment Variable Import
+# Under WSL/MSYS bash, PowerShell env vars may not propagate automatically.
+################################################################################
+
+maybe_import_windows_env AWS_REGION
+maybe_import_windows_env KEY_NAME
+maybe_import_windows_env KEY_PEM_PATH
+maybe_import_windows_env EC2_INSTANCE_PROFILE_NAME
+maybe_import_windows_env SEED_AMI_ID
+maybe_import_windows_env SUBNET_ID
+maybe_import_windows_env SG_ID
+
+# Re-apply defaults after import (in case import populated them)
+AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
+KEY_NAME="${KEY_NAME:-$DEFAULT_KEY_NAME}"
+KEY_PEM_PATH="${KEY_PEM_PATH:-$DEFAULT_KEY_PEM_PATH}"
+EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PROFILE_NAME}"
+SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
+
+# Normalize Windows PEM path if needed
+if [[ -n "${KEY_PEM_PATH:-}" ]]; then
+    KEY_PEM_PATH="$(normalize_windows_path_to_wsl "$KEY_PEM_PATH")"
+fi
+
+################################################################################
 # Dry-Run Validation
 ################################################################################
 
@@ -294,13 +359,22 @@ validate_dry_run() {
         ((pass++))
     fi
     
-    # Docker
+    # Docker: only required on EC2 (run mode). In driver mode it runs on EC2.
     log_info "[CHECK 3/7] Docker..."
-    if ! need_cmd docker; then
-        log_error "  FAIL: Docker not installed"
-        ((fail++))
+    if [[ $RUN_MODE -eq 0 ]]; then
+        # Driver mode: Docker runs on EC2, not locally
+        if need_cmd docker && docker ps >/dev/null 2>&1; then
+            log_info "  PASS: Docker accessible (optional in driver mode)"
+            ((pass++))
+        else
+            log_info "  SKIP: Docker not required in driver mode (runs on EC2)"
+        fi
     else
-        if ! docker ps >/dev/null 2>&1; then
+        # Run mode: Docker is needed locally
+        if ! need_cmd docker; then
+            log_error "  FAIL: Docker not installed"
+            ((fail++))
+        elif ! docker ps >/dev/null 2>&1; then
             log_error "  FAIL: Docker not accessible (run: docker ps)"
             ((fail++))
         else
