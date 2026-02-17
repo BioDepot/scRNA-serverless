@@ -78,6 +78,9 @@ SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher acco
 AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
 AUTO_CREATE_SG=1                   # Auto-create temporary security group
 AUTO_DETECT_SEED_AMI=0             # For authors: disabled (use hardcoded AMI). For reviewers: set to 1
+AUTO_CREATE_KEYPAIR="${AUTO_CREATE_KEYPAIR:-1}"   # Auto-create EC2 keypair if missing
+AUTO_FIX_PEM_PERMS="${AUTO_FIX_PEM_PERMS:-1}"     # Fix PEM permissions on Windows via icacls
+OVERWRITE_PEM="${OVERWRITE_PEM:-0}"               # Allow overwriting existing PEM (safety off by default)
 
 ################################################################################
 # Default Configuration
@@ -169,16 +172,40 @@ get_caller_public_ip() {
     curl -s -m 5 http://checkip.amazonaws.com | tr -d ' \n' 2>/dev/null || echo ""
 }
 
-normalize_pem_path() {
-    # On Windows Git Bash, convert D:\path\to\key.pem to /d/path/to/key.pem
-    local pem_path="$1"
-    if [[ "$pem_path" =~ ^[A-Z]:\\(.*)$ ]]; then
-        # D:\path\to\file.pem -> /d/path/to/file.pem
-        local drive="${pem_path:0:1}"
-        local rest="${pem_path:2}"
-        pem_path="/${drive,,}${rest//\\/\/}"
+is_windows_host() {
+    command -v powershell.exe >/dev/null 2>&1
+}
+
+normalize_path_for_bash() {
+    local p="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$p"
+        return 0
     fi
-    echo "$pem_path"
+    # fallback: D:\path\file.pem -> /d/path/file.pem (Git Bash)
+    if [[ "$p" =~ ^([A-Za-z]):\\ ]]; then
+        local drive="${p:0:1}"
+        local rest="${p:2}"
+        echo "/${drive,,}${rest//\\/\/}"
+    else
+        echo "$p"
+    fi
+}
+
+win_path_from_bash() {
+    local p="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$p"
+    else
+        echo "$p"
+    fi
+}
+
+fix_pem_perms_windows() {
+    local win_pem="$1"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
+        "& { \$p='$win_pem'; icacls \$p /inheritance:r | Out-Null; icacls \$p /grant:r \"\$env:USERNAME:(R)\" | Out-Null; icacls \$p /grant:r \"Administrators:(R)\" | Out-Null; }" \
+        >/dev/null 2>&1 || true
 }
 
 # If running under WSL / MSYS bash, sometimes PowerShell env vars don't appear.
@@ -210,15 +237,56 @@ maybe_import_windows_env() {
     fi
 }
 
-normalize_windows_path_to_wsl() {
-    local p="$1"
-    # Convert "D:\foo\bar.pem" -> "/mnt/d/foo/bar.pem"
-    if [[ "$p" =~ ^([A-Za-z]):\\ ]]; then
-        local drive="${BASH_REMATCH[1],,}"
-        p="${p//\\/\/}"
-        p="/mnt/${drive}/${p:3}"
+ensure_keypair_and_pem() {
+    [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
+    [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
+
+    # Normalize to a bash-usable path (so -f, ssh -i, scp, etc work)
+    KEY_PEM_PATH="$(normalize_path_for_bash "$KEY_PEM_PATH")"
+
+    local pem="$KEY_PEM_PATH"
+    mkdir -p "$(dirname "$pem")" 2>/dev/null || true
+
+    local keypair_exists=0
+    if aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
+        keypair_exists=1
     fi
-    printf '%s' "$p"
+
+    if [[ ! -f "$pem" ]]; then
+        if [[ $keypair_exists -eq 1 ]]; then
+            die "AWS keypair '$KEY_NAME' exists but PEM file is missing at '$pem'. AWS cannot re-download the private key. Choose a NEW KEY_NAME and rerun."
+        fi
+        [[ "$AUTO_CREATE_KEYPAIR" -eq 1 ]] || die "PEM missing and AUTO_CREATE_KEYPAIR=0. Create keypair+PEM manually or set AUTO_CREATE_KEYPAIR=1."
+
+        log_info "Creating new keypair '$KEY_NAME' and writing PEM to '$pem'..."
+        aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$pem"
+        chmod 600 "$pem" 2>/dev/null || true
+
+        if is_windows_host && [[ "$AUTO_FIX_PEM_PERMS" -eq 1 ]]; then
+            local win_pem
+            win_pem="$(win_path_from_bash "$pem")"
+            fix_pem_perms_windows "$win_pem"
+        fi
+
+        log_info "Keypair created and PEM saved."
+        return 0
+    fi
+
+    # PEM exists locally
+    if [[ $keypair_exists -eq 0 ]]; then
+        if [[ "$OVERWRITE_PEM" -eq 1 && "$AUTO_CREATE_KEYPAIR" -eq 1 ]]; then
+            log_info "Local PEM exists but AWS keypair '$KEY_NAME' does not. OVERWRITE_PEM=1: recreating keypair and overwriting PEM..."
+            aws ec2 create-key-pair --region "$AWS_REGION" --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > "$pem"
+            chmod 600 "$pem" 2>/dev/null || true
+            if is_windows_host && [[ "$AUTO_FIX_PEM_PERMS" -eq 1 ]]; then
+                fix_pem_perms_windows "$(win_path_from_bash "$pem")"
+            fi
+        else
+            die "Local PEM exists at '$pem' but AWS keypair '$KEY_NAME' is missing. This will cause SSH key mismatch. Either choose a NEW KEY_NAME or set OVERWRITE_PEM=1 to recreate keypair and overwrite PEM."
+        fi
+    fi
+
+    log_info "Keypair '$KEY_NAME' verified (PEM exists, AWS keypair exists)."
 }
 
 manage_sg_ingress() {
@@ -324,7 +392,7 @@ SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
 
 # Normalize Windows PEM path if needed
 if [[ -n "${KEY_PEM_PATH:-}" ]]; then
-    KEY_PEM_PATH="$(normalize_windows_path_to_wsl "$KEY_PEM_PATH")"
+    KEY_PEM_PATH="$(normalize_path_for_bash "$KEY_PEM_PATH")"
 fi
 
 ################################################################################
@@ -399,17 +467,19 @@ validate_dry_run() {
     fi
     
     # PEM file
-    if [[ $RUN_MODE -eq 0 && -n "$KEY_PEM_PATH" ]]; then
+    if [[ $RUN_MODE -eq 0 ]]; then
         log_info "[CHECK 5/7] PEM file..."
-        if [[ ! -f "$KEY_PEM_PATH" ]]; then
-            log_error "  FAIL: PEM not found: $KEY_PEM_PATH"
-            ((fail++))
-        else
-            log_info "  PASS: PEM file exists"
+        if [[ -n "$KEY_PEM_PATH" && -f "$KEY_PEM_PATH" ]]; then
+            log_info "  PASS: PEM file exists: $KEY_PEM_PATH"
             ((pass++))
+        elif [[ "$AUTO_CREATE_KEYPAIR" -eq 1 ]]; then
+            log_info "  WARN: PEM not found at '${KEY_PEM_PATH:-<empty>}' but AUTO_CREATE_KEYPAIR=1 (will create on real run)"
+        else
+            log_error "  FAIL: PEM not found at '${KEY_PEM_PATH:-<empty>}' and AUTO_CREATE_KEYPAIR=0"
+            ((fail++))
         fi
     else
-        log_info "[CHECK 5/7] (skipped)"
+        log_info "[CHECK 5/7] (skipped, run mode)"
     fi
     
     # FASTQ URL
@@ -490,8 +560,8 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "Dataset: $DATASET"
     log_info "Run ID: $RUN_ID"
     
-    # Normalize KEY_PEM_PATH for Windows Git Bash
-    KEY_PEM_PATH=$(normalize_pem_path "$KEY_PEM_PATH")
+    # Ensure keypair exists in AWS and PEM is available locally
+    ensure_keypair_and_pem
     
     # Auto-detect seed AMI by name prefix if not set
     if [[ -z "$SEED_AMI_ID" && $AUTO_DETECT_SEED_AMI -eq 1 ]]; then
@@ -650,10 +720,8 @@ if [[ $RUN_MODE -eq 0 ]]; then
             --tags "Key=Name,Value=scrna-driver-ssh-$RUN_ID" 2>/dev/null || true
     fi
     
-    # Validate driver mode requirements
+    # Validate driver mode requirements (KEY_NAME/KEY_PEM_PATH already validated by ensure_keypair_and_pem)
     [[ -n "$SEED_AMI_ID" ]] || die "SEED_AMI_ID must be set (use AUTO_DETECT_SEED_AMI=1 or set it explicitly)"
-    [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
-    [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set (use AUTO_PICK_SUBNET=1 or set it explicitly)"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set (use AUTO_CREATE_SG=1 or set it explicitly)"
     [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
