@@ -96,6 +96,7 @@ SG_ID="${SG_ID:-}"
 DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
 EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PROFILE_NAME}"
 AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
+SSH_USER="${SSH_USER:-ubuntu}"    # SSH username (auto-detected if default fails)
 CREATED_SG_ID=""                  # Track SG created by this script for cleanup
 
 # Lambda Configuration
@@ -758,27 +759,62 @@ if [[ $RUN_MODE -eq 0 ]]; then
     SSH_OPTS=(
         -o StrictHostKeyChecking=no
         -o UserKnownHostsFile=/dev/null
+        -o BatchMode=yes
+        -o IdentitiesOnly=yes
         -o ConnectTimeout=10
         -o ServerAliveInterval=5
         -o ServerAliveCountMax=2
         -i "$KEY_PEM_PATH"
     )
     
-    for i in $(seq 1 60); do
-        if ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
-            SSH_READY=1
-            break
+    # Try SSH_USER first, then fallback candidates
+    SSH_USER_CANDIDATES=("$SSH_USER" ubuntu ec2-user admin)
+    # Remove duplicates while preserving order
+    declare -A _seen_user; _deduped_users=()
+    for u in "${SSH_USER_CANDIDATES[@]}"; do
+        if [[ -z "${_seen_user[$u]:-}" ]]; then
+            _deduped_users+=("$u")
+            _seen_user[$u]=1
         fi
+    done
+    SSH_USER_CANDIDATES=("${_deduped_users[@]}")
+    unset _seen_user _deduped_users
+    
+    for i in $(seq 1 60); do
+        for try_user in "${SSH_USER_CANDIDATES[@]}"; do
+            if ssh "${SSH_OPTS[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
+                SSH_USER="$try_user"
+                SSH_READY=1
+                break 2
+            fi
+        done
         sleep 5
     done
     
     if [[ "$SSH_READY" -ne 1 ]]; then
+        log_error "========== SSH DIAGNOSTICS =========="
         log_error "SSH never became reachable on $DRIVER_INSTANCE_IP:22 (instance $DRIVER_INSTANCE_ID)."
+        log_error "Tried users: ${SSH_USER_CANDIDATES[*]}"
+        log_error ""
+        log_error "PEM path (resolved in bash): $KEY_PEM_PATH"
+        ls -l "$KEY_PEM_PATH" >&2 2>/dev/null || log_error "  File NOT FOUND at that path inside bash"
+        log_error ""
+        log_error "Running one verbose SSH attempt for diagnostics..."
+        SSH_DEBUG_LOG="ssh_debug_${RUN_ID}.log"
+        ssh -vvv "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" "echo OK" >"$SSH_DEBUG_LOG" 2>&1 || true
+        log_error "Full debug log saved to: $SSH_DEBUG_LOG"
+        log_error "--- Last 60 lines ---"
+        tail -60 "$SSH_DEBUG_LOG" >&2 2>/dev/null || true
+        log_error "--- End debug log ---"
+        log_error ""
+        log_error "To test manually from PowerShell:"
+        log_error '  ssh -i $env:KEY_PEM_PATH -o StrictHostKeyChecking=no ubuntu@'"$DRIVER_INSTANCE_IP" '"echo OK"'
+        log_error ""
         log_error "Most common causes: wrong keypair/PEM mismatch, SG inbound 22 wrong IP, subnet not public, or your network blocks outbound 22."
         die "Cannot SSH to driver instance."
     fi
     
-    log_info "SSH is ready"
+    log_info "SSH is ready (user: $SSH_USER)"
     
     log_info "Copying repository to instance..."
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -787,20 +823,20 @@ if [[ $RUN_MODE -eq 0 ]]; then
     
     tar -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
     
-    scp "${SSH_OPTS[@]}" "$TARBALL_LOCAL" "ubuntu@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
+    scp "${SSH_OPTS[@]}" "$TARBALL_LOCAL" "${SSH_USER}@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
     
     rm -f "$TARBALL_LOCAL"
     
     log_info "Extracting repository on instance..."
     TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
-    ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" \
-        "rm -rf /home/ubuntu/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/ubuntu/scrna-repo && rm -f ${TARBALL_REMOTE}"
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
+        "rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && rm -f ${TARBALL_REMOTE}"
     
     log_info "Running pipeline in --run mode on instance..."
     
     # Export environment variables and run --run mode
     # Note: AWS_ACCOUNT_ID is NOT exported; it will be auto-detected in run mode
-    ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" <<SSHEOF
+    ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" <<SSHEOF
 export AWS_REGION=$AWS_REGION
 export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
@@ -812,7 +848,7 @@ export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
 export RUN_ID=$RUN_ID
 
-cd /home/ubuntu/scrna-repo
+cd /home/${SSH_USER}/scrna-repo
 bash scripts/e2e_serverless_pbmc.sh $DATASET --run
 SSHEOF
     
@@ -823,13 +859,13 @@ SSHEOF
         log_info "Downloading results from EC2 to local machine..."
         
         # Create tarball on EC2 (exclude large folders)
-        ssh "${SSH_OPTS[@]}" "ubuntu@$DRIVER_INSTANCE_IP" \
+        ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
             "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
         
         # Download tarball to local
         mkdir -p "$LOCAL_RESULTS_DIR/$RUN_ID"
         scp "${SSH_OPTS[@]}" \
-            "ubuntu@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
+            "${SSH_USER}@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
         
         # Extract locally
         log_info "Extracting results to $LOCAL_RESULTS_DIR/$RUN_ID/"
