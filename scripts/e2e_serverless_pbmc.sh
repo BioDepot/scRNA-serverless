@@ -230,7 +230,42 @@ maybe_fix_pem_perms_windows() {
     chmod 600 "$pem" 2>/dev/null || true
 }
 
-# Read an env var from the current process environment.
+# Compute local PEM fingerprint matching the format AWS uses for KeyFingerprint.
+#   SHA-1 (20 bytes / 19 colons) → AWS-created RSA keypairs: SHA1(DER-encoded private key)
+#   MD5  (16 bytes / 15 colons) → imported keypairs: MD5 of public key
+# Usage: compute_local_fp_for_aws <pem_path> <aws_fingerprint>
+compute_local_fp_for_aws() {
+    local pem="$1" aws_fp="$2"
+    local colon_count fp=""
+    colon_count="$(echo "$aws_fp" | tr -cd ':' | wc -c)"
+    colon_count="${colon_count// /}"  # trim whitespace from wc
+
+    if [[ "$colon_count" -eq 19 ]] || [[ "$colon_count" -ne 15 ]]; then
+        # SHA-1 of DER-encoded private key (AWS CreateKeyPair / Console)
+        # Use a temp file because DER is binary (null bytes break bash variables)
+        local tmpder
+        tmpder="$(mktemp)" || return 1
+        if openssl rsa -in "$pem" -outform DER -out "$tmpder" 2>/dev/null && [[ -s "$tmpder" ]]; then
+            local hex=""
+            if command -v sha1sum >/dev/null 2>&1; then
+                hex="$(sha1sum "$tmpder" | awk '{print $1}')"
+            else
+                hex="$(openssl dgst -sha1 "$tmpder" | awk '{print $NF}')"
+            fi
+            if [[ -n "$hex" && "$hex" != "da39a3ee5e6b4b0d3255bfef95601890afd80709" ]]; then
+                fp="$(echo "$hex" | sed 's/..\B/&:/g')"
+            fi
+        fi
+        rm -f "$tmpder"
+    fi
+
+    if [[ -z "$fp" && "$colon_count" -eq 15 ]]; then
+        # MD5 of public key (imported keypair)
+        fp="$(ssh-keygen -E md5 -lf "$pem" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
+    fi
+
+    printf '%s' "${fp,,}"
+}
 win_env() {
     local var="$1"
     printf '%s' "${!var-}"
@@ -273,14 +308,13 @@ ensure_keypair_and_pem() {
     local aws_fp local_fp
     aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
         --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-
-    local_fp="$(ssh-keygen -E md5 -lf "$pem" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
-
     aws_fp="${aws_fp,,}"
-    local_fp="${local_fp,,}"
 
     [[ -n "$aws_fp" ]] || die "Could not read AWS key fingerprint for '$KEY_NAME'."
-    [[ -n "$local_fp" ]] || die "Could not read local PEM fingerprint via ssh-keygen for '$pem'."
+
+    local_fp="$(compute_local_fp_for_aws "$pem" "$aws_fp")"
+
+    [[ -n "$local_fp" ]] || die "Could not compute local PEM fingerprint for '$pem' (need openssl + sha1sum or ssh-keygen)."
 
     [[ "$local_fp" == "$aws_fp" ]] || die "PEM does not match AWS keypair. Choose a NEW KEY_NAME or recreate the keypair+PEM."
     log_info "Keypair/PEM fingerprint match confirmed for '$KEY_NAME'."
@@ -499,8 +533,8 @@ validate_dry_run() {
                 fi
                 aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
                     --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-                local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
-                aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
+                aws_fp="${aws_fp,,}"
+                local_fp="$(compute_local_fp_for_aws "$pem_check" "$aws_fp")"
                 if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
                     log_error "  FAIL: Could not compute fingerprints for mismatch detection"
                     ((fail++))
