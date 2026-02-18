@@ -216,11 +216,8 @@ maybe_fix_pem_perms_windows() {
         win_pem="$(cygpath -w "$pem")"
     fi
 
-    # Username (usually present)
-    local user="${USERNAME:-}"
-    if [[ -z "$user" ]] && command -v cmd.exe >/dev/null 2>&1; then
-        user="$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')"
-    fi
+    # Username (usually present in Git Bash as $USERNAME)
+    local user="${USERNAME:-${USER:-}}"
 
     # Tighten ACLs (ignore failures)
     icacls.exe "$win_pem" /inheritance:r >/dev/null 2>&1 || true
@@ -234,7 +231,6 @@ maybe_fix_pem_perms_windows() {
 }
 
 # Read an env var from the current process environment.
-# (Previously called cmd.exe which can hang in MSYS/Git Bash.)
 win_env() {
     local var="$1"
     printf '%s' "${!var-}"
