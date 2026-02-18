@@ -845,7 +845,8 @@ if [[ $RUN_MODE -eq 0 ]]; then
             IAM_PROFILE_ARGS=(--iam-instance-profile "Name=${EC2_INSTANCE_PROFILE_NAME}")
         fi
         
-        DRIVER_INSTANCE_ID=$(aws ec2 run-instances \
+        DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
+        aws ec2 run-instances \
         --region "$AWS_REGION" \
         --image-id "$SEED_AMI_ID" \
         --instance-type "$INSTANCE_TYPE" \
