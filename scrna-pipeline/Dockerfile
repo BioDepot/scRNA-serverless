@@ -43,7 +43,7 @@ RUN pip install boto3
 RUN pip install awslambdaric
 
 COPY entry_script.sh /entry_script.sh
-RUN chmod +x /entry_script.sh
+RUN sed -i 's/\r$//' /entry_script.sh && chmod +x /entry_script.sh
 
 # Set RUST_BACKTRACE environment variable
 ENV RUST_BACKTRACE=1

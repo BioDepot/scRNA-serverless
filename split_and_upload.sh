@@ -6,6 +6,17 @@ R1_S3_PATH="$2"
 R2_S3_PATH="$3"
 BASENAME_WITH_LANE="$4"
 S3_INPUT_TXT_BUCKET_NAME="$5"
+SPLIT_LINES="${6:-${SPLIT_LINES:-16000000}}"  # lines per split (default 16M = 4M reads)
+if [[ -z "${SPLIT_LINES}" || ! "${SPLIT_LINES}" =~ ^[0-9]+$ || "${SPLIT_LINES}" -le 0 ]]; then
+  echo "ERROR: SPLIT_LINES must be a positive integer (got '${SPLIT_LINES}')" >&2
+  exit 1
+fi
+
+if (( SPLIT_LINES % 4 != 0 )); then
+  echo "ERROR: SPLIT_LINES must be divisible by 4 (FASTQ = 4 lines/read). Got '$SPLIT_LINES'." >&2
+  exit 1
+fi
+
 
 echo "$R1_S3_PATH"
 echo "$R2_S3_PATH"
@@ -22,9 +33,9 @@ R2_FILE=$(basename "$R2_S3_PATH")
 R1_BASE="${R1_FILE%.fastq.gz}"
 R2_BASE="${R2_FILE%.fastq.gz}"
 
-echo "Streaming & Splitting FASTQ files from S3..."
-aws s3 cp "$R1_S3_FULL_PATH" - | zcat | split -l 16000000 -d --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
-aws s3 cp "$R2_S3_FULL_PATH" - | zcat | split -l 16000000 -d --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+echo "Streaming & Splitting FASTQ files from S3 (split every $SPLIT_LINES lines)..."
+aws s3 cp "$R1_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+aws s3 cp "$R2_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
 wait
 
 # Rename files to remove zero padding (_p00 -> _p0, _p01 -> _p1, etc.)

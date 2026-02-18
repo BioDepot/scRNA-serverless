@@ -80,13 +80,16 @@ def run_piscem(files_r1, files_r2, input_folder):
     output_dir = "/tmp/output"
     os.makedirs(output_dir, exist_ok=True)
 
+    # Use available CPUs (Lambda vCPUs scale with memory; 3008MB = 2 vCPUs)
+    num_threads = os.cpu_count() or 2
+
     command = [
         "/var/task/piscem", "map-sc",
         "-i", f"{home_dir}/index_output_transcriptome/index_output_transcriptome",
         "-g", "chromium_v3",
         "-1", ",".join(files_r1),
         "-2", ",".join(files_r2),
-        "-t", "6",
+        "-t", str(num_threads),
         "-o", f"{output_dir}/split_map_output_transcriptome"
     ]
 
