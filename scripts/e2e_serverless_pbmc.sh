@@ -157,11 +157,18 @@ need_cmd() {
 }
 
 rand_hex() {
-    # Generate random 4-byte hex string without xxd (portable across platforms)
-    python3 - <<'PY'
-import os,binascii
-print(binascii.hexlify(os.urandom(4)).decode())
-PY
+    # Return N lowercase hex chars (default 8). No python dependency.
+    local n="${1:-8}"
+    local bytes=$(( (n + 1) / 2 ))
+    local hex=""
+    if command -v openssl >/dev/null 2>&1; then
+        hex=$(openssl rand -hex "$bytes" 2>/dev/null)
+    elif [[ -r /dev/urandom ]]; then
+        hex=$(od -An -N"$bytes" -tx1 /dev/urandom | tr -d ' \n')
+    else
+        hex=$(date +%s%N | sha1sum | tr -d ' \t-')
+    fi
+    printf '%s' "${hex:0:$n}"
 }
 
 get_caller_public_ip() {
