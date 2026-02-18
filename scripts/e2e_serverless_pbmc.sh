@@ -402,8 +402,15 @@ EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PR
 SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
 
 # Normalize Windows PEM path if needed
-if [[ -n "${KEY_PEM_PATH:-}" ]]; then
-    KEY_PEM_PATH="$(normalize_path_for_bash "$KEY_PEM_PATH")"
+# (Postponed: normalize inside validate_dry_run / ensure_keypair_and_pem
+#  so raw path is available for WSL detection and error messages.)
+
+# Fail fast if running under WSL — paths like D:\... resolve to /d/... which
+# does not exist in WSL (it uses /mnt/d/...).  The script is designed for
+# Git for Windows (Git Bash / MSYS / MINGW).
+if is_wsl && [[ $DRY_RUN_MODE -eq 1 || $RUN_MODE -eq 0 ]]; then
+    log_error "WSL bash detected ($(uname -a))."
+    die "Use Git for Windows (Git Bash) to run this script. uname must show MINGW/MSYS, not Linux."
 fi
 
 ################################################################################
@@ -486,40 +493,37 @@ validate_dry_run() {
         elif [[ -z "$KEY_PEM_PATH" ]]; then
             log_error "  FAIL: KEY_PEM_PATH not set"
             ((fail++))
+        elif ! command -v ssh-keygen >/dev/null 2>&1; then
+            log_error "  FAIL: ssh-keygen not found (required for PEM/keypair fingerprint validation)"
+            ((fail++))
         else
-            # Detect WSL: normalize_path_for_bash produces /d/... which doesn't exist in WSL
-            if is_wsl && [[ "$KEY_PEM_PATH" =~ ^[A-Za-z]:[/\\] ]] && ! command -v cygpath >/dev/null 2>&1; then
-                log_error "  FAIL: Detected WSL bash. Run this script from Git for Windows (Git Bash), not WSL."
-                log_error "        Open Git Bash and run the same command. (uname must show MINGW or MSYS, not Linux.)"
+            local raw_pem="$KEY_PEM_PATH"
+            pem_check="$(normalize_path_for_bash "$raw_pem")"
+            if [[ ! -f "$pem_check" ]]; then
+                log_error "  FAIL: PEM not found (raw='$raw_pem' resolved='$pem_check')"
+                ((fail++))
+            elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
+                log_error "  FAIL: AWS keypair not found: $KEY_NAME"
                 ((fail++))
             else
-                pem_check="$(normalize_path_for_bash "$KEY_PEM_PATH")"
-                if [[ ! -f "$pem_check" ]]; then
-                    log_error "  FAIL: PEM not found (raw='$KEY_PEM_PATH' resolved='$pem_check')"
+                warn="$(ssh-keygen -lf "$pem_check" 2>&1 || true)"
+                if echo "$warn" | grep -q -E "UNPROTECTED PRIVATE KEY FILE|is not a key file"; then
+                    log_info "PEM permissions too open or unreadable; tightening permissions (Windows)..."
+                    maybe_fix_pem_perms_windows "$pem_check"
+                fi
+                aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
+                    --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
+                local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
+                aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
+                if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
+                    log_error "  FAIL: Could not compute fingerprints for mismatch detection"
                     ((fail++))
-                elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
-                    log_error "  FAIL: AWS keypair not found: $KEY_NAME"
+                elif [[ "$aws_fp" != "$local_fp" ]]; then
+                    log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
                     ((fail++))
                 else
-                    warn="$(ssh-keygen -lf "$pem_check" 2>&1 || true)"
-                    if echo "$warn" | grep -q -E "UNPROTECTED PRIVATE KEY FILE|is not a key file"; then
-                        log_info "PEM permissions too open or unreadable; tightening permissions (Windows)..."
-                        maybe_fix_pem_perms_windows "$pem_check"
-                    fi
-                    aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
-                        --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-                    local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
-                    aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
-                    if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
-                        log_error "  FAIL: Could not compute fingerprints for mismatch detection"
-                        ((fail++))
-                    elif [[ "$aws_fp" != "$local_fp" ]]; then
-                        log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
-                        ((fail++))
-                    else
-                        log_info "  PASS: Keypair + PEM present and match"
-                        ((pass++))
-                    fi
+                    log_info "  PASS: Keypair + PEM present and match"
+                    ((pass++))
                 fi
             fi
         fi
