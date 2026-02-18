@@ -233,21 +233,11 @@ maybe_fix_pem_perms_windows() {
     chmod 600 "$pem" 2>/dev/null || true
 }
 
-# If running under WSL / MSYS bash, sometimes PowerShell env vars don't appear.
-# This helper pulls them from Windows via cmd.exe when missing.
+# Read an env var from the current process environment.
+# (Previously called cmd.exe which can hang in MSYS/Git Bash.)
 win_env() {
     local var="$1"
-    if command -v cmd.exe >/dev/null 2>&1; then
-        local val
-        val="$(cmd.exe /c "echo %${var}%" 2>/dev/null | tr -d '\r')"
-        # If undefined, cmd.exe returns the literal %VAR%
-        if [[ "$val" == "%${var}%" ]]; then
-            val=""
-        fi
-        printf '%s' "$val"
-    else
-        printf '%s' ""
-    fi
+    printf '%s' "${!var-}"
 }
 
 maybe_import_windows_env() {
