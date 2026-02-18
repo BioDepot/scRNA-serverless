@@ -173,6 +173,12 @@ is_windows_host() {
     command -v powershell.exe >/dev/null 2>&1
 }
 
+is_wsl() {
+    [[ -n "${WSL_INTEROP:-}" ]] && return 0
+    [[ -f /proc/version ]] && grep -qi microsoft /proc/version 2>/dev/null && return 0
+    return 1
+}
+
 normalize_path_for_bash() {
     local p="$1"
     if command -v cygpath >/dev/null 2>&1; then
@@ -198,11 +204,33 @@ win_path_from_bash() {
     fi
 }
 
-fix_pem_perms_windows() {
-    local win_pem="$1"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \
-        "& { \$p='$win_pem'; icacls \$p /inheritance:r | Out-Null; icacls \$p /grant:r \"\$env:USERNAME:(R)\" | Out-Null; icacls \$p /grant:r \"Administrators:(R)\" | Out-Null; }" \
-        >/dev/null 2>&1 || true
+maybe_fix_pem_perms_windows() {
+    local pem="$1"
+
+    # Only meaningful on Windows Git Bash
+    command -v icacls.exe >/dev/null 2>&1 || return 0
+
+    # Convert bash path -> Windows path
+    local win_pem="$pem"
+    if command -v cygpath >/dev/null 2>&1; then
+        win_pem="$(cygpath -w "$pem")"
+    fi
+
+    # Username (usually present)
+    local user="${USERNAME:-}"
+    if [[ -z "$user" ]] && command -v cmd.exe >/dev/null 2>&1; then
+        user="$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')"
+    fi
+
+    # Tighten ACLs (ignore failures)
+    icacls.exe "$win_pem" /inheritance:r >/dev/null 2>&1 || true
+    [[ -n "$user" ]] && icacls.exe "$win_pem" /grant:r "${user}:R" >/dev/null 2>&1 || true
+    icacls.exe "$win_pem" /grant:r "Administrators:R" >/dev/null 2>&1 || true
+    icacls.exe "$win_pem" /grant:r "SYSTEM:R" >/dev/null 2>&1 || true
+    icacls.exe "$win_pem" /remove "Users" "Everyone" >/dev/null 2>&1 || true
+
+    # Also set mode bits to keep OpenSSH happy
+    chmod 600 "$pem" 2>/dev/null || true
 }
 
 # If running under WSL / MSYS bash, sometimes PowerShell env vars don't appear.
@@ -248,6 +276,13 @@ ensure_keypair_and_pem() {
         || die "AWS keypair '$KEY_NAME' not found in region '$AWS_REGION'. Create/import it in EC2 → Key Pairs."
 
     need_cmd ssh-keygen || die "ssh-keygen not found (required for PEM/keypair fingerprint validation)."
+
+    local warn
+    warn="$(ssh-keygen -lf "$pem" 2>&1 || true)"
+    if echo "$warn" | grep -q -E "UNPROTECTED PRIVATE KEY FILE|is not a key file"; then
+        log_info "PEM permissions too open or unreadable; tightening permissions (Windows)..."
+        maybe_fix_pem_perms_windows "$pem"
+    fi
 
     local aws_fp local_fp
     aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
@@ -452,27 +487,39 @@ validate_dry_run() {
             log_error "  FAIL: KEY_PEM_PATH not set"
             ((fail++))
         else
-            pem_check="$(normalize_path_for_bash "$KEY_PEM_PATH")"
-            if [[ ! -f "$pem_check" ]]; then
-                log_error "  FAIL: PEM not found: $pem_check"
-                ((fail++))
-            elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
-                log_error "  FAIL: AWS keypair not found: $KEY_NAME"
+            # Detect WSL: normalize_path_for_bash produces /d/... which doesn't exist in WSL
+            if is_wsl && [[ "$KEY_PEM_PATH" =~ ^[A-Za-z]:[/\\] ]] && ! command -v cygpath >/dev/null 2>&1; then
+                log_error "  FAIL: Detected WSL bash. Run this script from Git for Windows (Git Bash), not WSL."
+                log_error "        Open Git Bash and run the same command. (uname must show MINGW or MSYS, not Linux.)"
                 ((fail++))
             else
-                aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
-                    --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-                local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
-                aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
-                if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
-                    log_error "  FAIL: Could not compute fingerprints for mismatch detection"
+                pem_check="$(normalize_path_for_bash "$KEY_PEM_PATH")"
+                if [[ ! -f "$pem_check" ]]; then
+                    log_error "  FAIL: PEM not found (raw='$KEY_PEM_PATH' resolved='$pem_check')"
                     ((fail++))
-                elif [[ "$aws_fp" != "$local_fp" ]]; then
-                    log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
+                elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
+                    log_error "  FAIL: AWS keypair not found: $KEY_NAME"
                     ((fail++))
                 else
-                    log_info "  PASS: Keypair + PEM present and match"
-                    ((pass++))
+                    warn="$(ssh-keygen -lf "$pem_check" 2>&1 || true)"
+                    if echo "$warn" | grep -q -E "UNPROTECTED PRIVATE KEY FILE|is not a key file"; then
+                        log_info "PEM permissions too open or unreadable; tightening permissions (Windows)..."
+                        maybe_fix_pem_perms_windows "$pem_check"
+                    fi
+                    aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
+                        --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
+                    local_fp="$(ssh-keygen -E md5 -lf "$pem_check" 2>/dev/null | awk '{print $2}' | sed 's/^MD5://g' || true)"
+                    aws_fp="${aws_fp,,}"; local_fp="${local_fp,,}"
+                    if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
+                        log_error "  FAIL: Could not compute fingerprints for mismatch detection"
+                        ((fail++))
+                    elif [[ "$aws_fp" != "$local_fp" ]]; then
+                        log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
+                        ((fail++))
+                    else
+                        log_info "  PASS: Keypair + PEM present and match"
+                        ((pass++))
+                    fi
                 fi
             fi
         fi
