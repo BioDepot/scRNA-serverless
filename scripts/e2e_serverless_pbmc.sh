@@ -23,13 +23,17 @@
 #   AWS_REGION             AWS region (default: us-east-2)
 #   INSTANCE_TYPE          EC2 instance type (default: m6id.16xlarge)
 #   ROOT_VOL_GB            EBS root volume size in GB (default: 200)
-#   KEY_NAME               Required in driver mode. Existing EC2 keypair name.
-#   KEY_PEM_PATH           Required in driver mode. Path to .pem file for SSH.
+#   KEY_NAME               Required in driver mode when USE_SSM=0. Existing EC2 keypair name.
+#   KEY_PEM_PATH           Required in driver mode when USE_SSM=0. Path to .pem file for SSH.
 #   SUBNET_ID              Required in driver mode. VPC subnet ID.
 #   SG_ID                  Required in driver mode. Security group ID.
 #   DRIVER_INSTANCE_ID     Optional: reuse existing EC2 instance (skip launch).
 #   EC2_INSTANCE_PROFILE_NAME  Required for reviewer-proof runs (grants AWS permissions to driver EC2)
 #   AUTO_SSH_INGRESS       Auto-authorize caller IP in SG for SSH (default: 1)
+#   USE_SSM                SSM connection mode: auto|1|0 (default: auto)
+#                          auto = try SSH ~60s, fallback to SSM if blocked
+#                          1    = SSM only (no SSH required, KEY_NAME/KEY_PEM_PATH optional)
+#                          0    = SSH only (original behavior)
 #
 #   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240)
 #                          Paper uses 10240MB, but some accounts are capped (e.g., 3008MB).
@@ -40,7 +44,7 @@
 #   THREADS                Number of CPU threads (default: nproc)
 #   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
-#   RUN_QC                 Run QC analysis on outputs (default: 1)
+#   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
 #   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar. Auto-set by DATASET if empty.
@@ -98,6 +102,7 @@ EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PR
 AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
 SSH_USER="${SSH_USER:-ubuntu}"    # SSH username (auto-detected if default fails)
 CREATED_SG_ID=""                  # Track SG created by this script for cleanup
+USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked networks
 
 # Lambda Configuration
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
@@ -145,6 +150,10 @@ log_info() {
 
 log_error() {
     echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
+}
+
+log_warn() {
+    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
 }
 
 die() {
@@ -382,6 +391,492 @@ init_resource_names() {
 }
 
 ################################################################################
+# Bash Resource Setup Functions (replaces set-up-resources.py — no python needed)
+################################################################################
+
+create_ecr_repo_if_needed() {
+    local repo_name="$1"
+    local uri="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo_name}"
+    if aws ecr describe-repositories --repository-names "$repo_name" \
+        --region "$AWS_REGION" >/dev/null 2>&1; then
+        log_info "ECR repository '$repo_name' already exists."
+    else
+        aws ecr create-repository --repository-name "$repo_name" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "$AWS_REGION" >/dev/null
+        log_info "ECR repository '$repo_name' created."
+    fi
+    echo "$uri"
+}
+
+build_and_push_lambda_image() {
+    local repo_uri="$1" image_name="$2" build_dir="$3"
+    local docker_tag="${repo_uri}:${image_name}"
+
+    log_info "Building Docker image: $image_name ..."
+    $DOCKER build --platform linux/amd64 -t "$image_name" "$build_dir"
+
+    log_info "Tagging image as $docker_tag"
+    $DOCKER tag "$image_name" "$docker_tag"
+
+    log_info "Logging into ECR..."
+    aws ecr get-login-password --region "$AWS_REGION" | \
+        $DOCKER login --username AWS --password-stdin \
+        "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+    log_info "Pushing image to ECR..."
+    $DOCKER push "$docker_tag"
+
+    log_info "Docker image pushed: $docker_tag"
+    echo "$docker_tag"
+}
+
+create_lambda_execution_role() {
+    local role_name="$1"
+
+    # Check if role already exists
+    local existing_arn
+    existing_arn=$(aws iam get-role --role-name "$role_name" \
+        --query 'Role.Arn' --output text 2>/dev/null || echo "")
+    if [[ -n "$existing_arn" && "$existing_arn" != "None" ]]; then
+        log_info "IAM role '$role_name' already exists: $existing_arn"
+        echo "$existing_arn"
+        return 0
+    fi
+
+    local trust_policy='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["lambda.amazonaws.com","events.amazonaws.com"]},"Action":"sts:AssumeRole"}]}'
+
+    local role_arn
+    role_arn=$(aws iam create-role \
+        --role-name "$role_name" \
+        --assume-role-policy-document "$trust_policy" \
+        --description "Lambda execution role with EventBridge trigger" \
+        --query 'Role.Arn' --output text)
+
+    log_info "Created IAM role '$role_name': $role_arn"
+
+    # Attach required policies (same as set-up-resources.py)
+    local policies=(
+        "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        "arn:aws:iam::aws:policy/service-role/AmazonS3ObjectLambdaExecutionRolePolicy"
+        "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+    )
+
+    local max_retries=5
+    for policy_arn in "${policies[@]}"; do
+        local delay=5
+        for attempt in $(seq 1 $max_retries); do
+            if aws iam attach-role-policy --role-name "$role_name" \
+                --policy-arn "$policy_arn" 2>/dev/null; then
+                log_info "Attached policy $policy_arn"
+                break
+            fi
+            [[ $attempt -eq $max_retries ]] && die "Failed to attach policy $policy_arn after $max_retries attempts."
+            sleep "$delay"; delay=$((delay * 2))
+        done
+    done
+
+    echo "$role_arn"
+}
+
+create_lambda_function_from_image() {
+    local func_name="$1" role_arn="$2" image_uri="$3"
+    local mem="$4" eph="$5" timeout_sec="$6"
+
+    local env_json
+    env_json=$(jq -n \
+        --arg out "$OUTPUT_MAP_BUCKET" \
+        --arg inp "$INPUT_FASTQ_BUCKET" \
+        --arg txt "$INPUT_TXT_BUCKET" \
+        '{Variables:{S3_OUTPUT_BUCKET_NAME:$out,S3_INPUT_BUCKET_NAME:$inp,S3_INPUT_TXT_BUCKET_NAME:$txt}}')
+
+    # Check if function already exists
+    local existing_arn
+    existing_arn=$(aws lambda get-function --function-name "$func_name" \
+        --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
+    if [[ -n "$existing_arn" && "$existing_arn" != "None" ]]; then
+        log_info "Lambda function '$func_name' already exists."
+        echo "$existing_arn"
+        return 0
+    fi
+
+    local max_retries=5 delay=5
+    for attempt in $(seq 1 $max_retries); do
+        local func_arn
+        if func_arn=$(aws lambda create-function \
+            --function-name "$func_name" \
+            --role "$role_arn" \
+            --code "ImageUri=$image_uri" \
+            --package-type Image \
+            --memory-size "$mem" \
+            --ephemeral-storage "Size=$eph" \
+            --timeout "$timeout_sec" \
+            --architectures x86_64 \
+            --environment "$env_json" \
+            --region "$AWS_REGION" \
+            --query 'FunctionArn' --output text 2>/dev/null); then
+            log_info "Lambda function '$func_name' created."
+            echo "$func_arn"
+            return 0
+        fi
+        log_info "Lambda creation attempt $attempt/$max_retries failed, retrying in ${delay}s..."
+        sleep "$delay"; delay=$((delay * 2))
+    done
+
+    return 1
+}
+
+create_eventbridge_rule_for_lambda() {
+    local rule_name="$1" lambda_arn="$2" bucket_name="$3"
+
+    # Ensure EventBridge notifications enabled on bucket
+    aws s3api put-bucket-notification-configuration \
+        --bucket "$bucket_name" \
+        --notification-configuration '{"EventBridgeConfiguration":{}}' \
+        --region "$AWS_REGION" 2>/dev/null || true
+
+    # Create EventBridge rule
+    local event_pattern
+    event_pattern=$(jq -n --arg b "$bucket_name" \
+        '{source:["aws.s3"],"detail-type":["Object Created"],detail:{bucket:{name:[$b]}}}')
+
+    local rule_arn
+    rule_arn=$(aws events put-rule \
+        --name "$rule_name" \
+        --event-pattern "$event_pattern" \
+        --state ENABLED \
+        --region "$AWS_REGION" \
+        --query 'RuleArn' --output text)
+
+    log_info "EventBridge rule '$rule_name' created."
+
+    # Add Lambda as target
+    aws events put-targets \
+        --rule "$rule_name" \
+        --targets "Id=LambdaTarget,Arn=$lambda_arn" \
+        --region "$AWS_REGION" >/dev/null
+
+    log_info "Lambda added as target to rule '$rule_name'."
+
+    # Grant EventBridge permission to invoke Lambda
+    aws lambda add-permission \
+        --function-name "$LAMBDA_FUNCTION_NAME" \
+        --statement-id "EventBridgeInvoke-$(date +%s)" \
+        --action "lambda:InvokeFunction" \
+        --principal "events.amazonaws.com" \
+        --source-arn "$rule_arn" \
+        --region "$AWS_REGION" >/dev/null 2>&1 || log_info "Lambda invoke permission already exists (ok)"
+
+    # Verify rule is enabled
+    local max_wait=30 elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        local state
+        state=$(aws events describe-rule --name "$rule_name" --region "$AWS_REGION" \
+            --query 'State' --output text 2>/dev/null || echo "")
+        if [[ "$state" == "ENABLED" ]]; then
+            log_info "EventBridge rule verified ENABLED."
+            return 0
+        fi
+        sleep 5; elapsed=$((elapsed + 5))
+    done
+    log_warn "EventBridge rule not confirmed ENABLED within ${max_wait}s (continuing)."
+}
+
+################################################################################
+# Bash FASTQ Processing Functions (replaces process_fastq.py — no python needed)
+################################################################################
+
+find_s3_fastq_pairs() {
+    # Outputs lines: base_with_lane<TAB>read_type<TAB>key for each R1/R2 .fastq.gz
+    local bucket="$1"
+    aws s3api list-objects-v2 --bucket "$bucket" --region "$AWS_REGION" \
+        --query "Contents[].Key" --output text 2>/dev/null | \
+    tr '\t' '\n' | grep '\.fastq\.gz$' | grep -v '_I[12]_' | sort | \
+    while IFS= read -r key; do
+        if [[ "$key" =~ ^(.+_L[0-9]{3})_(R[12])_[0-9]{3}(_p[0-9]+)?\.fastq\.gz$ ]]; then
+            printf '%s\t%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "$key"
+        fi
+    done
+}
+
+create_and_upload_input_txt() {
+    local lane_id="$1" r1_s3_path="$2" r2_s3_path="$3" base_folder="$4"
+    local input_file="/tmp/${lane_id}_p0_input.txt"
+    printf '%s\n%s\n' "$r1_s3_path" "$r2_s3_path" > "$input_file"
+
+    local s3_key
+    if [[ -n "$base_folder" && "$base_folder" != "." ]]; then
+        s3_key="${base_folder}/${lane_id}_p0_input.txt"
+    else
+        s3_key="${lane_id}_p0_input.txt"
+    fi
+
+    aws s3 cp "$input_file" "s3://${INPUT_TXT_BUCKET}/${s3_key}" \
+        --region "$AWS_REGION" --only-show-errors
+    rm -f "$input_file"
+    log_info "Uploaded input.txt for ${lane_id}_p0"
+}
+
+process_fastq_bash() {
+    local output_dir="$1"
+
+    log_info "Finding FASTQ pairs in S3 bucket $INPUT_FASTQ_BUCKET ..."
+
+    declare -A PF_R1_KEYS PF_R2_KEYS
+    local pair_info
+    pair_info=$(find_s3_fastq_pairs "$INPUT_FASTQ_BUCKET")
+
+    while IFS=$'\t' read -r base read_type key; do
+        [[ -z "$base" ]] && continue
+        if [[ "$read_type" == "R1" ]]; then
+            PF_R1_KEYS["$base"]="$key"
+        else
+            PF_R2_KEYS["$base"]="$key"
+        fi
+    done <<< "$pair_info"
+
+    local INPUT_FOLDERS=()
+
+    for base in "${!PF_R1_KEYS[@]}"; do
+        local r1_key="${PF_R1_KEYS[$base]}"
+        local r2_key="${PF_R2_KEYS[$base]:-}"
+        [[ -z "$r2_key" ]] && { log_warn "No R2 for $base, skipping"; continue; }
+
+        local lane_id base_folder
+        lane_id=$(basename "$base")
+        base_folder=$(dirname "$base")
+        [[ "$base_folder" == "." ]] && base_folder=""
+
+        # Check combined file size
+        local r1_bytes r2_bytes combined_bytes seven_gb
+        r1_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r1_key" \
+            --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+        r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
+            --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+        combined_bytes=$(( r1_bytes + r2_bytes ))
+        seven_gb=$(( 7 * 1024 * 1024 * 1024 ))
+        log_info "Pair $lane_id: combined size $(( combined_bytes / 1048576 )) MB"
+
+        if [[ $combined_bytes -lt $seven_gb ]]; then
+            local r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_key}"
+            local r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_key}"
+            sleep 3
+            create_and_upload_input_txt "$lane_id" "$r1_s3" "$r2_s3" "$base_folder"
+            INPUT_FOLDERS+=("${lane_id}_p0")
+        else
+            log_info "Splitting large files for $lane_id ..."
+            local num_parts
+            num_parts=$(bash /home/ubuntu/scrna-repo/split_and_upload.sh \
+                "$INPUT_FASTQ_BUCKET" "$r1_key" "$r2_key" "$base" "$INPUT_TXT_BUCKET" 2>&1 | tail -1)
+            if [[ "${num_parts:-0}" -gt 0 ]]; then
+                for idx in $(seq 0 $((num_parts - 1))); do
+                    INPUT_FOLDERS+=("${lane_id}_p${idx}")
+                done
+            else
+                die "split_and_upload.sh failed for $lane_id"
+            fi
+        fi
+    done
+
+    local input_count=${#INPUT_FOLDERS[@]}
+    log_info "Total input folders: $input_count"
+    [[ $input_count -gt 0 ]] || die "No input folders created. Check FASTQ files in $INPUT_FASTQ_BUCKET"
+
+    # Wait 30s for EventBridge propagation (matches process_fastq.py behavior)
+    log_info "Waiting 30s for EventBridge/Lambda warm-up..."
+    sleep 30
+
+    # Poll output bucket
+    log_info "Polling output bucket $OUTPUT_MAP_BUCKET for Lambda results..."
+    local poll_start
+    poll_start=$(date +%s)
+
+    while true; do
+        local completed=0
+        for folder in "${INPUT_FOLDERS[@]}"; do
+            if aws s3api head-object --bucket "$OUTPUT_MAP_BUCKET" \
+                --key "piscem_output/${folder}/output.txt" \
+                --region "$AWS_REGION" >/dev/null 2>&1; then
+                ((completed++))
+            fi
+        done
+
+        log_info "Output progress: $completed / $input_count"
+
+        if [[ $completed -ge $input_count ]]; then
+            break
+        fi
+
+        local elapsed=$(( $(date +%s) - poll_start ))
+        if [[ $elapsed -gt $PROCESS_FASTQ_TIMEOUT_SEC ]]; then
+            die "Timeout (${PROCESS_FASTQ_TIMEOUT_SEC}s) waiting for Lambda outputs."
+        fi
+        sleep "$POLL_INTERVAL_SECONDS"
+    done
+
+    local elapsed_sec=$(( $(date +%s) - poll_start ))
+    log_info "All $input_count outputs ready ($((elapsed_sec / 60)) min $((elapsed_sec % 60)) sec)"
+
+    # Download outputs
+    log_info "Downloading output files from $OUTPUT_MAP_BUCKET ..."
+    for folder in "${INPUT_FOLDERS[@]}"; do
+        local local_dir="${output_dir}/piscem_output/${folder}"
+        mkdir -p "$local_dir"
+        aws s3 sync "s3://${OUTPUT_MAP_BUCKET}/piscem_output/${folder}/" "$local_dir/" \
+            --region "$AWS_REGION" --only-show-errors
+    done
+
+    log_info "All output files downloaded to $output_dir"
+}
+
+################################################################################
+# SSM Helper Functions (for driver mode when SSH is blocked)
+################################################################################
+
+ssm_wait_for_managed() {
+    local instance_id="$1" max_wait="${2:-300}"
+    log_info "Waiting for instance $instance_id to become SSM-managed ..."
+    local elapsed=0
+    while [[ $elapsed -lt $max_wait ]]; do
+        local managed
+        managed=$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --filters "Key=InstanceIds,Values=$instance_id" \
+            --query 'InstanceInformationList[0].InstanceId' \
+            --output text 2>/dev/null || echo "")
+        if [[ "$managed" == "$instance_id" ]]; then
+            log_info "Instance $instance_id is SSM-managed."
+            return 0
+        fi
+        sleep 10; elapsed=$((elapsed + 10))
+    done
+    die "Instance $instance_id not SSM-managed after ${max_wait}s. Ensure instance profile '$EC2_INSTANCE_PROFILE_NAME' includes the AmazonSSMManagedInstanceCore policy."
+}
+
+ssm_run_command() {
+    # Run a short command via SSM and return stdout
+    local instance_id="$1" cmd_text="$2" timeout_sec="${3:-600}"
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "{\"commands\":[\"$cmd_text\"]}" \
+        --timeout-seconds "$timeout_sec" \
+        --query 'Command.CommandId' --output text)
+
+    # Poll for completion
+    while true; do
+        local inv status
+        inv=$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --output json 2>/dev/null || echo '{"Status":"Pending"}')
+        status=$(echo "$inv" | jq -r '.Status')
+        case "$status" in
+            Success)
+                echo "$inv" | jq -r '.StandardOutputContent // ""'
+                return 0 ;;
+            Failed|TimedOut|Cancelled)
+                log_error "SSM command $status (ID: $cmd_id)"
+                echo "$inv" | jq -r '.StandardErrorContent // ""' >&2
+                return 1 ;;
+            *) sleep 5 ;;
+        esac
+    done
+}
+
+ssm_run_pipeline() {
+    # Run the e2e pipeline via SSM send-command with S3 output capture
+    local instance_id="$1" dataset="$2"
+    local transfer_bucket="$3" run_id="$4"
+
+    # Build commands array via jq
+    local cmds_json
+    cmds_json=$(jq -n \
+        --arg region "$AWS_REGION" \
+        --arg mem "$LAMBDA_MEMORY_MB" \
+        --arg eph "$LAMBDA_EPHEMERAL_MB" \
+        --arg timeout "$LAMBDA_TIMEOUT_SEC" \
+        --arg threads "$THREADS" \
+        --arg cleanup "$CLEANUP_AWS" \
+        --arg fastq_path "${FASTQ_TAR_PATH:-}" \
+        --arg fastq_url "${FASTQ_TAR_URL:-}" \
+        --arg write_h5ad "$WRITE_H5AD" \
+        --arg run_id "$run_id" \
+        --arg run_qc "$RUN_QC" \
+        --arg user "$SSH_USER" \
+        --arg ds "$dataset" \
+        '{commands:[
+            "#!/bin/bash",
+            "set -euo pipefail",
+            ("export AWS_REGION=" + $region),
+            ("export LAMBDA_MEMORY_MB=" + $mem),
+            ("export LAMBDA_EPHEMERAL_MB=" + $eph),
+            ("export LAMBDA_TIMEOUT_SEC=" + $timeout),
+            ("export THREADS=" + $threads),
+            ("export CLEANUP_AWS=" + $cleanup),
+            ("export FASTQ_TAR_PATH=" + $fastq_path),
+            ("export FASTQ_TAR_URL=" + $fastq_url),
+            ("export WRITE_H5AD=" + $write_h5ad),
+            ("export RUN_ID=" + $run_id),
+            ("export RUN_QC=" + $run_qc),
+            ("cd /home/" + $user + "/scrna-repo"),
+            ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
+        ]}')
+
+    local cmd_id
+    cmd_id=$(aws ssm send-command \
+        --region "$AWS_REGION" \
+        --instance-ids "$instance_id" \
+        --document-name "AWS-RunShellScript" \
+        --parameters "$cmds_json" \
+        --timeout-seconds 7200 \
+        --output-s3-bucket-name "$transfer_bucket" \
+        --output-s3-key-prefix "ssm-output/$run_id" \
+        --query 'Command.CommandId' --output text)
+
+    log_info "SSM pipeline command sent: $cmd_id"
+
+    # Poll for completion, stream available output
+    local last_len=0
+    while true; do
+        local inv status
+        inv=$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$cmd_id" \
+            --instance-id "$instance_id" \
+            --output json 2>/dev/null || echo '{"Status":"InProgress"}')
+        status=$(echo "$inv" | jq -r '.Status')
+
+        # Stream stdout incrementally
+        local stdout
+        stdout=$(echo "$inv" | jq -r '.StandardOutputContent // ""')
+        local cur_len=${#stdout}
+        if [[ $cur_len -gt $last_len ]]; then
+            printf '%s' "${stdout:$last_len}"
+            last_len=$cur_len
+        fi
+
+        case "$status" in
+            Success)
+                log_info "Pipeline completed successfully via SSM."
+                return 0 ;;
+            Failed|TimedOut|Cancelled)
+                log_error "Pipeline command $status (SSM ID: $cmd_id)"
+                echo "$inv" | jq -r '.StandardErrorContent // ""' >&2
+                # Download full log from S3
+                log_info "Downloading full SSM output log from S3..."
+                aws s3 sync "s3://${transfer_bucket}/ssm-output/${run_id}/" \
+                    "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output/" --region "$AWS_REGION" 2>/dev/null || true
+                return 1 ;;
+            *) sleep 15 ;;
+        esac
+    done
+}
+
+################################################################################
 # Argument Parsing
 ################################################################################
 
@@ -420,6 +915,7 @@ maybe_import_windows_env EC2_INSTANCE_PROFILE_NAME
 maybe_import_windows_env SEED_AMI_ID
 maybe_import_windows_env SUBNET_ID
 maybe_import_windows_env SG_ID
+maybe_import_windows_env USE_SSM
 
 # Re-apply defaults after import (in case import populated them)
 AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
@@ -514,7 +1010,9 @@ validate_dry_run() {
     # Keypair + PEM
     if [[ $RUN_MODE -eq 0 ]]; then
         log_info "[CHECK 5/7] Keypair + PEM..."
-        if [[ -z "$KEY_NAME" ]]; then
+        if [[ "$USE_SSM" == "1" && -z "$KEY_NAME" ]]; then
+            log_info "  SKIP: KEY_NAME not set but USE_SSM=1 (SSH not required)"
+        elif [[ -z "$KEY_NAME" ]]; then
             log_error "  FAIL: KEY_NAME not set"
             ((fail++))
         elif [[ -z "$KEY_PEM_PATH" ]]; then
@@ -635,9 +1133,17 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "======== E2E Serverless scRNA Pipeline (DRIVER MODE) ========"
     log_info "Dataset: $DATASET"
     log_info "Run ID: $RUN_ID"
+    log_info "USE_SSM: $USE_SSM"
     
-    # Ensure keypair exists in AWS and PEM is available locally
-    ensure_keypair_and_pem
+    # Validate and ensure keypair+PEM (only when SSH may be used)
+    if [[ "$USE_SSM" != "1" ]]; then
+        ensure_keypair_and_pem
+    elif [[ -n "$KEY_NAME" && -n "$KEY_PEM_PATH" ]]; then
+        # SSM=1 but keys provided — validate them (useful for fallback)
+        ensure_keypair_and_pem
+    else
+        log_info "USE_SSM=1: skipping keypair/PEM validation (SSH not required)."
+    fi
     
     # Auto-detect seed AMI by name prefix if not set
     if [[ -z "$SEED_AMI_ID" && $AUTO_DETECT_SEED_AMI -eq 1 ]]; then
@@ -796,13 +1302,15 @@ if [[ $RUN_MODE -eq 0 ]]; then
             --tags "Key=Name,Value=scrna-driver-ssh-$RUN_ID" 2>/dev/null || true
     fi
     
-    # Validate driver mode requirements (KEY_NAME/KEY_PEM_PATH/PEM validated by ensure_keypair_and_pem)
+    # Validate driver mode requirements
     [[ -n "$SEED_AMI_ID" ]] || die "SEED_AMI_ID must be set (use AUTO_DETECT_SEED_AMI=1 or set it explicitly)"
-    [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode"
-    [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode"
+    if [[ "$USE_SSM" == "0" ]]; then
+        [[ -n "$KEY_NAME" ]] || die "KEY_NAME must be set in driver mode (or set USE_SSM=auto|1)"
+        [[ -n "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH must be set in driver mode (or set USE_SSM=auto|1)"
+        [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
+    fi
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set (use AUTO_PICK_SUBNET=1 or set it explicitly)"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set (use AUTO_CREATE_SG=1 or set it explicitly)"
-    [[ -f "$KEY_PEM_PATH" ]] || die "KEY_PEM_PATH does not exist: $KEY_PEM_PATH"
     [[ -n "$EC2_INSTANCE_PROFILE_NAME" ]] || die "EC2_INSTANCE_PROFILE_NAME is required for reviewer-proof execution (no credentials baked into AMI)."
     
     # Resume logic: check for existing instance
@@ -845,12 +1353,18 @@ if [[ $RUN_MODE -eq 0 ]]; then
             IAM_PROFILE_ARGS=(--iam-instance-profile "Name=${EC2_INSTANCE_PROFILE_NAME}")
         fi
         
+        # Build key-name args (optional when using SSM)
+        KEY_NAME_ARGS=()
+        if [[ -n "$KEY_NAME" ]]; then
+            KEY_NAME_ARGS=(--key-name "$KEY_NAME")
+        fi
+        
         DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
         aws ec2 run-instances \
         --region "$AWS_REGION" \
         --image-id "$SEED_AMI_ID" \
         --instance-type "$INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
+        "${KEY_NAME_ARGS[@]}" \
         --subnet-id "$SUBNET_ID" \
         --security-group-ids "$SG_ID" \
         "${IAM_PROFILE_ARGS[@]}" \
@@ -879,14 +1393,16 @@ if [[ $RUN_MODE -eq 0 ]]; then
         sleep 2
     done
     
-    if [[ -z "$DRIVER_INSTANCE_IP" ]]; then
-        die "Instance has no public IP. Check subnet auto-assign setting."
+    if [[ -z "$DRIVER_INSTANCE_IP" || "$DRIVER_INSTANCE_IP" == "None" ]]; then
+        log_warn "Instance has no public IP (may be expected for SSM-only mode)."
+        DRIVER_INSTANCE_IP=""
+    else
+        log_info "Instance IP: $DRIVER_INSTANCE_IP"
     fi
     
-    log_info "Instance IP: $DRIVER_INSTANCE_IP"
-    
-    # Auto-authorize caller IP for SSH
-    if [[ $AUTO_SSH_INGRESS -eq 1 ]]; then
+    # Auto-authorize caller IP for SSH (only when SSH might be used)
+    CALLER_IP_TO_REVOKE=""
+    if [[ "$USE_SSM" != "1" && $AUTO_SSH_INGRESS -eq 1 && -n "$DRIVER_INSTANCE_IP" ]]; then
         CALLER_IP=$(get_caller_public_ip)
         if [[ -n "$CALLER_IP" ]]; then
             manage_sg_ingress authorize "$CALLER_IP"
@@ -900,100 +1416,172 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "Waiting for EC2 status checks (instance-status-ok)..."
     aws ec2 wait instance-status-ok --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
     
-    log_info "Waiting for SSH readiness..."
-    SSH_READY=0
+    ############################################################################
+    # Determine connection method: ssh or ssm
+    ############################################################################
+    CONNECT_METHOD=""
+    SSH_OPTS=()
     
-    SSH_OPTS=(
-        -o StrictHostKeyChecking=no
-        -o UserKnownHostsFile=/dev/null
-        -o BatchMode=yes
-        -o IdentitiesOnly=yes
-        -o ConnectTimeout=10
-        -o ServerAliveInterval=5
-        -o ServerAliveCountMax=2
-        -i "$KEY_PEM_PATH"
-    )
-    
-    # Try SSH_USER first, then fallback candidates
-    SSH_USER_CANDIDATES=("$SSH_USER" ubuntu ec2-user admin)
-    # Remove duplicates while preserving order
-    declare -A _seen_user; _deduped_users=()
-    for u in "${SSH_USER_CANDIDATES[@]}"; do
-        if [[ -z "${_seen_user[$u]:-}" ]]; then
-            _deduped_users+=("$u")
-            _seen_user[$u]=1
+    if [[ "$USE_SSM" == "1" ]]; then
+        CONNECT_METHOD="ssm"
+        log_info "USE_SSM=1: using SSM exclusively (no SSH)."
+    else
+        # Build SSH options (needed for both USE_SSM=0 and auto)
+        if [[ -n "$KEY_PEM_PATH" && -f "$KEY_PEM_PATH" ]]; then
+            SSH_OPTS=(
+                -o StrictHostKeyChecking=no
+                -o UserKnownHostsFile=/dev/null
+                -o BatchMode=yes
+                -o IdentitiesOnly=yes
+                -o ConnectTimeout=10
+                -o ServerAliveInterval=5
+                -o ServerAliveCountMax=2
+                -i "$KEY_PEM_PATH"
+            )
         fi
-    done
-    SSH_USER_CANDIDATES=("${_deduped_users[@]}")
-    unset _seen_user _deduped_users
-    
-    for i in $(seq 1 60); do
-        for try_user in "${SSH_USER_CANDIDATES[@]}"; do
-            if ssh "${SSH_OPTS[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
-                SSH_USER="$try_user"
-                SSH_READY=1
-                break 2
+        
+        # Try SSH_USER first, then fallback candidates
+        SSH_USER_CANDIDATES=("$SSH_USER" ubuntu ec2-user admin)
+        # Remove duplicates while preserving order
+        declare -A _seen_user; _deduped_users=()
+        for u in "${SSH_USER_CANDIDATES[@]}"; do
+            if [[ -z "${_seen_user[$u]:-}" ]]; then
+                _deduped_users+=("$u")
+                _seen_user[$u]=1
             fi
         done
-        sleep 5
-    done
-    
-    if [[ "$SSH_READY" -ne 1 ]]; then
-        log_error "========== SSH DIAGNOSTICS =========="
-        log_error "SSH never became reachable on $DRIVER_INSTANCE_IP:22 (instance $DRIVER_INSTANCE_ID)."
-        log_error "Tried users: ${SSH_USER_CANDIDATES[*]}"
-        log_error ""
-        log_error "PEM path (resolved in bash): $KEY_PEM_PATH"
-        ls -l "$KEY_PEM_PATH" >&2 2>/dev/null || log_error "  File NOT FOUND at that path inside bash"
-        log_error ""
-        log_error "Running one verbose SSH attempt for diagnostics..."
-        SSH_DEBUG_LOG="ssh_debug_${RUN_ID}.log"
-        ssh -vvv "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" "echo OK" >"$SSH_DEBUG_LOG" 2>&1 || true
-        log_error "Full debug log saved to: $SSH_DEBUG_LOG"
-        log_error "--- Last 60 lines ---"
-        tail -60 "$SSH_DEBUG_LOG" >&2 2>/dev/null || true
-        log_error "--- End debug log ---"
-        log_error ""
-        log_error "To test manually from PowerShell:"
-        log_error '  ssh -i $env:KEY_PEM_PATH -o StrictHostKeyChecking=no ubuntu@'"$DRIVER_INSTANCE_IP" '"echo OK"'
-        log_error ""
-        log_error "Instance KeyName:"
-        aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" \
-          --query 'Reservations[0].Instances[0].KeyName' --output text 2>/dev/null >&2 || true
-        log_error ""
-        log_error "Security Group: $SG_ID"
-        log_error "SG inbound rules for tcp/22:"
-        aws ec2 describe-security-groups --region "$AWS_REGION" --group-ids "$SG_ID" \
-          --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\` && ToPort==\`22\`]" \
-          --output json 2>/dev/null >&2 || true
-        log_error ""
-        log_error "Most common causes: wrong keypair/PEM mismatch, SG inbound 22 wrong IP, subnet not public, or your network blocks outbound 22."
-        die "Cannot SSH to driver instance."
+        SSH_USER_CANDIDATES=("${_deduped_users[@]}")
+        unset _seen_user _deduped_users
+        
+        if [[ "$USE_SSM" == "0" ]]; then
+            # SSH only — full 60-iteration retry
+            log_info "Waiting for SSH readiness (USE_SSM=0)..."
+            SSH_READY=0
+            for i in $(seq 1 60); do
+                for try_user in "${SSH_USER_CANDIDATES[@]}"; do
+                    if ssh "${SSH_OPTS[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
+                        SSH_USER="$try_user"
+                        SSH_READY=1
+                        break 2
+                    fi
+                done
+                sleep 5
+            done
+            
+            if [[ "$SSH_READY" -ne 1 ]]; then
+                log_error "========== SSH DIAGNOSTICS =========="
+                log_error "SSH never became reachable on $DRIVER_INSTANCE_IP:22 (instance $DRIVER_INSTANCE_ID)."
+                log_error "Tried users: ${SSH_USER_CANDIDATES[*]}"
+                log_error ""
+                log_error "PEM path (resolved in bash): $KEY_PEM_PATH"
+                ls -l "$KEY_PEM_PATH" >&2 2>/dev/null || log_error "  File NOT FOUND at that path inside bash"
+                log_error ""
+                log_error "Running one verbose SSH attempt for diagnostics..."
+                SSH_DEBUG_LOG="ssh_debug_${RUN_ID}.log"
+                ssh -vvv "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" "echo OK" >"$SSH_DEBUG_LOG" 2>&1 || true
+                log_error "Full debug log saved to: $SSH_DEBUG_LOG"
+                log_error "--- Last 60 lines ---"
+                tail -60 "$SSH_DEBUG_LOG" >&2 2>/dev/null || true
+                log_error "--- End debug log ---"
+                log_error ""
+                log_error "To test manually from PowerShell:"
+                log_error '  ssh -i $env:KEY_PEM_PATH -o StrictHostKeyChecking=no ubuntu@'"$DRIVER_INSTANCE_IP" '"echo OK"'
+                log_error ""
+                log_error "Instance KeyName:"
+                aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" \
+                  --query 'Reservations[0].Instances[0].KeyName' --output text 2>/dev/null >&2 || true
+                log_error ""
+                log_error "Security Group: $SG_ID"
+                log_error "SG inbound rules for tcp/22:"
+                aws ec2 describe-security-groups --region "$AWS_REGION" --group-ids "$SG_ID" \
+                  --query "SecurityGroups[0].IpPermissions[?FromPort==\`22\` && ToPort==\`22\`]" \
+                  --output json 2>/dev/null >&2 || true
+                log_error ""
+                log_error "Most common causes: wrong keypair/PEM mismatch, SG inbound 22 wrong IP, subnet not public, or your network blocks outbound 22."
+                log_error "TIP: Set USE_SSM=auto or USE_SSM=1 to bypass SSH and use AWS SSM instead."
+                die "Cannot SSH to driver instance."
+            fi
+            CONNECT_METHOD="ssh"
+        else
+            # USE_SSM=auto — try SSH briefly (~60s), then fall back to SSM
+            log_info "USE_SSM=auto: trying SSH for ~60s..."
+            SSH_READY=0
+            if [[ ${#SSH_OPTS[@]} -gt 0 && -n "$DRIVER_INSTANCE_IP" ]]; then
+                for i in $(seq 1 12); do
+                    for try_user in "${SSH_USER_CANDIDATES[@]}"; do
+                        if ssh "${SSH_OPTS[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
+                            SSH_USER="$try_user"
+                            SSH_READY=1
+                            break 2
+                        fi
+                    done
+                    sleep 5
+                done
+            fi
+            
+            if [[ "$SSH_READY" -eq 1 ]]; then
+                CONNECT_METHOD="ssh"
+                log_info "SSH is ready (user: $SSH_USER) — using SSH."
+            else
+                CONNECT_METHOD="ssm"
+                log_warn "SSH unreachable after ~60s — falling back to SSM."
+            fi
+        fi
     fi
     
-    log_info "SSH is ready (user: $SSH_USER)"
+    # If using SSM, wait for the instance to register with SSM
+    SSM_TRANSFER_BUCKET=""
+    if [[ "$CONNECT_METHOD" == "ssm" ]]; then
+        ssm_wait_for_managed "$DRIVER_INSTANCE_ID"
+        
+        # Get AWS account ID for SSM transfer bucket
+        if [[ -z "${AWS_ACCOUNT_ID:-}" ]]; then
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        fi
+        SSM_TRANSFER_BUCKET="scrna-ssm-xfer-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+        aws s3 mb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
+    else
+        log_info "SSH is ready (user: $SSH_USER)"
+    fi
     
+    ############################################################################
+    # Transfer repository to instance
+    ############################################################################
     log_info "Copying repository to instance..."
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     TARBALL_LOCAL="/tmp/scrna-repo-${RUN_ID}.tar.gz"
-    TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
     
     tar -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
     
-    scp "${SSH_OPTS[@]}" "$TARBALL_LOCAL" "${SSH_USER}@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
+    if [[ "$CONNECT_METHOD" == "ssh" ]]; then
+        TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
+        scp "${SSH_OPTS[@]}" "$TARBALL_LOCAL" "${SSH_USER}@$DRIVER_INSTANCE_IP:$TARBALL_REMOTE"
+        rm -f "$TARBALL_LOCAL"
+        
+        log_info "Extracting repository on instance..."
+        ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
+            "rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && rm -f ${TARBALL_REMOTE}"
+    else
+        # SSM: transfer via S3
+        TARBALL_S3_KEY="transfer/${RUN_ID}/repo.tar.gz"
+        aws s3 cp "$TARBALL_LOCAL" "s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY}" \
+            --region "$AWS_REGION" --only-show-errors
+        rm -f "$TARBALL_LOCAL"
+        log_info "Repo uploaded to s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY}"
+        
+        log_info "Downloading and extracting repo on instance via SSM..."
+        ssm_run_command "$DRIVER_INSTANCE_ID" \
+            "aws s3 cp s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY} /tmp/repo.tar.gz --region ${AWS_REGION} && rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf repo.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && chown -R ${SSH_USER}:${SSH_USER} /home/${SSH_USER}/scrna-repo && rm -f /tmp/repo.tar.gz" \
+            300
+    fi
     
-    rm -f "$TARBALL_LOCAL"
-    
-    log_info "Extracting repository on instance..."
-    TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
-        "rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && rm -f ${TARBALL_REMOTE}"
-    
+    ############################################################################
+    # Run pipeline on instance
+    ############################################################################
     log_info "Running pipeline in --run mode on instance..."
     
-    # Export environment variables and run --run mode
-    # Note: AWS_ACCOUNT_ID is NOT exported; it will be auto-detected in run mode
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" <<SSHEOF
+    if [[ "$CONNECT_METHOD" == "ssh" ]]; then
+        ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" <<SSHEOF
 export AWS_REGION=$AWS_REGION
 export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
@@ -1004,32 +1592,52 @@ export FASTQ_TAR_PATH=$FASTQ_TAR_PATH
 export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
 export RUN_ID=$RUN_ID
+export RUN_QC=$RUN_QC
 
 cd /home/${SSH_USER}/scrna-repo
 bash scripts/e2e_serverless_pbmc.sh $DATASET --run
 SSHEOF
+        RUN_EXIT=$?
+    else
+        # SSM path
+        if ssm_run_pipeline "$DRIVER_INSTANCE_ID" "$DATASET" "$SSM_TRANSFER_BUCKET" "$RUN_ID"; then
+            RUN_EXIT=0
+        else
+            RUN_EXIT=1
+        fi
+    fi
     
-    RUN_EXIT=$?
-    
-    # Download results from EC2 to local machine if run succeeded
+    ############################################################################
+    # Download results from EC2 to local machine
+    ############################################################################
     if [[ $RUN_EXIT -eq 0 && $DOWNLOAD_RESULTS -eq 1 ]]; then
         log_info "Downloading results from EC2 to local machine..."
-        
-        # Create tarball on EC2 (exclude large folders)
-        ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
-            "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
-        
-        # Download tarball to local
         mkdir -p "$LOCAL_RESULTS_DIR/$RUN_ID"
-        scp "${SSH_OPTS[@]}" \
-            "${SSH_USER}@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
+        
+        if [[ "$CONNECT_METHOD" == "ssh" ]]; then
+            ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
+            scp "${SSH_OPTS[@]}" \
+                "${SSH_USER}@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
+        else
+            # SSM: create tarball on instance, upload to S3, download locally
+            ssm_run_command "$DRIVER_INSTANCE_ID" \
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
+                600
+            aws s3 cp "s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz" \
+                "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" \
+                --region "$AWS_REGION" --only-show-errors
+        fi
         
         # Extract locally
         log_info "Extracting results to $LOCAL_RESULTS_DIR/$RUN_ID/"
         tar -xzf "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" -C "$LOCAL_RESULTS_DIR/$RUN_ID"
-        
         log_info "Results downloaded to: $LOCAL_RESULTS_DIR/$RUN_ID/$RUN_ID/"
     fi
+    
+    ############################################################################
+    # Cleanup
+    ############################################################################
     
     # Revoke caller IP from SG if it was authorized
     if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
@@ -1048,6 +1656,13 @@ SSHEOF
         if [[ -n "$CREATED_SG_ID" ]]; then
             log_info "Deleting temporary security group: $CREATED_SG_ID"
             aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
+        fi
+        
+        # Clean up SSM transfer bucket if used
+        if [[ -n "$SSM_TRANSFER_BUCKET" ]]; then
+            log_info "Cleaning up SSM transfer bucket: $SSM_TRANSFER_BUCKET"
+            aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null || true
+            aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
         fi
     else
         log_info "Driver instance $DRIVER_INSTANCE_ID left running (TERMINATE_DRIVER_ON_EXIT=0)"
@@ -1117,10 +1732,13 @@ log_info "Run directory: $RUN_DIR"
 
 log_info "Step 0: Bootstrapping tools..."
 
-# Check for required tools and install missing ones
-REQUIRED_TOOLS=(python3 pip3 aws docker jq curl tar gzip git)
-MISSING_TOOLS=()
+# Required tools: python3/pip3 only when RUN_QC=1
+REQUIRED_TOOLS=(aws docker jq curl tar gzip git)
+if [[ "${RUN_QC:-0}" == "1" ]]; then
+    REQUIRED_TOOLS+=(python3 pip3)
+fi
 
+MISSING_TOOLS=()
 for tool in "${REQUIRED_TOOLS[@]}"; do
     if ! need_cmd "$tool"; then
         MISSING_TOOLS+=("$tool")
@@ -1292,70 +1910,40 @@ cp -r /opt/scrna-seed/index_output_transcriptome "$BUILD_DIR/"
 # Sanitize Dockerfile: remove lines that COPY AWS credentials
 sed -i '/COPY.*aws.*credentials\|COPY.*\.aws\|COPY.*AWS_/d' "$BUILD_DIR/Dockerfile"
 
-log_info "Build context ready (set-up-resources.py will build and push image)"
+log_info "Build context ready"
 
 ################################################################################
-# Helper: Create patched copies of scripts (avoid editing tracked files)
-################################################################################
-
-# Create temp directory for patched scripts
-TMP_SCRIPTS_DIR="$RUN_DIR/tmp_scripts"
-mkdir -p "$TMP_SCRIPTS_DIR"
-
-# Copy set-up-resources.py to temp location
-cp /home/ubuntu/scrna-repo/set-up-resources.py "$TMP_SCRIPTS_DIR/set-up-resources.py"
-SETUP_RESOURCES_SCRIPT="$TMP_SCRIPTS_DIR/set-up-resources.py"
-
-patch_set_up_resources_lambda_sizes() {
-    local mem="$1" eph="$2"
-    python3 - "$SETUP_RESOURCES_SCRIPT" "$mem" "$eph" <<'PY'
-import re, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-mem = sys.argv[2]
-eph = sys.argv[3]
-txt = p.read_text()
-txt = re.sub(r"MemorySize\s*=\s*\d+", f"MemorySize={mem}", txt)
-txt = re.sub(r"EphemeralStorage\s*=\s*\{'Size':\s*\d+\}", f"EphemeralStorage={{'Size': {eph}}}", txt)
-p.write_text(txt)
-PY
-}
-
-################################################################################
-# Step 6: Setup Lambda and EventBridge (using set-up-resources.py)
+# Step 6: Setup Lambda and EventBridge (pure bash — no python)
 ################################################################################
 
 log_info "Step 6: Setting up Lambda function and EventBridge..."
 
-# Try memory/ephemeral combinations during Lambda creation
-MEM_CANDIDATES=(10240 3008 2048 1536 1024 512)
-EPH_CANDIDATES=(10240 512)
+# 6a: Create ECR repository
+ECR_REPO_URI=$(create_ecr_repo_if_needed "$ECR_REPO_NAME")
+
+# 6b: Build and push Docker image to ECR
+IMAGE_URI=$(build_and_push_lambda_image "$ECR_REPO_URI" "$DOCKER_IMAGE_NAME" "$BUILD_DIR")
+
+# 6c: Create Lambda execution role
+LAMBDA_ROLE_ARN=$(create_lambda_execution_role "$LAMBDA_EXECUTION_ROLE_NAME")
+
+# Wait for IAM role propagation (IAM is eventually consistent)
+log_info "Waiting 15s for IAM role propagation..."
+sleep 15
+
+# 6d: Create Lambda function with fallback for memory/ephemeral limits
+MEM_CANDIDATES=("$LAMBDA_MEMORY_MB" 3008 2048 1536 1024 512)
+EPH_CANDIDATES=("$LAMBDA_EPHEMERAL_MB" 10240 512)
 
 CREATE_SUCCESS=0
+LAMBDA_FUNCTION_ARN=""
 for mem in "${MEM_CANDIDATES[@]}"; do
     for eph in "${EPH_CANDIDATES[@]}"; do
-        log_info "Attempting Lambda creation: memory=${mem}MB, ephemeral=${eph}MB"
+        log_info "Attempting Lambda creation: memory=${mem}MB, ephemeral=${eph}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
         
-        # Patch set-up-resources.py with current candidate sizes
-        patch_set_up_resources_lambda_sizes "$mem" "$eph"
-        
-        # Run set-up-resources.py (use sudo -E if docker needs sudo)
-        PYTHON_CMD="python3"
-        if [[ "$DOCKER" == "sudo docker" ]]; then
-            PYTHON_CMD="sudo -E python3"
-        fi
-        
-        if $PYTHON_CMD "$SETUP_RESOURCES_SCRIPT" \
-            --aws_region "$AWS_REGION" \
-            --aws_account_id "$AWS_ACCOUNT_ID" \
-            --dockerfile_dir "$BUILD_DIR" \
-            --docker_image_name "$DOCKER_IMAGE_NAME" \
-            --ecr_repo_name "$ECR_REPO_NAME" \
-            --lambda_function_name "$LAMBDA_FUNCTION_NAME" \
-            --lambda_execution_role_name "$LAMBDA_EXECUTION_ROLE_NAME" \
-            --s3_bucket_name "$INPUT_FASTQ_BUCKET" \
-            --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
-            --s3_output_bucket_name "$OUTPUT_MAP_BUCKET" \
-            --final_output_bucket_name "$OUTPUT_QUANT_BUCKET" 2>&1; then
+        if LAMBDA_FUNCTION_ARN=$(create_lambda_function_from_image \
+            "$LAMBDA_FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$IMAGE_URI" \
+            "$mem" "$eph" "$LAMBDA_TIMEOUT_SEC"); then
             
             LAMBDA_MEMORY_MB="$mem"
             LAMBDA_EPHEMERAL_MB="$eph"
@@ -1372,9 +1960,9 @@ if [[ $CREATE_SUCCESS -eq 0 ]]; then
     die "Unable to create Lambda with any memory/ephemeral combination. Check account limits."
 fi
 
+# Update Lambda config with desired settings (retry with fallback)
 log_info "Updating Lambda function configuration..."
 
-# Try memory/ephemeral combinations until one succeeds
 MEM_CANDIDATES=("$LAMBDA_MEMORY_MB" 3008 2048 1536 1024 512)
 EPH_CANDIDATES=("$LAMBDA_EPHEMERAL_MB" 10240 512)
 
@@ -1405,14 +1993,47 @@ if [[ $CONFIG_SUCCESS -eq 0 ]]; then
     die "Unable to configure Lambda. Set LAMBDA_MEMORY_MB/LAMBDA_EPHEMERAL_MB to values allowed in your account. Example: LAMBDA_MEMORY_MB=3008 LAMBDA_EPHEMERAL_MB=512"
 fi
 
-# Wait for Lambda function update to complete
-log_info "Waiting for Lambda function update to complete..."
-aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION"
+# Lambda memory/ephemeral warnings
+if [[ "$LAMBDA_MEMORY_MB" -lt 10240 ]]; then
+    log_warn "Lambda memory (${LAMBDA_MEMORY_MB}MB) is below 10240MB recommended by the paper. Performance may be degraded."
+fi
+if [[ "$LAMBDA_EPHEMERAL_MB" -lt 10240 ]]; then
+    log_warn "Lambda ephemeral storage (${LAMBDA_EPHEMERAL_MB}MB) is below 10240MB recommended by the paper. Large datasets may fail."
+fi
+
+# Wait for Lambda function to be active
+log_info "Waiting for Lambda function to be active..."
+aws lambda wait function-active-v2 --function-name "$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" 2>/dev/null \
+    || aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" 2>/dev/null \
+    || sleep 10
+
+# 6e: Create EventBridge rule to trigger Lambda
+RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"
+create_eventbridge_rule_for_lambda "$RULE_NAME" "$LAMBDA_FUNCTION_ARN" "$INPUT_TXT_BUCKET"
+
+# Wait for EventBridge propagation (matches original set-up-resources.py sleep 30)
+log_info "Waiting 30s for EventBridge propagation..."
+sleep 30
+
+# Log resource summary
+log_info "========== RESOURCE SUMMARY =========="
+log_info "  ECR Repository:      $ECR_REPO_NAME"
+log_info "  Lambda Function:     $LAMBDA_FUNCTION_NAME"
+log_info "  Lambda Memory:       ${LAMBDA_MEMORY_MB}MB"
+log_info "  Lambda Ephemeral:    ${LAMBDA_EPHEMERAL_MB}MB"
+log_info "  Lambda Timeout:      ${LAMBDA_TIMEOUT_SEC}s"
+log_info "  Lambda Role:         $LAMBDA_EXECUTION_ROLE_NAME"
+log_info "  EventBridge Rule:    $RULE_NAME"
+log_info "  Input FASTQ Bucket:  $INPUT_FASTQ_BUCKET"
+log_info "  Input TXT Bucket:    $INPUT_TXT_BUCKET"
+log_info "  Output MAP Bucket:   $OUTPUT_MAP_BUCKET"
+log_info "  Output Quant Bucket: $OUTPUT_QUANT_BUCKET"
+log_info "======================================="
 
 log_info "Lambda function ready"
 
 ################################################################################
-# Step 7: Process FASTQs (split, upload, wait for Lambda, download)
+# Step 7: Process FASTQs (split, upload, wait for Lambda, download) — pure bash
 ################################################################################
 
 log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download)..."
@@ -1420,43 +2041,7 @@ log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download).
 OUTPUT_DIR="$RUN_DIR/output"
 mkdir -p "$OUTPUT_DIR"
 
-# Create patched copy of process_fastq.py for dynamic region
-TMP_PF_DIR="$RUN_DIR/tmp_process_fastq"
-mkdir -p "$TMP_PF_DIR"
-cp /home/ubuntu/scrna-repo/process_fastq.py "$TMP_PF_DIR/"
-cp /home/ubuntu/scrna-repo/split_and_upload.sh "$TMP_PF_DIR/"
-
-# Patch process_fastq.py to use dynamic region instead of hardcoded us-east-2
-python3 - "$TMP_PF_DIR/process_fastq.py" "$AWS_REGION" <<'PY'
-import re, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-region = sys.argv[2]
-txt = p.read_text()
-# Replace hardcoded region_name="us-east-2" with dynamic region
-txt = re.sub(r'region_name\s*=\s*["\']us-east-2["\']', f'region_name="{region}"', txt)
-p.write_text(txt)
-PY
-
-# Run process_fastq.py with timeout from temp directory
-log_info "Running process_fastq.py with ${PROCESS_FASTQ_TIMEOUT_SEC}s timeout..."
-
-cd "$TMP_PF_DIR"
-if ! timeout "${PROCESS_FASTQ_TIMEOUT_SEC}" python3 "$TMP_PF_DIR/process_fastq.py" \
-    --aws_region "$AWS_REGION" \
-    --bucket_name "$INPUT_FASTQ_BUCKET" \
-    --s3_input_files_bucket_name "$INPUT_TXT_BUCKET" \
-    --output_bucket_name "$OUTPUT_MAP_BUCKET" \
-    --output_dir "$OUTPUT_DIR" \
-    --polling_interval "$POLL_INTERVAL_SECONDS"; then
-    
-    TIMEOUT_EXIT=$?
-    if [[ $TIMEOUT_EXIT -eq 124 ]]; then
-        die "process_fastq.py timed out after ${PROCESS_FASTQ_TIMEOUT_SEC}s. Increase PROCESS_FASTQ_TIMEOUT_SEC or check Lambda function."
-    else
-        die "process_fastq.py failed with exit code $TIMEOUT_EXIT"
-    fi
-fi
-cd "$RUN_DIR"
+process_fastq_bash "$OUTPUT_DIR"
 
 log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 
@@ -1503,11 +2088,17 @@ aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" 
 log_info "Quant outputs uploaded"
 
 ################################################################################
-# Step 10: Optional QC Analysis
+# Step 10: Optional QC Analysis (ONLY step requiring python)
 ################################################################################
 
-if [[ $RUN_QC -eq 1 ]]; then
-    log_info "Step 11: Running QC analysis..."
+if [[ "${RUN_QC:-0}" == "1" ]]; then
+    log_info "Step 10: Running QC analysis (requires python3)..."
+    
+    # Ensure python3 is available for QC
+    if ! need_cmd python3; then
+        log_info "Installing python3 for QC..."
+        sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
+    fi
     
     QC_DIR="$RUN_DIR/analysis"
     mkdir -p "$QC_DIR/out"
@@ -1533,7 +2124,7 @@ if [[ $RUN_QC -eq 1 ]]; then
     
     log_info "QC analysis complete"
 else
-    log_info "Step 10: Skipping QC (RUN_QC=0)"
+    log_info "Step 10: Skipping QC (RUN_QC=0). No python required."
 fi
 
 ################################################################################
@@ -1555,6 +2146,9 @@ OUTPUT_QUANT_BUCKET=$OUTPUT_QUANT_BUCKET
 ECR_REPO=$ECR_REPO_NAME
 LAMBDA_FUNCTION=$LAMBDA_FUNCTION_NAME
 LAMBDA_EXECUTION_ROLE=$LAMBDA_EXECUTION_ROLE_NAME
+LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
+LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
+LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 RUN_DIR=$RUN_DIR
 BASENAME_WITH_LANE=$BASENAME_WITH_LANE
 EOF
@@ -1570,6 +2164,10 @@ log_info "Step 12: Cleanup..."
 if [[ $CLEANUP_AWS -eq 1 ]]; then
     log_info "Cleaning up AWS resources..."
     
+    # Get Lambda ARN before deleting (needed for EventBridge rule discovery)
+    LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
+        --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
+    
     # Delete Lambda function
     aws lambda delete-function --function-name "$LAMBDA_FUNCTION_NAME" \
         --region "$AWS_REGION" 2>/dev/null || true
@@ -1580,10 +2178,8 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
     
     # Delete EventBridge rules targeting this Lambda (discover rules dynamically)
     log_info "Discovering EventBridge rules targeting Lambda..."
-    LAMBDA_ARN=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
-        --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
     
-    if [[ -n "$LAMBDA_ARN" ]]; then
+    if [[ -n "$LAMBDA_ARN" && "$LAMBDA_ARN" != "None" ]]; then
         RULES=$(aws events list-rule-names-by-target --target-arn "$LAMBDA_ARN" \
             --region "$AWS_REGION" --query 'RuleNames[]' --output text 2>/dev/null || echo "")
         
@@ -1605,6 +2201,11 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
             done
         fi
     fi
+    
+    # Also delete the known rule name directly
+    aws events remove-targets --rule "${LAMBDA_FUNCTION_NAME}-rule" --ids "LambdaTarget" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    aws events delete-rule --name "${LAMBDA_FUNCTION_NAME}-rule" --region "$AWS_REGION" 2>/dev/null || true
     
     # Delete IAM execution role (detach all policies first)
     # Detach managed policies
@@ -1656,7 +2257,7 @@ log_info "Dataset: $DATASET"
 log_info "Output directory: $RUN_DIR"
 log_info "Quantification output: s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/"
 
-if [[ $RUN_QC -eq 1 ]]; then
+if [[ "${RUN_QC:-0}" == "1" ]]; then
     log_info "QC plots: $RUN_DIR/analysis/out/"
     if [[ $WRITE_H5AD -eq 1 ]]; then
         log_info "H5AD file: $RUN_DIR/analysis/out/pbmc_adata.h5ad"
