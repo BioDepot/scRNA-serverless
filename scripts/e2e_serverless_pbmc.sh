@@ -35,15 +35,14 @@
 #                          1    = SSM only (no SSH required, KEY_NAME/KEY_PEM_PATH optional)
 #                          0    = SSH only (original behavior)
 #
-#   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240)
-#                          Paper uses 10240MB, but some accounts are capped (e.g., 3008MB).
-#                          Set explicitly or rely on automatic fallback.
+#   LAMBDA_MEMORY_MB       Lambda function memory (default: 3008)
+#                          Paper uses 10240MB, but most accounts are capped at 3008MB.
 #   LAMBDA_EPHEMERAL_MB    Lambda /tmp ephemeral storage (default: 10240)
-#                          Some accounts limit this. Script will fallback if needed.
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
 #   THREADS                Number of CPU threads (default: nproc)
 #   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
+#   DOWNLOAD_TO_LOCAL      Download results from EC2 to local machine (default: 1). Alias for DOWNLOAD_RESULTS.
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
@@ -65,7 +64,57 @@
 set -euo pipefail
 
 # Cleanup temp files on exit (safe under set -u)
-trap '[[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true' EXIT INT TERM
+# Cleanup function — called automatically on EXIT/INT/TERM.
+# Ensures EC2 instances and security groups created by this script are not
+# left running if the script fails at any point.
+cleanup_on_exit() {
+    local exit_code=$?
+    # Clean up temp FASTQ files
+    [[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true
+
+    # Only run driver-mode cleanup when we are in driver mode and actually
+    # created resources (DRIVER_INSTANCE_ID is set after launch).
+    if [[ "${RUN_MODE:-0}" -eq 0 && -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" ]]; then
+        if [[ $exit_code -ne 0 ]]; then
+            echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') Script failed (exit $exit_code). Running automatic cleanup..." >&2
+        fi
+
+        # Revoke caller IP from SG if it was authorized
+        if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Revoking SG ingress for ${CALLER_IP_TO_REVOKE}..."
+            aws ec2 revoke-security-group-ingress \
+                --region "${AWS_REGION:-us-east-2}" \
+                --group-id "${SG_ID:-}" \
+                --protocol tcp --port 22 \
+                --cidr "${CALLER_IP_TO_REVOKE}/32" 2>/dev/null || true
+        fi
+
+        if [[ "${TERMINATE_DRIVER_ON_EXIT:-1}" -eq 1 ]]; then
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Terminating driver instance ${DRIVER_INSTANCE_ID}..."
+            aws ec2 terminate-instances --region "${AWS_REGION:-us-east-2}" \
+                --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
+
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Waiting for instance to terminate..."
+            aws ec2 wait instance-terminated --region "${AWS_REGION:-us-east-2}" \
+                --instance-ids "$DRIVER_INSTANCE_ID" 2>/dev/null || true
+
+            # Delete auto-created SG after instance is gone
+            if [[ -n "${CREATED_SG_ID:-}" ]]; then
+                echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting temporary security group ${CREATED_SG_ID}..."
+                aws ec2 delete-security-group --region "${AWS_REGION:-us-east-2}" \
+                    --group-id "$CREATED_SG_ID" 2>/dev/null || true
+            fi
+
+            # Clean up SSM transfer bucket if used
+            if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
+                echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
+                aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "${AWS_REGION:-us-east-2}" 2>/dev/null || true
+                aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "${AWS_REGION:-us-east-2}" 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+trap cleanup_on_exit EXIT INT TERM
 
 ################################################################################
 # User Configuration (Edit Once)
@@ -104,8 +153,8 @@ SSH_USER="${SSH_USER:-ubuntu}"    # SSH username (auto-detected if default fails
 CREATED_SG_ID=""                  # Track SG created by this script for cleanup
 USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked networks
 
-# Lambda Configuration
-LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
+# Lambda Configuration (account cap is 3008MB memory; ephemeral 10240MB works)
+LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-3008}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
 
@@ -114,7 +163,7 @@ THREADS="${THREADS:-$(nproc)}"
 CLEANUP_AWS="${CLEANUP_AWS:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
 RUN_QC="${RUN_QC:-1}"
-DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-1}"
+DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-${DOWNLOAD_TO_LOCAL:-1}}"  # DOWNLOAD_TO_LOCAL is accepted alias
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./runs}"
 
 # FASTQ Configuration
@@ -145,7 +194,7 @@ OUTPUT_QUANT_BUCKET=""
 ################################################################################
 
 log_info() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $*"
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
 }
 
 log_error() {
@@ -383,11 +432,19 @@ init_resource_names() {
     LAMBDA_EXECUTION_ROLE_NAME="scrna-lambda-role-${timestamp}-${random_suffix}"
     DOCKER_IMAGE_NAME="scrna-serverless-${run_id_clean}"
     
-    # S3 bucket names (must be lowercase, no underscores, globally unique, include region)
-    INPUT_FASTQ_BUCKET="scrna-input-fastq-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
-    INPUT_TXT_BUCKET="scrna-input-txt-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
-    OUTPUT_MAP_BUCKET="scrna-output-map-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
-    OUTPUT_QUANT_BUCKET="scrna-output-quant-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    # S3 bucket names (must be lowercase, no underscores, globally unique, ≤63 chars)
+    INPUT_FASTQ_BUCKET="scrna-fastq-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    INPUT_TXT_BUCKET="scrna-txt-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    OUTPUT_MAP_BUCKET="scrna-map-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+    OUTPUT_QUANT_BUCKET="scrna-quant-${AWS_ACCOUNT_ID}-${AWS_REGION}-${run_id_clean}"
+
+    # Validate S3 bucket name length (max 63 chars)
+    local _b
+    for _b in "$INPUT_FASTQ_BUCKET" "$INPUT_TXT_BUCKET" "$OUTPUT_MAP_BUCKET" "$OUTPUT_QUANT_BUCKET"; do
+        if (( ${#_b} > 63 )); then
+            die "S3 bucket name too long (${#_b} > 63): $_b"
+        fi
+    done
 }
 
 ################################################################################
@@ -414,18 +471,18 @@ build_and_push_lambda_image() {
     local docker_tag="${repo_uri}:${image_name}"
 
     log_info "Building Docker image: $image_name ..."
-    $DOCKER build --platform linux/amd64 -t "$image_name" "$build_dir"
+    $DOCKER build --platform linux/amd64 -t "$image_name" "$build_dir" >&2
 
     log_info "Tagging image as $docker_tag"
-    $DOCKER tag "$image_name" "$docker_tag"
+    $DOCKER tag "$image_name" "$docker_tag" >&2
 
     log_info "Logging into ECR..."
     aws ecr get-login-password --region "$AWS_REGION" | \
         $DOCKER login --username AWS --password-stdin \
-        "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >&2
 
     log_info "Pushing image to ECR..."
-    $DOCKER push "$docker_tag"
+    $DOCKER push "$docker_tag" >&2
 
     log_info "Docker image pushed: $docker_tag"
     echo "$docker_tag"
@@ -501,8 +558,10 @@ create_lambda_function_from_image() {
     fi
 
     local max_retries=5 delay=5
+    local _create_err
     for attempt in $(seq 1 $max_retries); do
         local func_arn
+        _create_err=$(mktemp)
         if func_arn=$(aws lambda create-function \
             --function-name "$func_name" \
             --role "$role_arn" \
@@ -514,12 +573,14 @@ create_lambda_function_from_image() {
             --architectures x86_64 \
             --environment "$env_json" \
             --region "$AWS_REGION" \
-            --query 'FunctionArn' --output text 2>/dev/null); then
+            --query 'FunctionArn' --output text 2>"$_create_err"); then
+            rm -f "$_create_err"
             log_info "Lambda function '$func_name' created."
             echo "$func_arn"
             return 0
         fi
-        log_info "Lambda creation attempt $attempt/$max_retries failed, retrying in ${delay}s..."
+        local err_msg; err_msg=$(cat "$_create_err" 2>/dev/null); rm -f "$_create_err"
+        log_info "Lambda creation attempt $attempt/$max_retries failed: ${err_msg:-unknown error}. Retrying in ${delay}s..."
         sleep "$delay"; delay=$((delay * 2))
     done
 
@@ -709,7 +770,19 @@ process_fastq_bash() {
 
         local elapsed=$(( $(date +%s) - poll_start ))
         if [[ $elapsed -gt $PROCESS_FASTQ_TIMEOUT_SEC ]]; then
-            die "Timeout (${PROCESS_FASTQ_TIMEOUT_SEC}s) waiting for Lambda outputs."
+            log_error "Timeout (${PROCESS_FASTQ_TIMEOUT_SEC}s) waiting for Lambda outputs."
+            log_error "Checking CloudWatch logs for Lambda errors..."
+            aws logs tail "/aws/lambda/$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" \
+                --since 30m --format short 2>&1 | tail -50 >&2 || true
+            log_error "Listing output bucket contents for diagnostics..."
+            aws s3 ls "s3://$OUTPUT_MAP_BUCKET/" --recursive --region "$AWS_REGION" 2>&1 | tail -30 >&2 || true
+            die "Lambda did not complete in time. Check CloudWatch logs above for OOM / Runtime errors."
+        fi
+        # Detect prolonged zero-progress (possible Lambda failure)
+        if [[ $completed -eq 0 && $elapsed -gt 900 ]]; then
+            log_warn "Zero outputs after $((elapsed/60))m. Checking CloudWatch for errors..."
+            aws logs tail "/aws/lambda/$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" \
+                --since 15m --format short 2>&1 | grep -iE 'error|oom|runtime.exited|killed|memory' | tail -20 >&2 || true
         fi
         sleep "$POLL_INTERVAL_SECONDS"
     done
@@ -839,7 +912,10 @@ ssm_run_pipeline() {
 
     log_info "SSM pipeline command sent: $cmd_id"
 
-    # Poll for completion, stream available output
+    # Poll for completion.
+    # NOTE: when --output-s3-bucket-name is used, get-command-invocation may
+    # return truncated JSON or empty StandardOutputContent (output goes to S3).
+    # We parse status only; stdout comes from the S3 log after completion.
     local last_len=0
     while true; do
         local inv status
@@ -847,12 +923,18 @@ ssm_run_pipeline() {
             --region "$AWS_REGION" \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
-            --output json 2>/dev/null || echo '{"Status":"InProgress"}')
-        status=$(echo "$inv" | jq -r '.Status')
+            --output json 2>&1 || true)
 
-        # Stream stdout incrementally
+        # Guard against truncated / malformed JSON from SSM
+        if ! status=$(echo "$inv" | jq -r '.Status' 2>/dev/null); then
+            log_info "SSM poll: waiting (response not valid JSON)..."
+            sleep 15
+            continue
+        fi
+
+        # Stream stdout incrementally (may be empty when S3 output is used)
         local stdout
-        stdout=$(echo "$inv" | jq -r '.StandardOutputContent // ""')
+        stdout=$(echo "$inv" | jq -r '.StandardOutputContent // ""' 2>/dev/null) || stdout=""
         local cur_len=${#stdout}
         if [[ $cur_len -gt $last_len ]]; then
             printf '%s' "${stdout:$last_len}"
@@ -862,12 +944,18 @@ ssm_run_pipeline() {
         case "$status" in
             Success)
                 log_info "Pipeline completed successfully via SSM."
+                # Download full output log from S3
+                log_info "Downloading full SSM output log from S3..."
+                mkdir -p "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output"
+                aws s3 sync "s3://${transfer_bucket}/ssm-output/${run_id}/" \
+                    "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output/" --region "$AWS_REGION" 2>/dev/null || true
                 return 0 ;;
             Failed|TimedOut|Cancelled)
                 log_error "Pipeline command $status (SSM ID: $cmd_id)"
-                echo "$inv" | jq -r '.StandardErrorContent // ""' >&2
+                echo "$inv" | jq -r '.StandardErrorContent // ""' 2>/dev/null >&2 || true
                 # Download full log from S3
                 log_info "Downloading full SSM output log from S3..."
+                mkdir -p "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output"
                 aws s3 sync "s3://${transfer_bucket}/ssm-output/${run_id}/" \
                     "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output/" --region "$AWS_REGION" 2>/dev/null || true
                 return 1 ;;
@@ -1115,6 +1203,59 @@ if [[ $DRY_RUN_MODE -eq 1 ]]; then
         exit 1
     fi
     exit 0
+fi
+
+################################################################################
+# Pre-Run Checks (AWS CLI, authentication, keypair)
+################################################################################
+
+# 1. AWS CLI must be available before any aws command
+if ! need_cmd aws; then
+    if [[ $RUN_MODE -eq 1 ]]; then
+        log_info "AWS CLI v2 not found — installing..."
+        curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+        (cd /tmp && unzip -qo awscliv2.zip && sudo ./aws/install --update 2>&1) >&2
+        rm -rf /tmp/awscliv2.zip /tmp/aws
+        hash -r
+        if ! command -v aws >/dev/null 2>&1; then
+            die "Failed to install AWS CLI v2. Install it manually and re-run."
+        fi
+        log_info "AWS CLI installed: $(aws --version 2>&1)"
+    else
+        die "AWS CLI not found. Install it: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+    fi
+fi
+
+# 2. AWS authentication must work
+if ! aws sts get-caller-identity --region "$AWS_REGION" >/dev/null 2>&1; then
+    log_error "AWS authentication failed."
+    log_error "Run 'aws configure' or export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN."
+    die "Cannot proceed without valid AWS credentials."
+fi
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)
+log_info "AWS authenticated (account: $AWS_ACCOUNT_ID, region: $AWS_REGION)"
+
+# 3. In driver mode checks (keypair, instance profile)
+if [[ $RUN_MODE -eq 0 ]]; then
+    # Instance profile
+    if [[ -z "$EC2_INSTANCE_PROFILE_NAME" ]]; then
+        die "EC2_INSTANCE_PROFILE_NAME must be set for driver mode."
+    fi
+    if ! aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
+        die "Instance profile '$EC2_INSTANCE_PROFILE_NAME' not found in IAM."
+    fi
+    log_info "Instance profile verified: $EC2_INSTANCE_PROFILE_NAME"
+
+    # Keypair (when SSH may be used)
+    if [[ "$USE_SSM" != "1" ]]; then
+        if [[ -z "$KEY_NAME" ]]; then
+            die "KEY_NAME must be set (or export USE_SSM=1 for SSM-only mode)."
+        fi
+        if ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
+            die "AWS keypair '$KEY_NAME' not found in region '$AWS_REGION'. Create it in EC2 → Key Pairs."
+        fi
+        log_info "Keypair verified in AWS: $KEY_NAME"
+    fi
 fi
 
 ################################################################################
@@ -1503,19 +1644,26 @@ if [[ $RUN_MODE -eq 0 ]]; then
             fi
             CONNECT_METHOD="ssh"
         else
-            # USE_SSM=auto — try SSH briefly (~60s), then fall back to SSM
-            log_info "USE_SSM=auto: trying SSH for ~60s..."
+            # USE_SSM=auto — try SSH briefly (~30s), then fall back to SSM
+            log_info "USE_SSM=auto: trying SSH for ~30s..."
             SSH_READY=0
-            if [[ ${#SSH_OPTS[@]} -gt 0 && -n "$DRIVER_INSTANCE_IP" ]]; then
-                for i in $(seq 1 12); do
+            # Use a shorter ConnectTimeout for the auto-probe to avoid long waits
+            _probe_opts=()
+            for _o in "${SSH_OPTS[@]}"; do
+                [[ "$_o" == "ConnectTimeout="* ]] && continue
+                _probe_opts+=("$_o")
+            done
+            _probe_opts+=(-o ConnectTimeout=3)
+            if [[ ${#_probe_opts[@]} -gt 0 && -n "$DRIVER_INSTANCE_IP" ]]; then
+                for i in $(seq 1 6); do
                     for try_user in "${SSH_USER_CANDIDATES[@]}"; do
-                        if ssh "${SSH_OPTS[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
+                        if ssh "${_probe_opts[@]}" "${try_user}@$DRIVER_INSTANCE_IP" "echo OK" >/dev/null 2>&1; then
                             SSH_USER="$try_user"
                             SSH_READY=1
                             break 2
                         fi
                     done
-                    sleep 5
+                    sleep 3
                 done
             fi
             
@@ -1524,7 +1672,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
                 log_info "SSH is ready (user: $SSH_USER) — using SSH."
             else
                 CONNECT_METHOD="ssm"
-                log_warn "SSH unreachable after ~60s — falling back to SSM."
+                log_warn "SSH unreachable after ~30s — falling back to SSM."
             fi
         fi
     fi
@@ -1568,7 +1716,13 @@ if [[ $RUN_MODE -eq 0 ]]; then
             --region "$AWS_REGION" --only-show-errors
         rm -f "$TARBALL_LOCAL"
         log_info "Repo uploaded to s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY}"
-        
+
+        # Ensure AWS CLI v2 is available on the instance (the AMI may not have it)
+        log_info "Ensuring AWS CLI v2 is installed on instance via SSM..."
+        ssm_run_command "$DRIVER_INSTANCE_ID" \
+            "if ! command -v aws >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq unzip curl >/dev/null 2>&1; curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip && cd /tmp && unzip -qo awscliv2.zip && ./aws/install --update >/dev/null 2>&1 && rm -rf /tmp/awscliv2.zip /tmp/aws && echo AWS_CLI_INSTALLED; else aws --version; fi" \
+            300
+
         log_info "Downloading and extracting repo on instance via SSM..."
         ssm_run_command "$DRIVER_INSTANCE_ID" \
             "aws s3 cp s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY} /tmp/repo.tar.gz --region ${AWS_REGION} && rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf repo.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && chown -R ${SSH_USER}:${SSH_USER} /home/${SSH_USER}/scrna-repo && rm -f /tmp/repo.tar.gz" \
@@ -1636,10 +1790,15 @@ SSHEOF
     fi
     
     ############################################################################
-    # Cleanup
+    # Cleanup (also runs via cleanup_on_exit trap on failure)
     ############################################################################
-    
-    # Revoke caller IP from SG if it was authorized
+
+    if [[ $RUN_EXIT -ne 0 ]]; then
+        log_error "Pipeline exited with code $RUN_EXIT.  Cleanup will run via trap."
+    fi
+
+    # Normal-path cleanup: revoke SG ingress, then terminate+delete.
+    # On failure the trap duplicates this (idempotent AWS calls are safe).
     if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
         manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
     fi
@@ -1648,25 +1807,28 @@ SSHEOF
         log_info "Terminating driver instance $DRIVER_INSTANCE_ID..."
         aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
         
-        # Wait for instance to terminate before cleaning up SG
         log_info "Waiting for instance to terminate..."
         aws ec2 wait instance-terminated --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" 2>/dev/null || true
         
-        # Only delete created SG after instance is terminated
         if [[ -n "$CREATED_SG_ID" ]]; then
             log_info "Deleting temporary security group: $CREATED_SG_ID"
             aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
         fi
         
-        # Clean up SSM transfer bucket if used
-        if [[ -n "$SSM_TRANSFER_BUCKET" ]]; then
+        if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
             log_info "Cleaning up SSM transfer bucket: $SSM_TRANSFER_BUCKET"
             aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null || true
             aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
         fi
+
+        # Clear DRIVER_INSTANCE_ID so the trap doesn't double-terminate
+        DRIVER_INSTANCE_ID=""
+        CREATED_SG_ID=""
     else
         log_info "Driver instance $DRIVER_INSTANCE_ID left running (TERMINATE_DRIVER_ON_EXIT=0)"
-        log_info "Note: Temporary SG $CREATED_SG_ID is still in use. Clean it up manually when done."
+        log_info "Note: Temporary SG ${CREATED_SG_ID:-} is still in use. Clean it up manually when done."
+        # Prevent trap from terminating a kept-alive instance
+        DRIVER_INSTANCE_ID=""
     fi
     
     exit $RUN_EXIT
@@ -1679,6 +1841,7 @@ fi
 log_info "======== E2E Serverless scRNA Pipeline (RUN MODE) ========"
 log_info "Dataset: $DATASET"
 log_info "Run ID: $RUN_ID"
+log_info "AWS CLI present: $(aws --version 2>&1)"
 
 # Auto-detect AWS account ID if not set
 if [[ -z "${AWS_ACCOUNT_ID:-}" ]]; then
@@ -1693,31 +1856,43 @@ init_resource_names
 # Setup NVMe storage if available
 log_info "Setting up NVMe storage..."
 
-NVMe_DEVICE=$(lsblk -d -n -l | grep nvme | awk '{print $1}' | head -1)
-if [[ -n "$NVMe_DEVICE" ]]; then
-    NVMe_PATH="/dev/$NVMe_DEVICE"
-    MOUNT_POINT="/mnt/nvme"
-    
-    if ! mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        log_info "Found NVMe device: $NVMe_PATH"
+MOUNT_POINT="/mnt/nvme"
+
+if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    log_info "$MOUNT_POINT already mounted — reusing"
+else
+    # Find an NVMe instance-store device (skip devices already mounted, e.g. root EBS on nvme0n1)
+    NVMe_DEVICE=""
+    while read -r dev; do
+        dev_path="/dev/$dev"
+        # Skip if this device (or a partition of it) is already mounted
+        if mount | grep -q "^${dev_path}"; then
+            log_info "Skipping $dev_path (already mounted)"
+            continue
+        fi
+        NVMe_DEVICE="$dev"
+        break
+    done < <(lsblk -d -n -l -o NAME | grep nvme)
+
+    if [[ -n "$NVMe_DEVICE" ]]; then
+        NVMe_PATH="/dev/$NVMe_DEVICE"
+        log_info "Found unmounted NVMe device: $NVMe_PATH"
         if [[ -b "$NVMe_PATH" ]]; then
             # Check if filesystem exists; if not, create one
             if ! sudo blkid "$NVMe_PATH" >/dev/null 2>&1; then
                 log_info "Creating ext4 filesystem on $NVMe_PATH..."
                 sudo mkfs.ext4 -F "$NVMe_PATH"
             fi
-            
             log_info "Mounting $NVMe_PATH to $MOUNT_POINT..."
             sudo mkdir -p "$MOUNT_POINT"
             sudo mount "$NVMe_PATH" "$MOUNT_POINT"
             sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
         fi
     else
-        log_info "$MOUNT_POINT already mounted"
+        log_info "No unmounted NVMe device found; using default storage"
+        sudo mkdir -p "$MOUNT_POINT"
+        sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
     fi
-else
-    log_info "No NVMe device found; using default storage"
-    mkdir -p /mnt/nvme
 fi
 
 # Create run directory
@@ -1725,6 +1900,11 @@ RUN_DIR="/mnt/nvme/runs/$RUN_ID"
 mkdir -p "$RUN_DIR"
 
 log_info "Run directory: $RUN_DIR"
+
+# Timing instrumentation (matching paper Table 1)
+declare -A STEP_TIMES
+declare -a STEP_ORDER
+PIPELINE_START=$(date +%s)
 
 ################################################################################
 # Step 0: Bootstrap Tools
@@ -1747,6 +1927,15 @@ done
 
 if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
     log_info "Installing missing tools: ${MISSING_TOOLS[*]}"
+    # Wait for any unattended-upgrades / dpkg locks to release (common on fresh Ubuntu instances)
+    for _w in $(seq 1 30); do
+        if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+           ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            break
+        fi
+        log_info "Waiting for dpkg/apt lock to release (attempt $_w/30)..."
+        sleep 10
+    done
     sudo apt-get update
     
     INSTALL_PKGS=()
@@ -1754,7 +1943,13 @@ if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
         case "$tool" in
             python3) INSTALL_PKGS+=(python3 python3-venv python3-pip) ;;
             pip3) INSTALL_PKGS+=(python3-pip) ;;
-            aws) INSTALL_PKGS+=(awscli) ;;
+            aws)
+                log_info "Installing AWS CLI v2..."
+                curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+                (cd /tmp && unzip -qo awscliv2.zip && sudo ./aws/install --update 2>&1) >&2
+                rm -rf /tmp/awscliv2.zip /tmp/aws
+                hash -r
+                ;;
             docker) INSTALL_PKGS+=(docker.io) ;;
             *) INSTALL_PKGS+=("$tool") ;;
         esac
@@ -1781,6 +1976,7 @@ log_info "Tools ready"
 ################################################################################
 
 log_info "Step 1: Preparing FASTQs..."
+STEP_START=$(date +%s)
 
 FASTQ_DIR="$RUN_DIR/fastq"
 mkdir -p "$FASTQ_DIR"
@@ -1857,6 +2053,10 @@ mv -f "$tmp_r2" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz"
 
 log_info "FASTQ files ready"
 
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["FASTQ Download"]=$STEP_ELAPSED; STEP_ORDER+=("FASTQ Download")
+log_info "Step 1 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+
 ################################################################################
 # Step 2-4: Create S3 Buckets and Setup EventBridge
 ################################################################################
@@ -1881,6 +2081,7 @@ log_info "Buckets created and configured"
 ################################################################################
 
 log_info "Step 3: Uploading FASTQs to S3..."
+STEP_START=$(date +%s)
 
 aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
     "s3://$INPUT_FASTQ_BUCKET/$DATASET/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
@@ -1892,11 +2093,16 @@ aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
 
 log_info "FASTQs uploaded"
 
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["FASTQ Upload to S3"]=$STEP_ELAPSED; STEP_ORDER+=("FASTQ Upload to S3")
+log_info "Step 3 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+
 ################################################################################
 # Step 5: Prepare Lambda Build Context
 ################################################################################
 
 log_info "Step 5: Preparing Lambda build context..."
+STEP_START=$(date +%s)
 
 BUILD_DIR="$RUN_DIR/lambda_build"
 mkdir -p "$BUILD_DIR"
@@ -1924,6 +2130,10 @@ ECR_REPO_URI=$(create_ecr_repo_if_needed "$ECR_REPO_NAME")
 # 6b: Build and push Docker image to ECR
 IMAGE_URI=$(build_and_push_lambda_image "$ECR_REPO_URI" "$DOCKER_IMAGE_NAME" "$BUILD_DIR")
 
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["Docker Build + Push"]=$STEP_ELAPSED; STEP_ORDER+=("Docker Build + Push")
+log_info "Steps 5-6b completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+
 # 6c: Create Lambda execution role
 LAMBDA_ROLE_ARN=$(create_lambda_execution_role "$LAMBDA_EXECUTION_ROLE_NAME")
 
@@ -1931,75 +2141,13 @@ LAMBDA_ROLE_ARN=$(create_lambda_execution_role "$LAMBDA_EXECUTION_ROLE_NAME")
 log_info "Waiting 15s for IAM role propagation..."
 sleep 15
 
-# 6d: Create Lambda function with fallback for memory/ephemeral limits
-MEM_CANDIDATES=("$LAMBDA_MEMORY_MB" 3008 2048 1536 1024 512)
-EPH_CANDIDATES=("$LAMBDA_EPHEMERAL_MB" 10240 512)
-
-CREATE_SUCCESS=0
-LAMBDA_FUNCTION_ARN=""
-for mem in "${MEM_CANDIDATES[@]}"; do
-    for eph in "${EPH_CANDIDATES[@]}"; do
-        log_info "Attempting Lambda creation: memory=${mem}MB, ephemeral=${eph}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
-        
-        if LAMBDA_FUNCTION_ARN=$(create_lambda_function_from_image \
-            "$LAMBDA_FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$IMAGE_URI" \
-            "$mem" "$eph" "$LAMBDA_TIMEOUT_SEC"); then
-            
-            LAMBDA_MEMORY_MB="$mem"
-            LAMBDA_EPHEMERAL_MB="$eph"
-            log_info "Lambda created successfully: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB"
-            CREATE_SUCCESS=1
-            break 2
-        else
-            log_info "Failed with memory=${mem}MB, ephemeral=${eph}MB (trying next combination...)"
-        fi
-    done
-done
-
-if [[ $CREATE_SUCCESS -eq 0 ]]; then
-    die "Unable to create Lambda with any memory/ephemeral combination. Check account limits."
-fi
-
-# Update Lambda config with desired settings (retry with fallback)
-log_info "Updating Lambda function configuration..."
-
-MEM_CANDIDATES=("$LAMBDA_MEMORY_MB" 3008 2048 1536 1024 512)
-EPH_CANDIDATES=("$LAMBDA_EPHEMERAL_MB" 10240 512)
-
-CONFIG_SUCCESS=0
-for mem in "${MEM_CANDIDATES[@]}"; do
-    for eph in "${EPH_CANDIDATES[@]}"; do
-        log_info "Attempting Lambda config: memory=${mem}MB, ephemeral=${eph}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
-        
-        if aws lambda update-function-configuration \
-            --function-name "$LAMBDA_FUNCTION_NAME" \
-            --region "$AWS_REGION" \
-            --memory-size "$mem" \
-            --timeout "$LAMBDA_TIMEOUT_SEC" \
-            --ephemeral-storage Size="$eph" 2>&1; then
-            
-            LAMBDA_MEMORY_MB="$mem"
-            LAMBDA_EPHEMERAL_MB="$eph"
-            log_info "Lambda configured: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
-            CONFIG_SUCCESS=1
-            break 2
-        else
-            log_info "Failed with memory=${mem}MB, ephemeral=${eph}MB (trying next combination...)"
-        fi
-    done
-done
-
-if [[ $CONFIG_SUCCESS -eq 0 ]]; then
-    die "Unable to configure Lambda. Set LAMBDA_MEMORY_MB/LAMBDA_EPHEMERAL_MB to values allowed in your account. Example: LAMBDA_MEMORY_MB=3008 LAMBDA_EPHEMERAL_MB=512"
-fi
-
-# Lambda memory/ephemeral warnings
-if [[ "$LAMBDA_MEMORY_MB" -lt 10240 ]]; then
-    log_warn "Lambda memory (${LAMBDA_MEMORY_MB}MB) is below 10240MB recommended by the paper. Performance may be degraded."
-fi
-if [[ "$LAMBDA_EPHEMERAL_MB" -lt 10240 ]]; then
-    log_warn "Lambda ephemeral storage (${LAMBDA_EPHEMERAL_MB}MB) is below 10240MB recommended by the paper. Large datasets may fail."
-fi
+# 6d: Create Lambda function (fixed 3008MB memory / 10240MB ephemeral)
+log_info "Creating Lambda: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
+LAMBDA_FUNCTION_ARN=$(create_lambda_function_from_image \
+    "$LAMBDA_FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$IMAGE_URI" \
+    "$LAMBDA_MEMORY_MB" "$LAMBDA_EPHEMERAL_MB" "$LAMBDA_TIMEOUT_SEC") \
+    || die "Failed to create Lambda (memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB). Check account limits."
+log_info "Lambda created successfully: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB"
 
 # Wait for Lambda function to be active
 log_info "Waiting for Lambda function to be active..."
@@ -2037,11 +2185,16 @@ log_info "Lambda function ready"
 ################################################################################
 
 log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download)..."
+STEP_START=$(date +%s)
 
 OUTPUT_DIR="$RUN_DIR/output"
 mkdir -p "$OUTPUT_DIR"
 
 process_fastq_bash "$OUTPUT_DIR"
+
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["Lambda Mapping"]=$STEP_ELAPSED; STEP_ORDER+=("Lambda Mapping")
+log_info "Step 7 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
 
 log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 
@@ -2058,6 +2211,7 @@ bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
 bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
 
 log_info "Running combine scripts..."
+STEP_START=$(date +%s)
 
 COMBINED_DIR="$RUN_DIR/combined"
 mkdir -p "$COMBINED_DIR"
@@ -2065,7 +2219,12 @@ mkdir -p "$COMBINED_DIR"
 bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$OUTPUT_DIR" "$COMBINED_DIR"
 bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$OUTPUT_DIR" "$COMBINED_DIR"
 
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["Combine Outputs"]=$STEP_ELAPSED; STEP_ORDER+=("Combine Outputs")
+log_info "Step 8a (combine) completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+
 log_info "Running alevin-fry quant via alevin_process.sh..."
+STEP_START=$(date +%s)
 
 ALEVIN_OUTPUT="$RUN_DIR/alevin_output"
 mkdir -p "$ALEVIN_OUTPUT"
@@ -2074,6 +2233,10 @@ TRANSCRIPTOME_GENE_MAPPING="/opt/scrna-seed/reference/t2g.tsv"
 
 bash /home/ubuntu/scrna-repo/alevin_process.sh "$COMBINED_DIR" "$ALEVIN_OUTPUT" "$TRANSCRIPTOME_GENE_MAPPING"
 
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["Alevin-fry Quant"]=$STEP_ELAPSED; STEP_ORDER+=("Alevin-fry Quant")
+log_info "Step 8b (quant) completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+
 log_info "Quantification complete"
 
 ################################################################################
@@ -2081,9 +2244,14 @@ log_info "Quantification complete"
 ################################################################################
 
 log_info "Step 9: Uploading quantification outputs to S3..."
+STEP_START=$(date +%s)
 
 aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" \
     --region "$AWS_REGION"
+
+STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
+STEP_TIMES["Upload Quant to S3"]=$STEP_ELAPSED; STEP_ORDER+=("Upload Quant to S3")
+log_info "Step 9 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
 
 log_info "Quant outputs uploaded"
 
@@ -2097,6 +2265,10 @@ if [[ "${RUN_QC:-0}" == "1" ]]; then
     # Ensure python3 is available for QC
     if ! need_cmd python3; then
         log_info "Installing python3 for QC..."
+        for _w in $(seq 1 30); do
+            if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
+            log_info "Waiting for dpkg lock ($_w/30)..."; sleep 10
+        done
         sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
     fi
     
@@ -2154,6 +2326,32 @@ BASENAME_WITH_LANE=$BASENAME_WITH_LANE
 EOF
 
 log_info "Run metadata saved to $RUN_DIR/run.env"
+
+################################################################################
+# Timing Summary
+################################################################################
+
+PIPELINE_END=$(date +%s)
+PIPELINE_TOTAL=$((PIPELINE_END - PIPELINE_START))
+
+DATASET_UPPER=$(echo "$DATASET" | tr '[:lower:]' '[:upper:]')
+
+{
+    echo ""
+    echo "========== SERVERLESS TIMING SUMMARY ($DATASET_UPPER) =========="
+    printf "%-30s %15s %10s\n" "Step" "Time (seconds)" "Time (min)"
+    echo "-----------------------------------------------------------"
+    for key in "${STEP_ORDER[@]}"; do
+        val="${STEP_TIMES[$key]}"
+        mins=$(echo "scale=2; $val / 60" | bc 2>/dev/null || echo "$((val/60)).$((val%60))")
+        printf "%-30s %15s %10s\n" "$key" "$val" "$mins"
+    done
+    echo "-----------------------------------------------------------"
+    total_mins=$(echo "scale=2; $PIPELINE_TOTAL / 60" | bc 2>/dev/null || echo "$((PIPELINE_TOTAL/60)).$((PIPELINE_TOTAL%60))")
+    printf "%-30s %15s %10s\n" "Total Pipeline" "$PIPELINE_TOTAL" "$total_mins"
+    echo "==========================================================="
+    echo ""
+} | tee "$RUN_DIR/timing_summary.txt" >&2
 
 ################################################################################
 # Cleanup
