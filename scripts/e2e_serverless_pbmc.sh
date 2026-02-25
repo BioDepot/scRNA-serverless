@@ -1524,7 +1524,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
         # Chain: m6id (NVMe, best perf) → m6i (EBS-only) → t3 (burstable, free-tier accounts)
         INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
         if [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
-            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large")
+            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large" "t3.medium" "t3.small" "t3.micro")
         fi
         
         DRIVER_INSTANCE_ID=""
@@ -1548,7 +1548,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
                 INSTANCE_TYPE="$_try_type"
                 break
             fi
-            local _err_msg; _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
+            _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
             if [[ "$_err_msg" == *"VcpuLimitExceeded"* || "$_err_msg" == *"InsufficientInstanceCapacity"* || "$_err_msg" == *"InstanceLimitExceeded"* || "$_err_msg" == *"Unsupported"* ]]; then
                 log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
                 DRIVER_INSTANCE_ID=""
