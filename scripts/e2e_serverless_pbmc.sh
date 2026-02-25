@@ -1239,6 +1239,36 @@ if ! need_cmd aws; then
     fi
 fi
 
+# 1.5. Ensure jq is available locally (needed for SSM fallback and Lambda JSON parsing)
+if ! need_cmd jq; then
+    if [[ $RUN_MODE -eq 0 ]]; then
+        log_info "jq not found — auto-installing for this session..."
+        _jq_dir="$HOME/.local/bin"
+        mkdir -p "$_jq_dir"
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+                curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.exe" -o "$_jq_dir/jq.exe"
+                ;;
+            Linux*)
+                curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$_jq_dir/jq"
+                chmod +x "$_jq_dir/jq"
+                ;;
+            Darwin*)
+                curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-amd64" -o "$_jq_dir/jq"
+                chmod +x "$_jq_dir/jq"
+                ;;
+            *)
+                die "Unsupported OS for jq auto-install. Install manually: https://jqlang.github.io/jq/download/"
+                ;;
+        esac
+        export PATH="$_jq_dir:$PATH"
+        if ! need_cmd jq; then
+            die "Failed to install jq. Install manually: https://jqlang.github.io/jq/download/"
+        fi
+        log_info "jq installed: $(jq --version 2>&1)"
+    fi
+fi
+
 # 2. AWS authentication must work
 if ! aws sts get-caller-identity --region "$AWS_REGION" >/dev/null 2>&1; then
     log_error "AWS authentication failed."
