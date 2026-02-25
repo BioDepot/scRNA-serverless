@@ -1783,7 +1783,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
         
         log_info "Extracting repository on instance..."
         ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
-            "rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && rm -f ${TARBALL_REMOTE}"
+            "rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf scrna-repo-${RUN_ID}.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && rm -f ${TARBALL_REMOTE} && find /home/${SSH_USER}/scrna-repo -name '*.sh' -exec sed -i 's/\r$//' {} +"
     else
         # SSM: transfer via S3
         TARBALL_S3_KEY="transfer/${RUN_ID}/repo.tar.gz"
@@ -1800,7 +1800,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
 
         log_info "Downloading and extracting repo on instance via SSM..."
         ssm_run_command "$DRIVER_INSTANCE_ID" \
-            "aws s3 cp s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY} /tmp/repo.tar.gz --region ${AWS_REGION} && rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf repo.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && chown -R ${SSH_USER}:${SSH_USER} /home/${SSH_USER}/scrna-repo && rm -f /tmp/repo.tar.gz" \
+            "aws s3 cp s3://${SSM_TRANSFER_BUCKET}/${TARBALL_S3_KEY} /tmp/repo.tar.gz --region ${AWS_REGION} && rm -rf /home/${SSH_USER}/scrna-repo && cd /tmp && tar -xzf repo.tar.gz && mv scRNA-serverless /home/${SSH_USER}/scrna-repo && chown -R ${SSH_USER}:${SSH_USER} /home/${SSH_USER}/scrna-repo && find /home/${SSH_USER}/scrna-repo -name '*.sh' -exec sed -i 's/\r$//' {} + && rm -f /tmp/repo.tar.gz" \
             300
     fi
     
