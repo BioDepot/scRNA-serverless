@@ -354,12 +354,26 @@ if [[ $RUN_MODE -eq 0 && $DRY_RUN_MODE -eq 0 ]]; then
     # Check disk space on server
     ########################################################################
     log_info "Checking disk space on server..."
-    REQUIRED_MB=10000
+    FASTQ_SUBDIR="${FASTQ_SUBDIRS[$DATASET]}"
+    FASTQ_DIR_NAME="${FASTQ_DIR_NAMES[$DATASET]}"
+    FASTQ_CHECK_DIR="${FASTQ_BASE_DIR}/${FASTQ_SUBDIR}/${FASTQ_DIR_NAME}"
+    FASTQ_CACHED=$(run_ssh "[ -d '$FASTQ_CHECK_DIR' ] && echo yes || echo no" 2>/dev/null || echo "no")
+
     if [[ "$DATASET" == "pbmc10k" ]]; then
-        REQUIRED_MB=60000
+        if [[ "$FASTQ_CACHED" == "yes" ]]; then
+            REQUIRED_MB=20000
+        else
+            REQUIRED_MB=60000
+        fi
+    else
+        if [[ "$FASTQ_CACHED" == "yes" ]]; then
+            REQUIRED_MB=5000
+        else
+            REQUIRED_MB=10000
+        fi
     fi
     AVAIL_MB=$(run_ssh "df -m /home 2>/dev/null | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0)
-    log_info "Server disk: ${AVAIL_MB} MB available, ${REQUIRED_MB} MB required"
+    log_info "Server disk: ${AVAIL_MB} MB available, ${REQUIRED_MB} MB required (FASTQs cached: ${FASTQ_CACHED})"
     if [[ "${AVAIL_MB:-0}" -lt "$REQUIRED_MB" ]]; then
         die "Insufficient disk space on server: ${AVAIL_MB} MB available, need ${REQUIRED_MB} MB"
     fi
@@ -687,12 +701,22 @@ DRYRUN_SCRIPT
         ERRORS=$((ERRORS + ${REMOTE_ERRORS:-0}))
 
         AVAIL_MB=$(echo "$REMOTE_CHECK" | grep '^AVAIL_MB=' | cut -d= -f2)
-        REQUIRED_MB=10000
+        FASTQ_IS_CACHED=$(echo "$REMOTE_CHECK" | grep -q '\[OK\] FASTQ directory' && echo yes || echo no)
         if [[ "$DATASET" == "pbmc10k" ]]; then
-            REQUIRED_MB=60000
+            if [[ "$FASTQ_IS_CACHED" == "yes" ]]; then
+                REQUIRED_MB=20000
+            else
+                REQUIRED_MB=60000
+            fi
+        else
+            if [[ "$FASTQ_IS_CACHED" == "yes" ]]; then
+                REQUIRED_MB=5000
+            else
+                REQUIRED_MB=10000
+            fi
         fi
         if [[ ${AVAIL_MB:-0} -lt $REQUIRED_MB ]]; then
-            log_warn "  Low disk space: ${AVAIL_MB:-0} MB available, ${REQUIRED_MB} MB recommended"
+            log_warn "  Low disk space: ${AVAIL_MB:-0} MB available, ${REQUIRED_MB} MB recommended (FASTQs cached: ${FASTQ_IS_CACHED})"
         fi
     fi
 
@@ -734,11 +758,23 @@ _sudo() {
 
 log_info "Checking disk space..."
 AVAIL_MB=$(df -m /home 2>/dev/null | awk 'NR==2{print $4}' || echo 999999)
-REQUIRED_MB=10000
+FASTQ_SUBDIR="${FASTQ_SUBDIRS[$DATASET]}"
+FASTQ_DIR_NAME="${FASTQ_DIR_NAMES[$DATASET]}"
+FASTQ_CHECK_PATH="${FASTQ_BASE_DIR}/${FASTQ_SUBDIR}/${FASTQ_DIR_NAME}"
 if [[ "$DATASET" == "pbmc10k" ]]; then
-    REQUIRED_MB=60000
+    if [[ -d "$FASTQ_CHECK_PATH" ]]; then
+        REQUIRED_MB=20000
+    else
+        REQUIRED_MB=60000
+    fi
+else
+    if [[ -d "$FASTQ_CHECK_PATH" ]]; then
+        REQUIRED_MB=5000
+    else
+        REQUIRED_MB=10000
+    fi
 fi
-log_info "  Available: ${AVAIL_MB} MB, Required: ${REQUIRED_MB} MB"
+log_info "  Available: ${AVAIL_MB} MB, Required: ${REQUIRED_MB} MB (FASTQs cached: $([[ -d "$FASTQ_CHECK_PATH" ]] && echo yes || echo no))"
 if [[ "${AVAIL_MB:-0}" -lt "$REQUIRED_MB" ]]; then
     die "Insufficient disk space: ${AVAIL_MB} MB available, need ${REQUIRED_MB} MB. Clean up and retry."
 fi
