@@ -62,3 +62,13 @@ The final quant matrix will be present in the S3 bucket mentioned in SCRNA_OUTPU
 cd ~/refactored-serverless-pipeline
 ./clean_up_resources.sh
 ```
+
+---
+
+## Documentation
+
+| Guide | Description |
+|---|---|
+| [Differences From the Paper](docs/PAPER_DIFFERENCES.md) | How this repository differs from the paper (memory, splitting, threads, etc.) |
+| [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) | Step-by-step instructions to run the pipeline on the UW Tacoma server via GitHub Actions |
+| [Serverless Pipeline Guide](docs/SERVERLESS_GUIDE.md) | Step-by-step instructions to run the serverless pipeline on your own AWS account |
