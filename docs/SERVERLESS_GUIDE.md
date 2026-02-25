@@ -24,7 +24,7 @@ The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parall
 | PBMC 1K | t3.large | 8 GB |
 | PBMC 10K | t3.xlarge | 16 GB |
 
-Free-tier instances (t3.micro/small/medium) are too small. The script selects the best instance your account supports automatically. You do not manually launch any EC2 instance. See [Paper Differences](PAPER_DIFFERENCES.md) for the full instance fallback chain.
+Free-tier instances (t3.micro/small/medium) are too small. The script selects the best instance your account supports automatically. You do not manually launch any EC2 instance. See [Reproducibility Notes](REPRODUCIBILITY_NOTES.md) for the full instance fallback chain.
 
 **Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
 
@@ -233,7 +233,7 @@ serverless_runs/
 | SSH blocked | Falls back to SSM automatically |
 | Lambda timeout exceeded | Fails fast after 2x timeout |
 
-For details on what changed from the paper (instance types, memory, threads, splitting), see [Paper Differences](PAPER_DIFFERENCES.md).
+For details on automatic fallbacks (instance types, memory, threads, splitting), see [Reproducibility Notes](REPRODUCIBILITY_NOTES.md).
 
 ---
 

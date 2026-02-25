@@ -1,24 +1,24 @@
-# Differences From the Paper
+# Reproducibility Notes
 
-All differences are handled automatically by the script. No manual configuration is needed. The output count matrices are identical regardless of which settings are used.
+The script reproduces the paper's pipeline exactly when run on a fully provisioned AWS account. For accounts with lower quotas or limits, the script automatically falls back to compatible settings. No manual configuration is needed. The output count matrices are identical regardless of which settings are used.
 
 ---
 
-## Serverless pipeline differences
+## Automatic fallbacks for AWS account limits
 
-### Lambda memory: 10,240 MB → 3,008 MB fallback
+### Lambda memory fallback
 
 The paper uses **10,240 MB** Lambda functions (~6 vCPUs, piscem `-t 6`). This repo tries 10,240 MB first, and falls back to **3,008 MB** (~2 vCPUs, `-t 2`) if the account quota is exceeded.
 
-### PBMC 1K splitting: 1 Lambda → 17 Lambdas
+### PBMC 1K automatic splitting
 
 The paper processes PBMC 1K (~5 GB) in a single Lambda. At 3,008 MB, splitting is forced to avoid OOM — PBMC 1K becomes **17 chunks** (4M reads each), processed by 17 parallel Lambdas. For PBMC 10K, splitting occurs at both memory tiers.
 
-### Piscem threads: `-t 6` → `-t 2`
+### Piscem thread auto-configuration
 
 `scrna-pipeline/map.py` reads `LAMBDA_MEMORY_MB` at runtime and sets threads accordingly. No configuration needed.
 
-### EC2 driver instance: m6id.16xlarge → automatic fallback
+### EC2 instance type fallback
 
 The paper uses a fixed **m6id.16xlarge** (64 vCPUs, 256 GB RAM). This repo tries m6id.16xlarge first, then falls back through smaller instances if the account's vCPU quota is too low:
 
@@ -37,13 +37,13 @@ The paper uses a fixed **m6id.16xlarge** (64 vCPUs, 256 GB RAM). This repo tries
 
 This repo defaults to **500 GB**, matching the paper. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
 
-### NVMe storage: required → optional
+### NVMe storage fallback
 
 The paper assumes NVMe instance storage (m6id family). This repo falls back to the EBS root volume if no NVMe device is found (m6i, t3 families).
 
-### Summary table
+### Configuration summary
 
-| Setting | Paper | This repo |
+| Setting | Paper | Script default (auto-adjusted if needed) |
 |---|---|---|
 | Lambda memory | 10,240 MB | 10,240 MB (falls back to 3,008 MB) |
 | Lambda ephemeral storage | 10,240 MB | 10,240 MB (unchanged) |
