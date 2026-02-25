@@ -399,6 +399,26 @@ if [[ $RUN_MODE -eq 0 && $DRY_RUN_MODE -eq 0 ]]; then
 
     REMOTE_REPO_DIR="/home/${SSH_USER}/scrna-repo"
 
+    # Clean up any leftover run directories and repo copies from interrupted runs
+    log_info "Cleaning up leftover files from previous runs..."
+    run_ssh bash -s <<PRECLEAN
+set -euo pipefail
+CLEANED=0
+# Remove old run directories (but not the parent)
+if [[ -d "${SERVER_RUN_DIR}" ]]; then
+    for d in "${SERVER_RUN_DIR}"/*/; do
+        [[ -d "\$d" ]] && rm -rf "\$d" && CLEANED=\$((CLEANED + 1))
+    done
+fi
+# Remove old repo copy
+[[ -d "${REMOTE_REPO_DIR}" ]] && rm -rf "${REMOTE_REPO_DIR}" && CLEANED=\$((CLEANED + 1))
+# Remove stale tarballs
+rm -f /tmp/scrna-repo-upload.tar.gz /home/${SSH_USER}/scrna-repo.tar /home/${SSH_USER}/scrna-scripts.tar 2>/dev/null
+echo "PRE_CLEANED=\$CLEANED"
+PRECLEAN
+
+    log_info "Pre-run cleanup complete."
+
     run_scp "$TARBALL_LOCAL" "${SSH_TARGET}:/tmp/scrna-repo-upload.tar.gz"
     rm -f "$TARBALL_LOCAL"
 
