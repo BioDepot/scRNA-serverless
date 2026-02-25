@@ -35,8 +35,8 @@
 #                          1    = SSM only (no SSH required, KEY_NAME/KEY_PEM_PATH optional)
 #                          0    = SSH only (original behavior)
 #
-#   LAMBDA_MEMORY_MB       Lambda function memory (default: 3008)
-#                          Paper uses 10240MB, but most accounts are capped at 3008MB.
+#   LAMBDA_MEMORY_MB       Lambda function memory (default: 10240, fallback: 3008)
+#                          Attempts 10240MB first; falls back to 3008MB if account quota exceeded.
 #   LAMBDA_EPHEMERAL_MB    Lambda /tmp ephemeral storage (default: 10240)
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
 #   THREADS                Number of CPU threads (default: nproc)
@@ -153,8 +153,8 @@ SSH_USER="${SSH_USER:-ubuntu}"    # SSH username (auto-detected if default fails
 CREATED_SG_ID=""                  # Track SG created by this script for cleanup
 USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked networks
 
-# Lambda Configuration (account cap is 3008MB memory; ephemeral 10240MB works)
-LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-3008}"
+# Lambda Configuration (try 10240MB memory; fallback to 3008MB if quota exceeded)
+LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
 
@@ -580,6 +580,11 @@ create_lambda_function_from_image() {
             return 0
         fi
         local err_msg; err_msg=$(cat "$_create_err" 2>/dev/null); rm -f "$_create_err"
+        # InvalidParameterValue means memory exceeds account quota — return 2 so caller can fallback
+        if [[ "$err_msg" == *"InvalidParameterValue"* ]]; then
+            log_info "InvalidParameterValue: $err_msg"
+            return 2
+        fi
         log_info "Lambda creation attempt $attempt/$max_retries failed: ${err_msg:-unknown error}. Retrying in ${delay}s..."
         sleep "$delay"; delay=$((delay * 2))
     done
@@ -709,16 +714,21 @@ process_fastq_bash() {
         [[ "$base_folder" == "." ]] && base_folder=""
 
         # Check combined file size
-        local r1_bytes r2_bytes combined_bytes seven_gb
+        local r1_bytes r2_bytes combined_bytes split_threshold_bytes
         r1_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r1_key" \
             --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
         r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
             --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
         combined_bytes=$(( r1_bytes + r2_bytes ))
-        seven_gb=$(( 7 * 1024 * 1024 * 1024 ))
-        log_info "Pair $lane_id: combined size $(( combined_bytes / 1048576 )) MB"
+        # Force splitting when Lambda memory <= 3008 MB (threshold=0) to avoid OOM/timeouts
+        if [[ $LAMBDA_MEMORY_MB -le 3008 ]]; then
+            split_threshold_bytes=0
+        else
+            split_threshold_bytes=$(( 7 * 1024 * 1024 * 1024 ))
+        fi
+        log_info "Pair $lane_id: combined size $(( combined_bytes / 1048576 )) MB (split threshold: $(( split_threshold_bytes / 1048576 )) MB)"
 
-        if [[ $combined_bytes -lt $seven_gb ]]; then
+        if [[ $split_threshold_bytes -gt 0 && $combined_bytes -lt $split_threshold_bytes ]]; then
             local r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_key}"
             local r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_key}"
             sleep 3
@@ -778,11 +788,14 @@ process_fastq_bash() {
             aws s3 ls "s3://$OUTPUT_MAP_BUCKET/" --recursive --region "$AWS_REGION" 2>&1 | tail -30 >&2 || true
             die "Lambda did not complete in time. Check CloudWatch logs above for OOM / Runtime errors."
         fi
-        # Detect prolonged zero-progress (possible Lambda failure)
-        if [[ $completed -eq 0 && $elapsed -gt 900 ]]; then
-            log_warn "Zero outputs after $((elapsed/60))m. Checking CloudWatch for errors..."
+        # Fail-fast: if zero progress after LAMBDA_TIMEOUT_SEC, Lambda likely failed
+        if [[ $completed -eq 0 && $elapsed -gt $LAMBDA_TIMEOUT_SEC ]]; then
+            log_warn "Zero outputs after $((elapsed/60))m (Lambda timeout: ${LAMBDA_TIMEOUT_SEC}s). Checking CloudWatch for errors..."
             aws logs tail "/aws/lambda/$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" \
                 --since 15m --format short 2>&1 | grep -iE 'error|oom|runtime.exited|killed|memory' | tail -20 >&2 || true
+            if [[ $elapsed -gt $(( LAMBDA_TIMEOUT_SEC * 2 )) ]]; then
+                die "No Lambda outputs after $((elapsed/60))m (2x timeout). Lambda processing appears to have failed."
+            fi
         fi
         sleep "$POLL_INTERVAL_SECONDS"
     done
@@ -2141,13 +2154,25 @@ LAMBDA_ROLE_ARN=$(create_lambda_execution_role "$LAMBDA_EXECUTION_ROLE_NAME")
 log_info "Waiting 15s for IAM role propagation..."
 sleep 15
 
-# 6d: Create Lambda function (fixed 3008MB memory / 10240MB ephemeral)
-log_info "Creating Lambda: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
+# 6d: Create Lambda function — try requested memory, fallback to 3008MB if quota exceeded
+log_info "Creating Lambda: attempting memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB, timeout=${LAMBDA_TIMEOUT_SEC}s"
+_create_rc=0
 LAMBDA_FUNCTION_ARN=$(create_lambda_function_from_image \
     "$LAMBDA_FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$IMAGE_URI" \
-    "$LAMBDA_MEMORY_MB" "$LAMBDA_EPHEMERAL_MB" "$LAMBDA_TIMEOUT_SEC") \
-    || die "Failed to create Lambda (memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB). Check account limits."
+    "$LAMBDA_MEMORY_MB" "$LAMBDA_EPHEMERAL_MB" "$LAMBDA_TIMEOUT_SEC") || _create_rc=$?
+
+if [[ $_create_rc -eq 2 ]]; then
+    log_info "10,240 MB memory quota exceeded, falling back to 3008 MB"
+    LAMBDA_MEMORY_MB=3008
+    LAMBDA_FUNCTION_ARN=$(create_lambda_function_from_image \
+        "$LAMBDA_FUNCTION_NAME" "$LAMBDA_ROLE_ARN" "$IMAGE_URI" \
+        "$LAMBDA_MEMORY_MB" "$LAMBDA_EPHEMERAL_MB" "$LAMBDA_TIMEOUT_SEC") \
+        || die "Failed to create Lambda (memory=${LAMBDA_MEMORY_MB}MB). Check account limits."
+elif [[ $_create_rc -ne 0 ]]; then
+    die "Failed to create Lambda (memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB). Check account limits."
+fi
 log_info "Lambda created successfully: memory=${LAMBDA_MEMORY_MB}MB, ephemeral=${LAMBDA_EPHEMERAL_MB}MB"
+log_info "LAMBDA_EFFECTIVE_MEMORY_MB=${LAMBDA_MEMORY_MB}"
 
 # Wait for Lambda function to be active
 log_info "Waiting for Lambda function to be active..."
@@ -2290,11 +2315,13 @@ if [[ "${RUN_QC:-0}" == "1" ]]; then
         QC_ARGS+=("--write-h5ad")
     fi
     
-    python scripts/qc_scanpy.py "${QC_ARGS[@]}"
+    if python scripts/qc_scanpy.py "${QC_ARGS[@]}"; then
+        log_info "QC analysis complete"
+    else
+        log_warn "QC analysis failed (non-fatal). Pipeline continues."
+    fi
     
     deactivate
-    
-    log_info "QC analysis complete"
 else
     log_info "Step 10: Skipping QC (RUN_QC=0). No python required."
 fi
