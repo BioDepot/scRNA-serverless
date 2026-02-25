@@ -8,11 +8,11 @@ The script reproduces the paper's pipeline exactly when run on a fully provision
 
 ### Lambda memory fallback
 
-The paper uses **10,240 MB** Lambda functions (~6 vCPUs, piscem `-t 6`). This repo tries 10,240 MB first, and falls back to **3,008 MB** (~2 vCPUs, `-t 2`) if the account quota is exceeded.
+The script uses **10,240 MB** Lambda functions (~6 vCPUs, piscem `-t 6`), matching the paper. If the account's Lambda memory quota is lower, it automatically falls back to **3,008 MB** (~2 vCPUs, `-t 2`).
 
 ### PBMC 1K automatic splitting
 
-The paper processes PBMC 1K (~5 GB) in a single Lambda. At 3,008 MB, splitting is forced to avoid OOM — PBMC 1K becomes **17 chunks** (4M reads each), processed by 17 parallel Lambdas. For PBMC 10K, splitting occurs at both memory tiers.
+The script processes PBMC 1K (~5 GB) in a single Lambda, matching the paper. If the account falls back to 3,008 MB memory, splitting is forced to avoid OOM — PBMC 1K becomes **17 chunks** (4M reads each), processed by 17 parallel Lambdas. For PBMC 10K, splitting occurs at both memory tiers.
 
 ### Piscem thread auto-configuration
 
@@ -20,7 +20,7 @@ The paper processes PBMC 1K (~5 GB) in a single Lambda. At 3,008 MB, splitting i
 
 ### EC2 instance type fallback
 
-The paper uses a fixed **m6id.16xlarge** (64 vCPUs, 256 GB RAM). This repo tries m6id.16xlarge first, then falls back through smaller instances if the account's vCPU quota is too low:
+The script uses **m6id.16xlarge** (64 vCPUs, 256 GB RAM), matching the paper. If the account's vCPU quota is too low, it automatically falls back through smaller instances:
 
 | Instance | vCPUs | RAM | Notes |
 |---|---|---|---|
@@ -35,26 +35,26 @@ The paper uses a fixed **m6id.16xlarge** (64 vCPUs, 256 GB RAM). This repo tries
 
 ### EBS root volume: 500 GB (unchanged)
 
-This repo defaults to **500 GB**, matching the paper. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
+The script defaults to **500 GB**, matching the paper. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
 
 ### NVMe storage fallback
 
-The paper assumes NVMe instance storage (m6id family). This repo falls back to the EBS root volume if no NVMe device is found (m6i, t3 families).
+The script uses NVMe instance storage (m6id family), matching the paper. If the EC2 instance has no NVMe device (m6i, t3 families), it automatically falls back to the EBS root volume.
 
 ### Configuration summary
 
-| Setting | Paper | Script default (auto-adjusted if needed) |
-|---|---|---|
-| Lambda memory | 10,240 MB | 10,240 MB (falls back to 3,008 MB) |
-| Lambda ephemeral storage | 10,240 MB | 10,240 MB (unchanged) |
-| Piscem threads | 6 | 6 or 2 (auto) |
-| PBMC 1K splitting | Not split (1 Lambda) | 17 parts at 3,008 MB |
-| Split threshold | 7 GB | 7 GB or 0 (auto) |
-| Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads (unchanged) |
-| EC2 driver instance | m6id.16xlarge | m6id.16xlarge (fallback chain) |
-| EBS root volume | 500 GB | 500 GB (unchanged) |
-| NVMe storage | Required | Optional (EBS fallback) |
-| Lambda timeout | 900 s | 900 s (unchanged) |
+| Setting | Paper | Script default | If account quota is too low |
+|---|---|---|---|
+| Lambda memory | 10,240 MB | 10,240 MB | Falls back to 3,008 MB |
+| Lambda ephemeral storage | 10,240 MB | 10,240 MB | *(unchanged)* |
+| Piscem threads | 6 | 6 | 2 (at 3,008 MB) |
+| PBMC 1K splitting | Not split (1 Lambda) | Not split (1 Lambda) | 17 parts (at 3,008 MB) |
+| Split threshold | 7 GB | 7 GB | 0 GB (at 3,008 MB — forces splitting) |
+| Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads | *(unchanged)* |
+| EC2 driver instance | m6id.16xlarge | m6id.16xlarge | Falls through smaller instances |
+| EBS root volume | 500 GB | 500 GB | *(unchanged)* |
+| NVMe storage | Available (m6id) | Used if available | EBS root volume (m6i/t3 families) |
+| Lambda timeout | 900 s | 900 s | *(unchanged)* |
 
 ### Local disk space requirements
 
