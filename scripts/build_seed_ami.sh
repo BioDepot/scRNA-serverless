@@ -2,20 +2,32 @@
 ################################################################################
 # build_seed_ami.sh
 #
-# MAINTAINER-ONLY TOOL
-# 
-# Purpose: Create a "seed AMI" containing pre-installed reference data to
-#          eliminate dependency on external S3 buckets (nnasam-*).
+# MAINTAINER-ONLY TOOL — DO NOT RUN
 #
-# WARNING: This script is for maintainers only. Reviewers and users should
-#          NOT build AMIs. Instead:
-#          - Launch the published AMI
-#          - Run scripts/e2e_serverless_pbmc1k.sh for serverless testing
-#          - Run scripts/e2e_onserver_pbmc1k.sh for on-server testing
+# This script documents how the public seed AMI (ami-0b80485dc95b72c33) was
+# created. It is kept in the repository for reproducibility and transparency
+# so reviewers can see exactly how the AMI was built. The AMI is already
+# public in us-east-2 and hardcoded in e2e_serverless_pbmc.sh — there is no
+# need to rebuild it.
 #
-# The seed AMI contains:
-#   /opt/scrna-seed/index_output_transcriptome/
-#   /opt/scrna-seed/reference/
+# What the seed AMI contains:
+#   /opt/scrna-seed/index_output_transcriptome/   (187 MB, 6 piscem index files)
+#   /opt/scrna-seed/reference/t2g.tsv             (6.1 MB, 199,138 lines)
+#   /opt/scrna-seed/reference/refdata-gex-GRCh38-2020-A.tar.gz  (11 GB)
+#
+# How reviewers use it:
+#   The AMI ID is hardcoded in scripts/e2e_serverless_pbmc.sh as
+#   DEFAULT_SEED_AMI_ID. Reviewers just clone the repo and run the pipeline;
+#   the script launches an EC2 instance from this public AMI automatically.
+#
+# How the AMI was built (steps performed by this script):
+#   1. Launch a fresh Ubuntu 22.04 EC2 instance
+#   2. Upload pre-built piscem index and reference data (from local tar files)
+#   3. Extract to /opt/scrna-seed/ and validate checksums
+#   4. Create an AMI snapshot from the instance
+#   5. Disable "Block Public Access for AMIs" (AWS account-level setting)
+#   6. Make the AMI and its EBS snapshot public so any AWS account can use it
+#   7. Terminate the build instance
 #
 ################################################################################
 
@@ -38,7 +50,7 @@ set -euo pipefail
 # Optional with defaults
 SEED_EBS_GB="${SEED_EBS_GB:-120}"
 UBUNTU_AMI_ID="${UBUNTU_AMI_ID:-}"
-MAKE_PUBLIC="${MAKE_PUBLIC:-0}"
+MAKE_PUBLIC="${MAKE_PUBLIC:-1}"
 AMI_NAME_PREFIX="${AMI_NAME_PREFIX:-scrna-seed}"
 SSH_MAX_ATTEMPTS="${SSH_MAX_ATTEMPTS:-90}"
 SSH_SLEEP_SECONDS="${SSH_SLEEP_SECONDS:-10}"
@@ -726,6 +738,16 @@ if [[ ${MAKE_PUBLIC} -eq 1 && ${AMI_AVAILABLE} -eq 1 ]]; then
     echo "========================================================================"
     echo "Step 7: Making AMI public..."
     echo "========================================================================"
+
+    # AWS accounts have "Block Public Access for AMIs" enabled by default.
+    # This must be disabled before an AMI can be shared publicly.
+    echo "Disabling 'Block Public Access for AMIs' (account-level setting)..."
+    BPA_STATE=$(aws ec2 disable-image-block-public-access \
+        --region "${AWS_REGION}" \
+        --query 'ImageBlockPublicAccessState' \
+        --output text)
+    echo "  Block Public Access state: ${BPA_STATE}"
+    sleep 5
     
     # Check for encrypted root snapshot before attempting to make public
     echo "Checking if AMI root snapshot is encrypted..."
@@ -822,11 +844,12 @@ echo "The AMI contains:"
 echo "  /opt/scrna-seed/index_output_transcriptome/"
 echo "  /opt/scrna-seed/reference/"
 echo ""
-echo "Next steps for reviewers:"
-echo "  1. Launch an instance from AMI: ${AMI_ID}"
-echo "  2. Clone the scRNA-serverless repository"
-echo "  3. Run: scripts/e2e_serverless_pbmc1k.sh (for serverless pipeline)"
-echo "     OR:  scripts/e2e_onserver_pbmc1k.sh (for on-server pipeline)"
+echo "Next steps:"
+echo "  1. Update DEFAULT_SEED_AMI_ID in scripts/e2e_serverless_pbmc.sh"
+echo "     with the AMI ID printed above."
+echo "  2. Reviewers can then clone the repo and run:"
+echo "       bash scripts/e2e_serverless_pbmc.sh pbmc1k"
+echo "     The script will automatically launch an EC2 instance from this AMI."
 echo "========================================================================"
 
 exit 0

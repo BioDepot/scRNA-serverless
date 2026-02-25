@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-qc_scanpy.py
+qc_serverless.py
 
 Quality control analysis for alevin-fry quantification outputs using scanpy.
+Used by the serverless pipeline (e2e_serverless_pbmc.sh).
 
 USAGE:
-    python3 scripts/qc_scanpy.py <quants_dir> [--outdir <output_dir>] [--write-h5ad]
+    python3 scripts/qc_serverless.py <quants_dir> [--outdir <output_dir>] [--write-h5ad]
 
 ARGUMENTS:
     quants_dir      Path to alevin-fry quantification output directory
@@ -60,15 +61,27 @@ def open_maybe_gzip(path: Path, mode: str = 'rt') -> Union[IO, gzip.GzipFile]:
         return open(path, mode)
 
 
+def _search_file(base_dir: Path, names: list) -> Optional[Path]:
+    """Search for a file by name in a directory and its immediate subdirectories."""
+    for name in names:
+        path = base_dir / name
+        if path.exists():
+            return path
+    for subdir in sorted(base_dir.iterdir()):
+        if subdir.is_dir():
+            for name in names:
+                path = subdir / name
+                if path.exists():
+                    return path
+    return None
+
+
 def find_matrix_file(quants_dir: Path) -> Path:
     """Find the matrix file in quantification directory."""
     common_names = ['quants_mat.mtx', 'quants_mat.mtx.gz']
-    
-    for name in common_names:
-        path = quants_dir / name
-        if path.exists():
-            return path
-    
+    result = _search_file(quants_dir, common_names)
+    if result:
+        return result
     raise FileNotFoundError(
         f"Could not find matrix file in {quants_dir}. "
         f"Looked for: {', '.join(common_names)}"
@@ -78,12 +91,9 @@ def find_matrix_file(quants_dir: Path) -> Path:
 def find_feature_file(quants_dir: Path) -> Path:
     """Find the gene/feature file in quantification directory."""
     common_names = ['quants_mat_rows.txt', 'genes.tsv', 'genes.tsv.gz']
-    
-    for name in common_names:
-        path = quants_dir / name
-        if path.exists():
-            return path
-    
+    result = _search_file(quants_dir, common_names)
+    if result:
+        return result
     raise FileNotFoundError(
         f"Could not find feature/gene file in {quants_dir}. "
         f"Looked for: {', '.join(common_names)}"
@@ -93,12 +103,9 @@ def find_feature_file(quants_dir: Path) -> Path:
 def find_barcode_file(quants_dir: Path) -> Path:
     """Find the barcode/cell file in quantification directory."""
     common_names = ['quants_mat_cols.txt', 'barcodes.tsv', 'barcodes.tsv.gz']
-    
-    for name in common_names:
-        path = quants_dir / name
-        if path.exists():
-            return path
-    
+    result = _search_file(quants_dir, common_names)
+    if result:
+        return result
     raise FileNotFoundError(
         f"Could not find barcode/cell file in {quants_dir}. "
         f"Looked for: {', '.join(common_names)}"
@@ -191,7 +198,9 @@ def compute_qc_metrics(adata: sc.AnnData) -> sc.AnnData:
     logger.info(f"Found {mt_genes.sum()} mitochondrial genes")
     
     # Compute metrics
-    sc.pp.calculate_qc_metrics(adata, qc_vars=['MT'] if 'MT' in adata.var_names else None, inplace=True)
+    adata.var['MT'] = mt_genes
+    qc_var_list = ['MT'] if mt_genes.sum() > 0 else []
+    sc.pp.calculate_qc_metrics(adata, qc_vars=qc_var_list, inplace=True)
     
     # Manual MT gene percentage calculation
     if mt_genes.sum() > 0:
@@ -234,20 +243,32 @@ def preprocess_and_analyze(adata: sc.AnnData) -> sc.AnnData:
     # Find highly variable genes
     logger.info("Finding highly variable genes...")
     sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
-    hvg_count = adata.var['highly_variable'].sum()
+    hvg_count = int(adata.var['highly_variable'].sum())
     logger.info(f"Found {hvg_count} HVGs")
     
+    if hvg_count < 2:
+        logger.warning("Too few HVGs — skipping PCA/UMAP")
+        adata.obs['leiden'] = 'unclustered'
+        return adata
+    
     # Subset to HVGs
-    adata = adata[:, adata.var['highly_variable']]
+    adata = adata[:, adata.var['highly_variable']].copy()
     
     # PCA
-    logger.info("Computing PCA...")
     sc.pp.scale(adata, max_value=10)
-    sc.tl.pca(adata, n_comps=50)
+    n_comps = min(50, adata.n_obs - 1, adata.n_vars - 1)
+    if n_comps < 2:
+        logger.warning("Not enough dimensions for PCA")
+        adata.obs['leiden'] = 'unclustered'
+        return adata
+    logger.info(f"Computing PCA (n_comps={n_comps})...")
+    sc.tl.pca(adata, n_comps=n_comps)
     
     # Neighbors
-    logger.info("Computing neighbors...")
-    sc.pp.neighbors(adata, use_rep='X_pca', n_neighbors=15, n_pcs=30)
+    n_pcs = min(30, n_comps)
+    n_neighbors = min(15, adata.n_obs - 1)
+    logger.info(f"Computing neighbors (n_neighbors={n_neighbors}, n_pcs={n_pcs})...")
+    sc.pp.neighbors(adata, use_rep='X_pca', n_neighbors=n_neighbors, n_pcs=n_pcs)
     
     # UMAP
     logger.info("Computing UMAP...")
@@ -344,13 +365,13 @@ def main():
         return
 
     parser = argparse.ArgumentParser(
-        description='QC analysis for alevin-fry quantification using scanpy',
+        description='QC analysis for alevin-fry quantification using scanpy (serverless pipeline)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python3 qc_scanpy.py /path/to/alevin_output
-    python3 qc_scanpy.py /path/to/alevin_output --outdir ./qc_results
-    python3 qc_scanpy.py /path/to/alevin_output --outdir ./qc_results --write-h5ad
+    python3 qc_serverless.py /path/to/alevin_output
+    python3 qc_serverless.py /path/to/alevin_output --outdir ./qc_results
+    python3 qc_serverless.py /path/to/alevin_output --outdir ./qc_results --write-h5ad
         """
     )
     

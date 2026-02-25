@@ -1,0 +1,307 @@
+# Serverless Pipeline Guide
+
+The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parallel using AWS Lambda, then runs alevin-fry on the EC2 instance to produce the final count matrix.
+
+> **Region:** Everything runs in **us-east-2 (Ohio)**. The script enforces this automatically.
+
+---
+
+## Requirements
+
+**Local software:**
+- [Git for Windows](https://gitforwindows.org/) (includes Git Bash) — Mac/Linux: built in
+- [AWS CLI v2](https://aws.amazon.com/cli/) — verify with `aws --version`
+
+**AWS account:**
+- Valid access key configured via `aws configure`
+- An IAM role with `AdministratorAccess` (created in Step C below)
+- An EC2 keypair in us-east-2 (created in Step D below)
+
+**Minimum EC2 instance (auto-selected by the script):**
+
+| Dataset | Min instance | RAM |
+|---|---|---|
+| PBMC 1K | t3.large | 8 GB |
+| PBMC 10K | t3.xlarge | 16 GB |
+
+Free-tier instances (t3.micro/small/medium) are too small. The script selects the best instance your account supports automatically. You do not manually launch any EC2 instance. See [Paper Differences](PAPER_DIFFERENCES.md) for the full instance fallback chain.
+
+**Storage:** The script creates a 200 GB EBS root volume. A 200 GB volume for a 15-minute run costs ~$0.01-$0.02. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
+
+---
+
+## Setup (one-time)
+
+### A) Install software
+
+1. Install **Git for Windows** (includes Git Bash). Mac/Linux: skip this.
+2. Install **AWS CLI v2**. Verify:
+
+```bash
+aws --version
+```
+
+### B) Configure AWS credentials
+
+1. In the AWS Console: **IAM → Users → your user → Security credentials → Create access key**
+2. Run in Git Bash:
+
+```bash
+aws configure
+```
+
+3. Enter your Access Key ID, Secret Access Key, region `us-east-2`, output `json`.
+4. Verify:
+
+```bash
+aws sts get-caller-identity
+```
+
+**If this fails, stop.** Fix credentials before continuing.
+
+### C) Create IAM role
+
+1. AWS Console → **IAM → Roles → Create role**
+2. Trusted entity: **AWS service → EC2** → Next
+3. Search `AdministratorAccess`, check it → Next
+4. Role name: `scrna-serverless-ec2-role` → Create role
+
+This role name is your `EC2_INSTANCE_PROFILE_NAME`.
+
+### D) Create EC2 keypair + fix PEM permissions
+
+**Create the keypair:**
+
+1. AWS Console → **EC2 → Key Pairs** (make sure region is **us-east-2**)
+2. Create key pair: name `scrna-reviewer-key`, type **RSA**, format **.pem**
+3. Save the downloaded `.pem` file to a permanent location (e.g. `D:\Keys\scrna-reviewer-key.pem`)
+
+**Fix PEM permissions:**
+
+Windows (run in **PowerShell**, not Git Bash):
+
+```powershell
+$Pem = "D:\Keys\scrna-reviewer-key.pem"
+icacls "$Pem" /inheritance:r
+icacls "$Pem" /grant:r "$($env:USERNAME):R"
+icacls "$Pem" /grant:r "Administrators:R"
+icacls "$Pem" /grant:r "SYSTEM:R"
+icacls "$Pem" /remove "Users" "Everyone"
+```
+
+Mac/Linux:
+
+```bash
+chmod 600 ~/.ssh/scrna-reviewer-key.pem
+```
+
+### E) Clone the repository
+
+```bash
+git clone https://github.com/BioDepot/scRNA-serverless.git
+cd scRNA-serverless
+```
+
+---
+
+## Running the pipeline
+
+### F) Open Git Bash and set environment variables
+
+All commands below must be run in **Git Bash** (not PowerShell, CMD, or WSL). Verify with `uname -a` — you should see `MINGW` or `MSYS`.
+
+Set these every time before a run:
+
+```bash
+export AWS_REGION="us-east-2"
+export SEED_AMI_ID="ami-0b80485dc95b72c33"
+export EC2_INSTANCE_PROFILE_NAME="scrna-serverless-ec2-role"
+export KEY_NAME="scrna-reviewer-key"
+export KEY_PEM_PATH="/d/Keys/scrna-reviewer-key.pem"
+chmod 600 "$KEY_PEM_PATH" 2>/dev/null || true
+```
+
+- `AWS_REGION` and `SEED_AMI_ID` — do not change these.
+- `EC2_INSTANCE_PROFILE_NAME` — the role name from Step C.
+- `KEY_NAME` — the keypair name from Step D (without `.pem`).
+- `KEY_PEM_PATH` — full path to your `.pem` file. Use forward slashes on Windows (e.g. `/d/Keys/...`).
+
+### G) Dry run (recommended first)
+
+```bash
+bash scripts/e2e_serverless_pbmc.sh pbmc1k --dry-run
+```
+
+Checks credentials, AMI, subnet, security group, instance profile, and keypair. Costs nothing.
+
+### H) Run the pipeline
+
+**Minimal first run** (no QC, keep resources for inspection):
+
+```bash
+export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0
+export RUN_QC=0 WRITE_H5AD=0
+bash scripts/e2e_serverless_pbmc.sh pbmc1k
+```
+
+**Full run** (QC + h5ad + auto-cleanup):
+
+```bash
+export CLEANUP_AWS=1 TERMINATE_DRIVER_ON_EXIT=1
+export DOWNLOAD_RESULTS=1 RUN_QC=1 WRITE_H5AD=1
+bash scripts/e2e_serverless_pbmc.sh pbmc1k
+```
+
+**PBMC 10K:**
+
+```bash
+bash scripts/e2e_serverless_pbmc.sh pbmc10k
+```
+
+The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
+
+---
+
+## What the pipeline does
+
+1. Launches an EC2 instance from the public seed AMI
+2. Uploads the repository code to the instance
+3. Builds a Docker image with piscem + reference index, pushes to ECR
+4. Creates S3 buckets, Lambda function, and EventBridge rule
+5. Downloads FASTQs, splits them, uploads splits to S3
+6. Lambda functions map each split in parallel (piscem)
+7. Downloads Lambda outputs, merges .rad files
+8. Runs alevin-fry (generate-permit-list, collate, quant)
+9. Runs QC (optional), downloads results locally, cleans up
+
+---
+
+## Optional flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `RUN_QC` | `1` | QC analysis (UMAP + violin). `0` to skip. |
+| `WRITE_H5AD` | `0` | Save `.h5ad` file. Needs `RUN_QC=1`. |
+| `CLEANUP_AWS` | `1` | Delete all AWS resources after run. `0` to keep. |
+| `TERMINATE_DRIVER_ON_EXIT` | `1` | Terminate EC2 after run. `0` to keep. |
+| `DOWNLOAD_RESULTS` | `1` | Download results locally. `0` to skip. |
+
+---
+
+## Output structure
+
+Results appear in `serverless_runs/`:
+
+```
+serverless_runs/
+  <RUN_ID>.log                          <-- Pipeline log
+  <RUN_ID>/
+  ├── timing_summary.txt                <-- Step timings
+  ├── run.env                           <-- Run metadata
+  ├── combined/
+  │   ├── map.rad                       <-- Merged mapping output
+  │   └── unmapped_bc_count.bin
+  ├── alevin_output/alevin/
+  │   ├── quants_mat.mtx                <-- *** COUNT MATRIX ***
+  │   ├── quants_mat_rows.txt           <-- Gene names
+  │   └── quants_mat_cols.txt           <-- Cell barcodes
+  └── qc_output/                        <-- If RUN_QC=1
+      ├── umap_leiden.png
+      ├── qc_violin.png
+      └── pbmc_adata.h5ad               <-- If WRITE_H5AD=1
+```
+
+---
+
+## Auto-handled constraints
+
+| Constraint | Behavior |
+|---|---|
+| Lambda memory quota too low | Falls back to 3,008 MB automatically |
+| EC2 vCPU quota too low | Falls through instance chain automatically |
+| No NVMe storage | Uses EBS root volume |
+| SSH blocked | Falls back to SSM automatically |
+| Lambda timeout exceeded | Fails fast after 2x timeout |
+
+For details on what changed from the paper (instance types, memory, threads, splitting), see [Paper Differences](PAPER_DIFFERENCES.md).
+
+---
+
+## Manual overrides
+
+Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
+
+| Setting | Line | Default | Effect |
+|---|---|---|---|
+| `DEFAULT_SEED_AMI_ID` | 128 | `ami-0b80485dc95b72c33` | Seed AMI |
+| `DEFAULT_AWS_REGION` | 124 | `us-east-2` | Region |
+| `INSTANCE_TYPE` | 143 | `m6id.16xlarge` | EC2 type |
+| `ROOT_VOL_GB` | 144 | `200` | EBS size (GB) |
+| `LAMBDA_MEMORY_MB` | 157 | `10240` | Lambda RAM |
+| `LAMBDA_TIMEOUT_SEC` | 159 | `900` | Lambda timeout |
+| `RUN_QC` | 165 | `1` | QC on/off |
+| `WRITE_H5AD` | 172 | `0` | h5ad on/off |
+| `LOCAL_RESULTS_DIR` | 167 | `./serverless_runs` | Output dir |
+
+---
+
+## Cleanup
+
+**Auto-cleanup** (`CLEANUP_AWS=1`, default) deletes: EC2 instance, S3 buckets, Lambda, EventBridge rule, Lambda IAM role, ECR repo, and temp security group.
+
+**Not cleaned up:** your IAM role (reuse it), the seed AMI (shared resource), and `serverless_runs/` (your results).
+
+**Manual cleanup** (if a run failed midway with `CLEANUP_AWS=0`):
+
+```bash
+# Leftover EC2 instances
+aws ec2 describe-instances --filters "Name=tag:Name,Values=scrna-*" \
+  "Name=instance-state-name,Values=running,stopped" \
+  --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Name'].Value|[0]]" \
+  --output table --region us-east-2
+
+# Terminate: aws ec2 terminate-instances --instance-ids i-xxxxx --region us-east-2
+
+# Leftover S3 buckets
+aws s3 ls --region us-east-2 | grep scrna
+# Remove: aws s3 rb s3://bucket-name --force --region us-east-2
+
+# Leftover Lambda functions
+aws lambda list-functions --query "Functions[?starts_with(FunctionName,'scrna-')].FunctionName" \
+  --output text --region us-east-2
+# Delete: aws lambda delete-function --function-name scrna-xxx --region us-east-2
+
+# Leftover security groups
+aws ec2 describe-security-groups \
+  --query "SecurityGroups[?starts_with(GroupName,'scrna-driver-')].{Name:GroupName,Id:GroupId}" \
+  --output table --region us-east-2
+# Delete: aws ec2 delete-security-group --group-id sg-xxxxx --region us-east-2
+```
+
+---
+
+## Cost estimate
+
+| Resource | PBMC 1K | PBMC 10K |
+|---|---|---|
+| EC2 | ~$0.30 | ~$0.80 |
+| Lambda | ~$0.05 | ~$0.20 |
+| S3 + ECR | <$0.01 | <$0.01 |
+| **Total** | **~$0.35** | **~$1.00** |
+
+With `t3.xlarge`: EC2 drops to ~$0.01-$0.03 for PBMC 1K.
+
+---
+
+## Troubleshooting
+
+| Error | Fix |
+|---|---|
+| `aws sts get-caller-identity` fails | Run `aws configure` with valid keys in the same terminal |
+| `EC2_INSTANCE_PROFILE_NAME must be set` | `export EC2_INSTANCE_PROFILE_NAME=scrna-serverless-ec2-role` |
+| `All instance types exhausted` | Request vCPU quota increase: **Service Quotas → EC2** |
+| `Failed to create Lambda (memory=3008MB)` | Check **Service Quotas → Lambda** |
+| Results not downloaded | Check `DOWNLOAD_RESULTS=1`. Results also on EC2 at `/mnt/nvme/runs/<RUN_ID>/` |
+| `$'\r': command not found` | Fix line endings: `sed -i 's/\r$//' scripts/*.sh install_scripts/*.sh *.sh` |
+| `icacls` fails in Git Bash | Run `icacls` in **PowerShell** only (Step D) |
+| `uname -a` shows Linux/Microsoft | You're in WSL. Open **Git Bash** instead. |

@@ -164,7 +164,7 @@ CLEANUP_AWS="${CLEANUP_AWS:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
 RUN_QC="${RUN_QC:-1}"
 DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-${DOWNLOAD_TO_LOCAL:-1}}"  # DOWNLOAD_TO_LOCAL is accepted alias
-LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./runs}"
+LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./serverless_runs}"
 
 # FASTQ Configuration
 FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
@@ -580,9 +580,9 @@ create_lambda_function_from_image() {
             return 0
         fi
         local err_msg; err_msg=$(cat "$_create_err" 2>/dev/null); rm -f "$_create_err"
-        # InvalidParameterValue means memory exceeds account quota — return 2 so caller can fallback
-        if [[ "$err_msg" == *"InvalidParameterValue"* ]]; then
-            log_info "InvalidParameterValue: $err_msg"
+        # Memory quota exceeded — return 2 so caller can fallback
+        if [[ "$err_msg" == *"InvalidParameterValue"* || "$err_msg" == *"ValidationException"* && "$err_msg" == *"MemorySize"* ]]; then
+            log_info "Memory quota exceeded (detected in error): $err_msg"
             return 2
         fi
         log_info "Lambda creation attempt $attempt/$max_retries failed: ${err_msg:-unknown error}. Retrying in ${delay}s..."
@@ -768,7 +768,7 @@ process_fastq_bash() {
             if aws s3api head-object --bucket "$OUTPUT_MAP_BUCKET" \
                 --key "piscem_output/${folder}/output.txt" \
                 --region "$AWS_REGION" >/dev/null 2>&1; then
-                ((completed++))
+                completed=$((completed + 1))
             fi
         done
 
@@ -1052,22 +1052,22 @@ validate_dry_run() {
     log_info "[CHECK 1/7] AWS CLI..."
     if ! need_cmd aws; then
         log_error "  FAIL: AWS CLI not found"
-        ((fail++))
+        fail=$((fail + 1))
     else
         log_info "  PASS: AWS CLI installed"
-        ((pass++))
+        pass=$((pass + 1))
     fi
     
     # AWS Auth
     log_info "[CHECK 2/7] AWS authentication..."
     if ! aws sts get-caller-identity --region "$AWS_REGION" >/dev/null 2>&1; then
         log_error "  FAIL: AWS authentication failed"
-        ((fail++))
+        fail=$((fail + 1))
     else
         CALLER=$(aws sts get-caller-identity --region "$AWS_REGION" --query Arn --output text)
         AWS_ACCOUNT_ID=$(aws sts get-caller-identity --region "$AWS_REGION" --query Account --output text)
         log_info "  PASS: Authenticated as $CALLER"
-        ((pass++))
+        pass=$((pass + 1))
     fi
     
     # Docker: only required on EC2 (run mode). In driver mode it runs on EC2.
@@ -1076,7 +1076,7 @@ validate_dry_run() {
         # Driver mode: Docker runs on EC2, not locally
         if need_cmd docker && docker ps >/dev/null 2>&1; then
             log_info "  PASS: Docker accessible (optional in driver mode)"
-            ((pass++))
+            pass=$((pass + 1))
         else
             log_info "  SKIP: Docker not required in driver mode (runs on EC2)"
         fi
@@ -1084,13 +1084,13 @@ validate_dry_run() {
         # Run mode: Docker is needed locally
         if ! need_cmd docker; then
             log_error "  FAIL: Docker not installed"
-            ((fail++))
+            fail=$((fail + 1))
         elif ! docker ps >/dev/null 2>&1; then
             log_error "  FAIL: Docker not accessible (run: docker ps)"
-            ((fail++))
+            fail=$((fail + 1))
         else
             log_info "  PASS: Docker working"
-            ((pass++))
+            pass=$((pass + 1))
         fi
     fi
     
@@ -1099,10 +1099,10 @@ validate_dry_run() {
         log_info "[CHECK 4/7] Seed AMI..."
         if ! aws ec2 describe-images --image-ids "$SEED_AMI_ID" --region "$AWS_REGION" >/dev/null 2>&1; then
             log_error "  FAIL: AMI not found: $SEED_AMI_ID"
-            ((fail++))
+            fail=$((fail + 1))
         else
             log_info "  PASS: Seed AMI accessible"
-            ((pass++))
+            pass=$((pass + 1))
         fi
     else
         log_info "[CHECK 4/7] (skipped, run mode)"
@@ -1115,22 +1115,22 @@ validate_dry_run() {
             log_info "  SKIP: KEY_NAME not set but USE_SSM=1 (SSH not required)"
         elif [[ -z "$KEY_NAME" ]]; then
             log_error "  FAIL: KEY_NAME not set"
-            ((fail++))
+            fail=$((fail + 1))
         elif [[ -z "$KEY_PEM_PATH" ]]; then
             log_error "  FAIL: KEY_PEM_PATH not set"
-            ((fail++))
+            fail=$((fail + 1))
         elif ! command -v ssh-keygen >/dev/null 2>&1; then
             log_error "  FAIL: ssh-keygen not found (required for PEM/keypair fingerprint validation)"
-            ((fail++))
+            fail=$((fail + 1))
         else
             local raw_pem="$KEY_PEM_PATH"
             pem_check="$(normalize_path_for_bash "$raw_pem")"
             if [[ ! -f "$pem_check" ]]; then
                 log_error "  FAIL: PEM not found (raw='$raw_pem' resolved='$pem_check')"
-                ((fail++))
+                fail=$((fail + 1))
             elif ! aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" >/dev/null 2>&1; then
                 log_error "  FAIL: AWS keypair not found: $KEY_NAME"
-                ((fail++))
+                fail=$((fail + 1))
             else
                 warn="$(ssh-keygen -lf "$pem_check" 2>&1 || true)"
                 if echo "$warn" | grep -q -E "UNPROTECTED PRIVATE KEY FILE|is not a key file"; then
@@ -1143,13 +1143,13 @@ validate_dry_run() {
                 local_fp="$(compute_local_fp_for_aws "$pem_check" "$aws_fp")"
                 if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
                     log_error "  FAIL: Could not compute fingerprints for mismatch detection"
-                    ((fail++))
+                    fail=$((fail + 1))
                 elif [[ "$aws_fp" != "$local_fp" ]]; then
                     log_error "  FAIL: PEM/keypair mismatch (AWS=$aws_fp local=$local_fp)"
-                    ((fail++))
+                    fail=$((fail + 1))
                 else
                     log_info "  PASS: Keypair + PEM present and match"
-                    ((pass++))
+                    pass=$((pass + 1))
                 fi
             fi
         fi
@@ -1168,10 +1168,10 @@ validate_dry_run() {
     fi
     if ! curl -s -I -m 10 "$fastq_url" 2>/dev/null | head -1 | grep -q "200\|302"; then
         log_error "  FAIL: FASTQ URL not reachable"
-        ((fail++))
+        fail=$((fail + 1))
     else
         log_info "  PASS: FASTQ URL reachable"
-        ((pass++))
+        pass=$((pass + 1))
     fi
     
     # Instance Profile  
@@ -1179,13 +1179,13 @@ validate_dry_run() {
         log_info "[CHECK 7/7] EC2 instance profile..."
         if [[ -z "$EC2_INSTANCE_PROFILE_NAME" ]]; then
             log_error "  FAIL: EC2_INSTANCE_PROFILE_NAME not set"
-            ((fail++))
+            fail=$((fail + 1))
         elif ! aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
             log_error "  FAIL: Instance profile not found: $EC2_INSTANCE_PROFILE_NAME"
-            ((fail++))
+            fail=$((fail + 1))
         else
             log_info "  PASS: Instance profile exists"
-            ((pass++))
+            pass=$((pass + 1))
         fi
     else
         log_info "[CHECK 7/7] (skipped, run mode)"
@@ -1288,6 +1288,12 @@ if [[ $RUN_MODE -eq 0 ]]; then
     log_info "Dataset: $DATASET"
     log_info "Run ID: $RUN_ID"
     log_info "USE_SSM: $USE_SSM"
+
+    # Capture all driver-mode output to a log file in the results directory
+    mkdir -p "$LOCAL_RESULTS_DIR"
+    PIPELINE_LOG="$LOCAL_RESULTS_DIR/${RUN_ID}.log"
+    exec > >(tee -a "$PIPELINE_LOG") 2>&1
+    log_info "Pipeline log: $PIPELINE_LOG"
     
     # Validate and ensure keypair+PEM (only when SSH may be used)
     if [[ "$USE_SSM" != "1" ]]; then
@@ -1513,21 +1519,47 @@ if [[ $RUN_MODE -eq 0 ]]; then
             KEY_NAME_ARGS=(--key-name "$KEY_NAME")
         fi
         
-        DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
-        aws ec2 run-instances \
-        --region "$AWS_REGION" \
-        --image-id "$SEED_AMI_ID" \
-        --instance-type "$INSTANCE_TYPE" \
-        "${KEY_NAME_ARGS[@]}" \
-        --subnet-id "$SUBNET_ID" \
-        --security-group-ids "$SG_ID" \
-        "${IAM_PROFILE_ARGS[@]}" \
-        --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
-        --query "Instances[0].InstanceId" \
-        --output text)
+        # Instance type fallback: try requested type first, then progressively smaller
+        # alternatives if launch fails due to vCPU quota or capacity issues.
+        # Chain: m6id (NVMe, best perf) → m6i (EBS-only) → t3 (burstable, free-tier accounts)
+        INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
+        if [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
+            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large")
+        fi
+        
+        DRIVER_INSTANCE_ID=""
+        for _try_type in "${INSTANCE_FALLBACKS[@]}"; do
+            log_info "Attempting instance type: $_try_type"
+            _launch_err=$(mktemp)
+            if DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
+                aws ec2 run-instances \
+                --region "$AWS_REGION" \
+                --image-id "$SEED_AMI_ID" \
+                --instance-type "$_try_type" \
+                "${KEY_NAME_ARGS[@]}" \
+                --subnet-id "$SUBNET_ID" \
+                --security-group-ids "$SG_ID" \
+                "${IAM_PROFILE_ARGS[@]}" \
+                --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
+                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
+                --query "Instances[0].InstanceId" \
+                --output text 2>"$_launch_err"); then
+                rm -f "$_launch_err"
+                INSTANCE_TYPE="$_try_type"
+                break
+            fi
+            local _err_msg; _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
+            if [[ "$_err_msg" == *"VcpuLimitExceeded"* || "$_err_msg" == *"InsufficientInstanceCapacity"* || "$_err_msg" == *"InstanceLimitExceeded"* || "$_err_msg" == *"Unsupported"* ]]; then
+                log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
+                DRIVER_INSTANCE_ID=""
+                continue
+            fi
+            die "Failed to launch EC2 instance ($_try_type): $_err_msg"
+        done
+        
+        [[ -n "$DRIVER_INSTANCE_ID" ]] || die "All instance types exhausted (tried: ${INSTANCE_FALLBACKS[*]}). Request a vCPU quota increase in AWS Service Quotas."
     
-        log_info "Instance launched: $DRIVER_INSTANCE_ID"
+        log_info "Instance launched: $DRIVER_INSTANCE_ID (type: $INSTANCE_TYPE)"
         
         log_info "Waiting for instance to reach running state..."
         aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID"
@@ -1733,8 +1765,8 @@ if [[ $RUN_MODE -eq 0 ]]; then
         # Ensure AWS CLI v2 is available on the instance (the AMI may not have it)
         log_info "Ensuring AWS CLI v2 is installed on instance via SSM..."
         ssm_run_command "$DRIVER_INSTANCE_ID" \
-            "if ! command -v aws >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq unzip curl >/dev/null 2>&1; curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip && cd /tmp && unzip -qo awscliv2.zip && ./aws/install --update >/dev/null 2>&1 && rm -rf /tmp/awscliv2.zip /tmp/aws && echo AWS_CLI_INSTALLED; else aws --version; fi" \
-            300
+            "if command -v aws >/dev/null 2>&1; then aws --version; exit 0; fi; for i in \$(seq 1 30); do fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; echo waiting for dpkg lock \$i/30; sleep 10; done; apt-get update -qq && apt-get install -y -qq unzip curl && curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip && cd /tmp && unzip -qo awscliv2.zip && ./aws/install --update && rm -rf /tmp/awscliv2.zip /tmp/aws && echo AWS_CLI_INSTALLED" \
+            600
 
         log_info "Downloading and extracting repo on instance via SSM..."
         ssm_run_command "$DRIVER_INSTANCE_ID" \
@@ -1783,13 +1815,13 @@ SSHEOF
         
         if [[ "$CONNECT_METHOD" == "ssh" ]]; then
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
-                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID}"
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' -C /mnt/nvme/runs ${RUN_ID}"
             scp "${SSH_OPTS[@]}" \
                 "${SSH_USER}@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
         else
             # SSM: create tarball on instance, upload to S3, download locally
             ssm_run_command "$DRIVER_INSTANCE_ID" \
-                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
                 600
             aws s3 cp "s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz" \
                 "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" \
@@ -2286,42 +2318,49 @@ log_info "Quant outputs uploaded"
 
 if [[ "${RUN_QC:-0}" == "1" ]]; then
     log_info "Step 10: Running QC analysis (requires python3)..."
-    
-    # Ensure python3 is available for QC
-    if ! need_cmd python3; then
-        log_info "Installing python3 for QC..."
+
+    _qc_ok=true
+
+    # Ensure python3 + venv are available
+    if ! need_cmd python3 || ! python3 -c "import ensurepip" 2>/dev/null; then
+        log_info "Installing python3/venv for QC..."
         for _w in $(seq 1 30); do
             if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then break; fi
             log_info "Waiting for dpkg lock ($_w/30)..."; sleep 10
         done
-        sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip
+        if ! { sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-venv python3-pip; }; then
+            log_warn "Failed to install python3-venv (non-fatal). Skipping QC."
+            _qc_ok=false
+        fi
     fi
-    
-    QC_DIR="$RUN_DIR/analysis"
-    mkdir -p "$QC_DIR/out"
-    
-    # Create isolated venv for QC
-    python3 -m venv "$RUN_DIR/venv_qc"
-    source "$RUN_DIR/venv_qc/bin/activate"
-    
-    # Upgrade pip, setuptools, wheel explicitly
-    python -m pip install -q --upgrade pip setuptools wheel
-    
-    # Install all QC dependencies explicitly
-    pip install -q numpy pandas scipy matplotlib seaborn anndata scanpy python-igraph leidenalg
-    
-    QC_ARGS=("$ALEVIN_OUTPUT" "--outdir" "$QC_DIR/out")
-    if [[ $WRITE_H5AD -eq 1 ]]; then
-        QC_ARGS+=("--write-h5ad")
+
+    if $_qc_ok; then
+        QC_DIR="$RUN_DIR/analysis"
+        mkdir -p "$QC_DIR/out"
+
+        _qc_rc=0
+        (
+            set -e
+            python3 -m venv "$RUN_DIR/venv_qc"
+            source "$RUN_DIR/venv_qc/bin/activate"
+
+            python -m pip install -q --upgrade pip setuptools wheel
+            pip install -q numpy pandas scipy matplotlib seaborn anndata scanpy python-igraph leidenalg
+
+            QC_ARGS=("$ALEVIN_OUTPUT" "--outdir" "$QC_DIR/out")
+            if [[ $WRITE_H5AD -eq 1 ]]; then
+                QC_ARGS+=("--write-h5ad")
+            fi
+
+            python scripts/qc_serverless.py "${QC_ARGS[@]}"
+        ) || _qc_rc=$?
+
+        if [[ $_qc_rc -eq 0 ]]; then
+            log_info "QC analysis complete"
+        else
+            log_warn "QC step failed with exit code $_qc_rc (non-fatal). Pipeline continues."
+        fi
     fi
-    
-    if python scripts/qc_scanpy.py "${QC_ARGS[@]}"; then
-        log_info "QC analysis complete"
-    else
-        log_warn "QC analysis failed (non-fatal). Pipeline continues."
-    fi
-    
-    deactivate
 else
     log_info "Step 10: Skipping QC (RUN_QC=0). No python required."
 fi
