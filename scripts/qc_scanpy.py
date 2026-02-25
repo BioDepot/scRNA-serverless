@@ -338,6 +338,11 @@ def generate_plots(adata: sc.AnnData, outdir: Path) -> None:
 
 
 def main():
+    run_qc_env = os.getenv("RUN_QC", "1")
+    if run_qc_env == "0":
+        logger.info("RUN_QC=0 detected. Skipping QC analysis.")
+        return
+
     parser = argparse.ArgumentParser(
         description='QC analysis for alevin-fry quantification using scanpy',
         formatter_class=argparse.RawDescriptionHelpFormatter,

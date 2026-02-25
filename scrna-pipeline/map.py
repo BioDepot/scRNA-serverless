@@ -80,8 +80,21 @@ def run_piscem(files_r1, files_r2, input_folder):
     output_dir = "/tmp/output"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Use available CPUs (Lambda vCPUs scale with memory; 3008MB = 2 vCPUs)
-    num_threads = os.cpu_count() or 2
+    # Thread scaling policy:
+    # - 3008MB Lambda: use 2 threads
+    # - 10240MB Lambda: use up to 6 threads
+    # Also cap by visible CPUs in the runtime.
+    cpu_count = os.cpu_count() or 2
+    try:
+        lambda_memory_mb = int(os.getenv("LAMBDA_MEMORY_MB", "0"))
+    except ValueError:
+        lambda_memory_mb = 0
+    thread_cap = 2 if 0 < lambda_memory_mb <= 3008 else 6
+    num_threads = max(2, min(cpu_count, thread_cap))
+    print(
+        f"Thread selection: cpu_count={cpu_count}, "
+        f"LAMBDA_MEMORY_MB={lambda_memory_mb}, threads={num_threads}"
+    )
 
     command = [
         "/var/task/piscem", "map-sc",

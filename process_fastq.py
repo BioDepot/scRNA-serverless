@@ -12,6 +12,21 @@ import subprocess
 # Constants
 NUM_THREADS = 20
 S3_CONFIG = TransferConfig(multipart_threshold=5 * 1024**2, max_concurrency=32)
+DEFAULT_SPLIT_THRESHOLD_GB = 7
+
+
+def get_split_threshold_gb():
+    """
+    Use 0 GB threshold (force split) when Lambda memory is capped at 3008 MB.
+    Otherwise keep default 7 GB threshold.
+    """
+    try:
+        lambda_memory_mb = int(os.getenv("LAMBDA_MEMORY_MB", "0"))
+    except ValueError:
+        lambda_memory_mb = 0
+    if 0 < lambda_memory_mb <= 3008:
+        return 0
+    return DEFAULT_SPLIT_THRESHOLD_GB
 
 
 # Download File from S3
@@ -83,6 +98,8 @@ def split_and_upload(bucket_name, r1_file, r2_file, basename_with_lane, input_tx
 def upload_input_files(file_pairs, input_folders):
     # Print each pair found and write to input file
     s3_client = boto3.client('s3', region_name=region)
+    split_threshold_gb = get_split_threshold_gb()
+    print(f"SPLIT_THRESHOLD_GB={split_threshold_gb} (LAMBDA_MEMORY_MB={os.getenv('LAMBDA_MEMORY_MB', '')})")
 
     future_to_file = {}
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
@@ -111,9 +128,9 @@ def upload_input_files(file_pairs, input_folders):
                 combined_size = r1_file_size + r2_file_size
                 print(f"combined size of file pairs in GB: {combined_size:.2f}")
 
-                if combined_size < 7:
+                if combined_size < split_threshold_gb:
                     # Create input.txt file in memory
-                    print("File pairs size < 7GB → Uploading directly")
+                    print(f"File pairs size < {split_threshold_gb}GB → Uploading directly")
                     time.sleep(3)
                     create_and_upload_input_file(lane_identifier, bucket_path_r1, bucket_path_r2, base_folder, input_folders)
                 else:
