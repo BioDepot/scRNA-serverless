@@ -910,7 +910,7 @@ ssm_run_pipeline() {
             ("export RUN_QC=" + $run_qc),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
-        ]}')
+        ], executionTimeout:["7200"]}')
 
     local cmd_id
     cmd_id=$(aws ssm send-command \
