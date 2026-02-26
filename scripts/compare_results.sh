@@ -40,13 +40,19 @@ fi
 # ── argument handling ─────────────────────────────────────────────────────
 usage() {
     cat <<'EOF'
-Usage: compare_results.sh <reference_zip_or_dir> [local_results_dir]
+Usage: compare_results.sh <dataset> <reference_zip_or_dir> [local_results_dir]
 
-  reference_zip_or_dir  Path to the GitHub Actions results zip file, OR
+  dataset               Dataset size: 1k or 10k
+  reference_zip_or_dir  Path to the on-server results zip file, OR
                         an already-extracted directory.
   local_results_dir     (Optional) Path to the local / serverless results
                         directory.  If omitted, the script scans
-                        serverless_runs/ for the most recent run.
+                        serverless_runs/ for the most recent matching run.
+
+Examples:
+  compare_results.sh 1k  /path/to/onserver-pbmc1k-results.zip
+  compare_results.sh 10k /path/to/onserver-pbmc10k-results.zip
+  compare_results.sh 1k  /path/to/1k.zip  /path/to/specific/local/run
 
 The script compares:
   • Count matrix (quants_mat.mtx)  – exact match
@@ -55,15 +61,23 @@ The script compares:
   • Quantification metrics from quant.json
   • Permit-list metrics from generate_permit_list.json
   • Per-barcode QC stats from featureDump.txt
-  • Timing summaries (side by side)
+  • Timing summaries (side by side, pipeline compute only)
   • File presence / sizes
 EOF
     exit 1
 }
 
-[[ $# -lt 1 ]] && usage
-REF_INPUT="$1"
-LOCAL_INPUT="${2:-}"
+[[ $# -lt 2 ]] && usage
+
+DATASET_INPUT="$1"
+case "$DATASET_INPUT" in
+    1k|1K|pbmc1k)  DATASET="pbmc1k"  ;;
+    10k|10K|pbmc10k) DATASET="pbmc10k" ;;
+    *) echo "ERROR: dataset must be 1k or 10k (got: $DATASET_INPUT)"; exit 1 ;;
+esac
+
+REF_INPUT="$2"
+LOCAL_INPUT="${3:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -110,8 +124,30 @@ resolve_ref() {
 }
 
 # ── resolve local results directory ───────────────────────────────────────
+# Detects which dataset a result directory belongs to by reading run.env or
+# checking the timing_summary.txt header.
+detect_dataset() {
+    local dir="$1"
+    # Try run.env first
+    local env_file=""
+    env_file=$(find "$dir" -maxdepth 2 -name "run.env" 2>/dev/null | head -1)
+    if [[ -n "$env_file" ]]; then
+        local ds
+        ds=$(grep "^DATASET=" "$env_file" 2>/dev/null | cut -d= -f2-)
+        if [[ -n "$ds" ]]; then echo "$ds"; return; fi
+    fi
+    # Fall back to timing summary header
+    local ts_file=""
+    ts_file=$(find "$dir" -maxdepth 2 -name "timing_summary.txt" 2>/dev/null | head -1)
+    if [[ -n "$ts_file" ]]; then
+        if grep -qi "PBMC1K" "$ts_file" 2>/dev/null; then echo "pbmc1k"; return; fi
+        if grep -qi "PBMC10K" "$ts_file" 2>/dev/null; then echo "pbmc10k"; return; fi
+    fi
+    echo "unknown"
+}
+
 resolve_local() {
-    local input="$1"
+    local input="$1" target_dataset="$2"
     input="${input//\\//}"
 
     if [[ -n "$input" ]]; then
@@ -126,19 +162,50 @@ resolve_local() {
         echo "ERROR: Could not find alevin_output/quant.json inside $input" >&2; return 1
     fi
 
-    # Auto-detect: newest run under serverless_runs/
+    # Auto-detect: find the newest run matching target_dataset under serverless_runs/
     local runs_dir="$REPO_ROOT/serverless_runs"
     if [[ ! -d "$runs_dir" ]]; then
         echo "ERROR: No local results dir given and $runs_dir not found" >&2; return 1
     fi
-    local latest
-    latest=$(find "$runs_dir" -maxdepth 5 -name "quant.json" -path "*/alevin_output/*" 2>/dev/null \
-             | while read -r f; do stat -c '%Y %s' "$f" 2>/dev/null || stat -f '%m %z' "$f" 2>/dev/null; echo " $f"; done \
-             | sort -rn | head -1 | awk '{print $NF}')
-    if [[ -z "$latest" ]]; then
-        echo "ERROR: No results found under $runs_dir" >&2; return 1
+
+    # Collect all result dirs with quant.json, newest first
+    local best_dir="" best_mtime=0
+    while IFS= read -r qj; do
+        local result_dir
+        result_dir="$(dirname "$(dirname "$qj")")"
+        local ds
+        ds=$(detect_dataset "$result_dir")
+        if [[ "$ds" == "$target_dataset" ]]; then
+            local mtime
+            mtime=$(stat -c '%Y' "$qj" 2>/dev/null || stat -f '%m' "$qj" 2>/dev/null || echo "0")
+            if [[ $mtime -gt $best_mtime ]]; then
+                best_mtime=$mtime
+                best_dir="$result_dir"
+            fi
+        fi
+    done < <(find "$runs_dir" -maxdepth 5 -name "quant.json" -path "*/alevin_output/*" 2>/dev/null)
+
+    if [[ -z "$best_dir" ]]; then
+        # List what IS available
+        local available=""
+        while IFS= read -r qj; do
+            local rd
+            rd="$(dirname "$(dirname "$qj")")"
+            local ds
+            ds=$(detect_dataset "$rd")
+            available="${available}  ${ds} → $(basename "$rd")\n"
+        done < <(find "$runs_dir" -maxdepth 5 -name "quant.json" -path "*/alevin_output/*" 2>/dev/null)
+
+        if [[ -n "$available" ]]; then
+            echo "ERROR: No ${target_dataset} serverless run found. Available runs:" >&2
+            printf "$available" >&2
+        else
+            echo "ERROR: No serverless runs found in $runs_dir" >&2
+        fi
+        return 1
     fi
-    echo "$(dirname "$(dirname "$latest")")"
+
+    echo "$best_dir"
 }
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -146,14 +213,21 @@ cleanup() { [[ -n "${CLEANUP_TMPDIR:-}" ]] && rm -rf "$CLEANUP_TMPDIR"; }
 trap cleanup EXIT
 
 REF_DIR=$(resolve_ref "$REF_INPUT")
-LOCAL_DIR=$(resolve_local "$LOCAL_INPUT")
+LOCAL_DIR=$(resolve_local "$LOCAL_INPUT" "$DATASET")
+
+# ── auto-save log ────────────────────────────────────────────────────────
+COMPARE_LOG="${LOCAL_RESULTS_DIR:-$REPO_ROOT/serverless_runs}/compare_${DATASET}_$(date '+%Y%m%d_%H%M%S').log"
+mkdir -p "$(dirname "$COMPARE_LOG")"
+exec > >(tee "$COMPARE_LOG") 2>&1
 
 printf "\n${BOLD}╔══════════════════════════════════════════════════════════════╗${RESET}\n"
 printf "${BOLD}║          scRNA-seq Pipeline Results Comparison               ║${RESET}\n"
 printf "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}\n"
 echo
+info "Dataset:       $DATASET"
 info "Reference (A): $REF_DIR"
 info "Local     (B): $LOCAL_DIR"
+info "Log saved to:  $COMPARE_LOG"
 
 # ── helper: json field compare ────────────────────────────────────────────
 json_cmp() {
@@ -408,37 +482,101 @@ header "8. Timing Comparison"
 TIME_A="$REF_DIR/timing_summary.txt"
 TIME_B="$LOCAL_DIR/timing_summary.txt"
 
+# parse_timing FILE -> outputs "step_name<TAB>minutes" lines
+# Extracts data rows from timing summaries (skips headers/separators/blanks)
+parse_timing() {
+    local f="$1"
+    grep -v '^[[:space:]]*$' "$f" \
+    | grep -v '===\|---\|Step\|Task\|Time\|FASTQs:' \
+    | while IFS= read -r line; do
+        local mins
+        mins=$(echo "$line" | awk '{for(i=NF;i>=1;i--) if($i ~ /^[0-9]*\.?[0-9]+$/) {print $i; exit}}')
+        [[ -z "$mins" ]] && continue
+        local name
+        name=$(echo "$line" | sed 's/[0-9.,]*[[:space:]]*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [[ -z "$name" ]] && continue
+        printf '%s\t%s\n' "$name" "$mins"
+    done
+}
+
+# Steps to exclude from the "pipeline computation" total (infrastructure, not compute)
+EXCLUDE_PATTERN="FASTQ Download|FASTQ Upload|Docker Build|Upload Quant|Upload .* to S3"
+
 if [[ -f "$TIME_A" || -f "$TIME_B" ]]; then
-    printf "\n%-45s │ %s\n" "  REFERENCE (A)" "LOCAL (B)"
-    printf "%-45s │ %s\n" "  ─────────────" "─────────"
+    # Parse both files
+    STEPS_A=""
+    STEPS_B=""
+    [[ -f "$TIME_A" ]] && STEPS_A=$(parse_timing "$TIME_A")
+    [[ -f "$TIME_B" ]] && STEPS_B=$(parse_timing "$TIME_B")
 
-    if [[ -f "$TIME_A" ]]; then
-        # Extract total time from ref
-        TOTAL_A=$(grep -i 'total' "$TIME_A" | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.?[0-9]*$/) {last=$i}} END{print last}')
+    # Show step-by-step table
+    printf "\n  ${BOLD}%-40s %10s %10s${RESET}\n" "Step" "Ref (min)" "Local (min)"
+    printf "  %-40s %10s %10s\n" "$(printf '%0.s─' {1..40})" "──────────" "──────────"
+
+    COMPUTE_A="0"; COMPUTE_B="0"
+    TOTAL_A="0";   TOTAL_B="0"
+
+    # Print reference steps
+    if [[ -n "$STEPS_A" ]]; then
+        while IFS=$'\t' read -r name mins; do
+            [[ "$name" =~ ^Total ]] && { TOTAL_A="$mins"; continue; }
+            local_mins="-"
+            is_infra=0
+            echo "$name" | grep -qE "$EXCLUDE_PATTERN" && is_infra=1
+            if [[ $is_infra -eq 0 ]]; then
+                COMPUTE_A=$(awk "BEGIN{printf \"%.2f\", $COMPUTE_A + $mins}")
+            fi
+            printf "  %-40s %10s %10s\n" "$name" "$mins" "$local_mins"
+        done <<< "$STEPS_A"
     fi
-    if [[ -f "$TIME_B" ]]; then
-        TOTAL_B=$(grep -i 'total' "$TIME_B" | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.?[0-9]*$/) {last=$i}} END{print last}')
+
+    # Print local steps (skip those already in ref by nature)
+    if [[ -n "$STEPS_B" ]]; then
+        while IFS=$'\t' read -r name mins; do
+            [[ "$name" =~ ^Total ]] && { TOTAL_B="$mins"; continue; }
+            is_infra=0
+            echo "$name" | grep -qE "$EXCLUDE_PATTERN" && is_infra=1
+            if [[ $is_infra -eq 0 ]]; then
+                COMPUTE_B=$(awk "BEGIN{printf \"%.2f\", $COMPUTE_B + $mins}")
+            fi
+            # Check if this step only exists in local
+            if [[ $is_infra -eq 1 ]]; then
+                printf "  ${YELLOW}%-40s %10s %10s${RESET}\n" "$name (infra)" "-" "$mins"
+            else
+                printf "  %-40s %10s %10s\n" "$name" "-" "$mins"
+            fi
+        done <<< "$STEPS_B"
+    fi
+
+    printf "  %-40s %10s %10s\n" "$(printf '%0.s─' {1..40})" "──────────" "──────────"
+
+    # Compute-only totals (excluding FASTQ download + infrastructure)
+    printf "  ${BOLD}%-40s %10s %10s${RESET}\n" \
+        "Pipeline Compute (excl. infra)" "$COMPUTE_A" "$COMPUTE_B"
+
+    if [[ "$TOTAL_A" != "0" || "$TOTAL_B" != "0" ]]; then
+        printf "  %-40s %10s %10s\n" \
+            "Total (including everything)" \
+            "$([ "$TOTAL_A" != "0" ] && echo "$TOTAL_A" || echo "-")" \
+            "$([ "$TOTAL_B" != "0" ] && echo "$TOTAL_B" || echo "-")"
     fi
 
     echo
+    if [[ "$COMPUTE_A" != "0" && "$COMPUTE_B" != "0" ]]; then
+        RATIO=$(awk "BEGIN{printf \"%.1f\", $COMPUTE_B / $COMPUTE_A}")
+        info "Pipeline compute ratio: local is ${RATIO}x vs reference"
+    fi
+
+    # Still show raw summaries for full context
+    echo
     if [[ -f "$TIME_A" ]]; then
-        printf "${CYAN}  Reference timing:${RESET}\n"
+        printf "${CYAN}  Raw reference timing:${RESET}\n"
         sed 's/^/    /' "$TIME_A"
-    else
-        warn "timing_summary.txt missing in reference"
     fi
-
     echo
     if [[ -f "$TIME_B" ]]; then
-        printf "${CYAN}  Local timing:${RESET}\n"
+        printf "${CYAN}  Raw local timing:${RESET}\n"
         sed 's/^/    /' "$TIME_B"
-    else
-        warn "timing_summary.txt missing in local"
-    fi
-
-    if [[ -n "${TOTAL_A:-}" && -n "${TOTAL_B:-}" ]]; then
-        echo
-        info "Total time: ref=${TOTAL_A} min  vs  local=${TOTAL_B} min"
     fi
 else
     warn "No timing_summary.txt in either result set"

@@ -39,6 +39,7 @@
 #                          Attempts 10240MB first; falls back to 3008MB if account quota exceeded.
 #   LAMBDA_EPHEMERAL_MB    Lambda /tmp ephemeral storage (default: 10240)
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
+#   LAMBDA_CONCURRENCY     Max concurrent Lambda invocations (default: 1000, fallback: 500→100→10). Set 0 for unrestricted.
 #   THREADS                Number of CPU threads (default: nproc)
 #   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
@@ -157,6 +158,7 @@ USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked ne
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
+LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
 
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
@@ -169,7 +171,7 @@ LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./serverless_runs}"
 # FASTQ Configuration
 FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
-WRITE_H5AD="${WRITE_H5AD:-0}"
+WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-7200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
@@ -892,6 +894,7 @@ ssm_run_pipeline() {
         --arg write_h5ad "$WRITE_H5AD" \
         --arg run_id "$run_id" \
         --arg run_qc "$RUN_QC" \
+        --arg concurrency "${LAMBDA_CONCURRENCY:-0}" \
         --arg user "$SSH_USER" \
         --arg ds "$dataset" \
         '{commands:[
@@ -901,6 +904,7 @@ ssm_run_pipeline() {
             ("export LAMBDA_MEMORY_MB=" + $mem),
             ("export LAMBDA_EPHEMERAL_MB=" + $eph),
             ("export LAMBDA_TIMEOUT_SEC=" + $timeout),
+            ("export LAMBDA_CONCURRENCY=" + $concurrency),
             ("export THREADS=" + $threads),
             ("export CLEANUP_AWS=" + $cleanup),
             ("export FASTQ_TAR_PATH=" + $fastq_path),
@@ -1199,7 +1203,7 @@ validate_dry_run() {
     if [[ $fail -eq 0 ]]; then
         log_info "All checks passed! Ready to run:"
         log_info "  export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=1 WRITE_H5AD=1"
-        log_info "  bash scripts/e2e_serverless_pbmc.sh $DATASET 2>&1 | tee pbmc1k.log"
+        log_info "  bash scripts/e2e_serverless_pbmc.sh $DATASET"
         return 0
     else
         log_error "$fail check(s) failed. See errors above."
@@ -1815,6 +1819,7 @@ export AWS_REGION=$AWS_REGION
 export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 export LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
+export LAMBDA_CONCURRENCY=$LAMBDA_CONCURRENCY
 export THREADS=$THREADS
 export CLEANUP_AWS=$CLEANUP_AWS
 export FASTQ_TAR_PATH=$FASTQ_TAR_PATH
@@ -2242,6 +2247,33 @@ aws lambda wait function-active-v2 --function-name "$LAMBDA_FUNCTION_NAME" --reg
     || aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" 2>/dev/null \
     || sleep 10
 
+# 6d2: Set reserved concurrency with fallback chain
+set_lambda_concurrency() {
+    local requested="${1:-0}"
+    [[ "$requested" -le 0 ]] && return 0
+
+    local -a chain=()
+    for lvl in 1000 500 100 10; do
+        [[ $lvl -le $requested ]] && chain+=("$lvl")
+    done
+    [[ ${#chain[@]} -eq 0 ]] && chain=("$requested")
+
+    for c in "${chain[@]}"; do
+        if aws lambda put-function-concurrency \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --reserved-concurrent-executions "$c" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            LAMBDA_CONCURRENCY="$c"
+            log_info "Lambda reserved concurrency set to $c"
+            return 0
+        fi
+        log_warn "Concurrency $c rejected by account quota, trying lower..."
+    done
+    log_warn "All concurrency levels rejected — running with unrestricted concurrency"
+    LAMBDA_CONCURRENCY="unrestricted"
+}
+set_lambda_concurrency "$LAMBDA_CONCURRENCY"
+
 # 6e: Create EventBridge rule to trigger Lambda
 RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"
 create_eventbridge_rule_for_lambda "$RULE_NAME" "$LAMBDA_FUNCTION_ARN" "$INPUT_TXT_BUCKET"
@@ -2257,6 +2289,7 @@ log_info "  Lambda Function:     $LAMBDA_FUNCTION_NAME"
 log_info "  Lambda Memory:       ${LAMBDA_MEMORY_MB}MB"
 log_info "  Lambda Ephemeral:    ${LAMBDA_EPHEMERAL_MB}MB"
 log_info "  Lambda Timeout:      ${LAMBDA_TIMEOUT_SEC}s"
+log_info "  Lambda Concurrency:  ${LAMBDA_CONCURRENCY:-unrestricted}"
 log_info "  Lambda Role:         $LAMBDA_EXECUTION_ROLE_NAME"
 log_info "  EventBridge Rule:    $RULE_NAME"
 log_info "  Input FASTQ Bucket:  $INPUT_FASTQ_BUCKET"
@@ -2417,6 +2450,7 @@ LAMBDA_EXECUTION_ROLE=$LAMBDA_EXECUTION_ROLE_NAME
 LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
+LAMBDA_CONCURRENCY=${LAMBDA_CONCURRENCY:-unrestricted}
 RUN_DIR=$RUN_DIR
 BASENAME_WITH_LANE=$BASENAME_WITH_LANE
 EOF

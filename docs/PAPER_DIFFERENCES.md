@@ -57,3 +57,188 @@ The paper assumes NVMe instance storage (m6id family). This repo falls back to t
 | Lambda timeout | 900 s | 900 s (unchanged) |
 
 All other steps (alevin-fry generate-permit-list, collate, quant, resource creation, cleanup) are identical.
+
+---
+
+## Script reference
+
+This repository includes three scripts. Each can run PBMC 1K or PBMC 10K.
+
+---
+
+### `scripts/e2e_serverless_pbmc.sh` — Serverless pipeline
+
+Provisions AWS resources (EC2, Lambda, S3, ECR, EventBridge), runs the mapping/quantification pipeline, and optionally cleans everything up.
+
+**Usage:**
+
+```bash
+bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
+```
+
+- `<dataset>`: `pbmc1k` or `pbmc10k`
+- `--dry-run`: validate credentials, AMI, network, keypair — creates nothing
+
+**Required environment variables** (set before every run):
+
+| Variable | Example | Purpose |
+|---|---|---|
+| `AWS_REGION` | `us-east-2` | AWS region (must match AMI) |
+| `SEED_AMI_ID` | `ami-0b80485dc95b72c33` | Pre-built seed AMI |
+| `EC2_INSTANCE_PROFILE_NAME` | `scrna-serverless-ec2-role` | IAM role for EC2 |
+| `KEY_NAME` | `scrna-reviewer-key` | EC2 keypair name |
+| `KEY_PEM_PATH` | `/d/Keys/scrna-reviewer-key.pem` | Path to PEM file |
+
+**Optional environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CLEANUP_AWS` | `1` | `1` = delete all AWS resources after run. `0` = keep them for inspection. |
+| `TERMINATE_DRIVER_ON_EXIT` | `1` | `1` = terminate EC2 when done. `0` = leave it running. |
+| `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip QC. |
+| `WRITE_H5AD` | `1` | `1` = save `.h5ad` AnnData file (requires `RUN_QC=1`). `0` = skip. |
+| `DOWNLOAD_RESULTS` | `1` | `1` = download results to local machine. `0` = leave on EC2 only. |
+| `LOCAL_RESULTS_DIR` | `./serverless_runs` | Where downloaded results are saved. |
+| `INSTANCE_TYPE` | `m6id.16xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
+| `ROOT_VOL_GB` | `200` | EBS root volume size in GB. |
+| `LAMBDA_MEMORY_MB` | `10240` | Lambda memory in MB (falls back to 3008 if quota exceeded). |
+| `LAMBDA_EPHEMERAL_MB` | `10240` | Lambda ephemeral storage in MB. |
+| `LAMBDA_TIMEOUT_SEC` | `900` | Lambda function timeout in seconds. |
+| `LAMBDA_CONCURRENCY` | `1000` | Max parallel Lambda invocations (fallback: 1000→500→100→10). Set `0` for unrestricted. |
+| `THREADS` | auto (`nproc`) | CPU threads for on-instance processing. |
+| `USE_SSM` | `auto` | `auto` = try SSH, fall back to SSM. `1` = force SSM. `0` = force SSH. |
+| `SSH_USER` | `ubuntu` | SSH username on the EC2 instance. |
+| `FASTQ_TAR_PATH` | *(empty)* | Path to a local FASTQ tarball (skip download). |
+| `FASTQ_TAR_URL` | *(empty)* | URL to download FASTQs from (overrides default). |
+| `RUN_ID` | auto-generated | Custom run identifier. |
+
+**Examples:**
+
+```bash
+# Minimal first run — keep resources, no QC
+export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=0 WRITE_H5AD=0
+bash scripts/e2e_serverless_pbmc.sh pbmc1k
+
+# Full run with QC + cleanup
+export CLEANUP_AWS=1 TERMINATE_DRIVER_ON_EXIT=1 RUN_QC=1 WRITE_H5AD=1
+bash scripts/e2e_serverless_pbmc.sh pbmc1k
+
+# PBMC 10K
+bash scripts/e2e_serverless_pbmc.sh pbmc10k
+
+# Dry run only
+bash scripts/e2e_serverless_pbmc.sh pbmc1k --dry-run
+```
+
+---
+
+### `scripts/e2e_onserver_pbmc.sh` — On-server pipeline
+
+Runs the pipeline on a dedicated Linux server (UW Tacoma) over SSH. Normally triggered by GitHub Actions, but can also be run locally.
+
+**Usage:**
+
+```bash
+bash scripts/e2e_onserver_pbmc.sh <dataset> [--dry-run]
+```
+
+- `<dataset>`: `pbmc1k` or `pbmc10k`
+- `--dry-run`: check tools, references, and disk on the server without running
+
+**Via GitHub Actions** (recommended):
+
+1. Go to the repository **Actions** tab
+2. Select **On-Server scRNA Pipeline**
+3. Click **Run workflow**, choose branch, dataset, QC, h5ad, and mode
+4. Download results from **Artifacts** when finished
+
+**Required environment variables** (for local use — GitHub Actions sets these automatically):
+
+| Variable | Purpose |
+|---|---|
+| `SERVER_HOST` | Server IP or hostname |
+| `SSH_USER` | SSH username |
+| `SSH_PASSWORD` | SSH password |
+
+**Optional environment variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip. |
+| `WRITE_H5AD` | `0` | `1` = save `.h5ad` file. `0` = skip. |
+| `DOWNLOAD_RESULTS` | `1` | `1` = download results locally. `0` = leave on server. |
+| `LOCAL_RESULTS_DIR` | `./onserver_runs` | Where downloaded results are saved. |
+| `THREADS` | auto (server cores) | CPU threads on the server. |
+| `RUN_ID` | auto-generated | Custom run identifier. |
+
+**Examples:**
+
+```bash
+# Local run (needs .env or exported vars)
+bash scripts/e2e_onserver_pbmc.sh pbmc1k
+
+# Skip QC
+RUN_QC=0 bash scripts/e2e_onserver_pbmc.sh pbmc1k
+
+# 10K with h5ad
+WRITE_H5AD=1 bash scripts/e2e_onserver_pbmc.sh pbmc10k
+
+# Dry run
+bash scripts/e2e_onserver_pbmc.sh pbmc1k --dry-run
+```
+
+---
+
+### `scripts/compare_results.sh` — Results comparison
+
+Compares outputs from two pipeline runs (typically serverless vs. on-server) to verify they produce identical results.
+
+**Usage:**
+
+```bash
+bash scripts/compare_results.sh <dataset> <reference_zip_or_dir> [local_results_dir]
+```
+
+- `<dataset>`: `1k` or `10k` — controls which local serverless run to auto-detect
+- `<reference_zip_or_dir>`: path to the on-server results zip (downloaded from GitHub Actions Artifacts) or an already-extracted directory
+- `[local_results_dir]`: *(optional)* explicit path to a serverless results directory. If omitted, the script finds the **latest** matching run (1k or 10k) under `serverless_runs/`.
+
+**Auto-detection behavior:**
+
+- If you pass `1k`, the script scans `serverless_runs/` and picks the most recent run whose `run.env` contains `DATASET=pbmc1k`
+- If you pass `10k`, it picks the most recent `DATASET=pbmc10k` run
+- If no matching run exists, the script lists what runs are available and exits
+- Cross-comparisons work: you can compare a 1k zip against a 10k local run and vice versa — the dataset argument only controls which local run to auto-detect
+
+**What it compares:**
+
+| Check | Method |
+|---|---|
+| Count matrix (`quants_mat.mtx`) | Exact value match (barcode-normalised to handle row ordering) |
+| Cell barcodes (`quants_mat_rows.txt`) | Set equality (order-independent) |
+| Gene list (`quants_mat_cols.txt`) | Exact line-by-line match |
+| Quantification metrics (`quant.json`) | Key-by-key numeric comparison |
+| Permit-list metrics (`generate_permit_list.json`) | Key-by-key comparison |
+| Per-barcode QC (`featureDump.txt`) | Row-by-row comparison |
+| Timing (`timing_summary.txt`) | Side-by-side display, excluding infrastructure steps (FASTQ download, Docker build, S3 uploads) |
+| File presence and sizes | Lists all output files in both directories |
+
+**Log output:**
+
+The script automatically saves a log to `serverless_runs/compare_<dataset>_<timestamp>.log` (e.g. `serverless_runs/compare_pbmc1k_20260226_143022.log`). The full output is still printed to the terminal — the log is an additional copy for later reference.
+
+**Examples:**
+
+```bash
+# Compare latest local 1k serverless run against the on-server 1k zip
+bash scripts/compare_results.sh 1k "C:/Users/me/Downloads/onserver-pbmc1k-results.zip"
+
+# Compare latest local 10k serverless run against the on-server 10k zip
+bash scripts/compare_results.sh 10k "C:/Users/me/Downloads/onserver-pbmc10k-results.zip"
+
+# Explicit local results directory
+bash scripts/compare_results.sh 1k "/path/to/ref.zip" "/path/to/local/results"
+
+# Compare cross-dataset (1k zip against 10k local run)
+bash scripts/compare_results.sh 10k "C:/Users/me/Downloads/onserver-pbmc1k-results.zip"
+```
