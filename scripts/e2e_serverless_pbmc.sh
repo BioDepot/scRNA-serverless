@@ -142,7 +142,7 @@ AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
-ROOT_VOL_GB="${ROOT_VOL_GB:-200}"
+ROOT_VOL_GB="${ROOT_VOL_GB:-500}"
 KEY_NAME="${KEY_NAME:-$DEFAULT_KEY_NAME}"
 KEY_PEM_PATH="${KEY_PEM_PATH:-$DEFAULT_KEY_PEM_PATH}"
 SUBNET_ID="${SUBNET_ID:-}"
@@ -158,7 +158,7 @@ USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked ne
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
-LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
+LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-900}"
 
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
@@ -173,7 +173,7 @@ FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
-PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-7200}"
+PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-21600}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 
 # Derived values (will be set later)
@@ -914,7 +914,7 @@ ssm_run_pipeline() {
             ("export RUN_QC=" + $run_qc),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
-        ], executionTimeout:["7200"]}')
+        ], executionTimeout:["21600"]}')
 
     local cmd_id
     cmd_id=$(aws ssm send-command \
@@ -922,7 +922,7 @@ ssm_run_pipeline() {
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters "$cmds_json" \
-        --timeout-seconds 7200 \
+        --timeout-seconds 21600 \
         --output-s3-bucket-name "$transfer_bucket" \
         --output-s3-key-prefix "ssm-output/$run_id" \
         --query 'Command.CommandId' --output text)
@@ -1404,8 +1404,8 @@ if [[ $RUN_MODE -eq 0 ]]; then
         fi
         
         # For each candidate, verify it has a route to an internet gateway
-        BEST_SUBNET=""
-        BEST_IPS=0
+        PUBLIC_SUBNETS=()
+        PUBLIC_SUBNET_IPS=()
         
         while IFS=$'\t' read -r sid ips az; do
             # Find route table: explicit association first, then main
@@ -1433,16 +1433,14 @@ if [[ $RUN_MODE -eq 0 ]]; then
             
             if [[ "$IGW_ROUTE" == igw-* ]]; then
                 log_info "  Subnet $sid ($az): public (IGW route via $RT, $ips IPs)"
-                if [[ $ips -gt $BEST_IPS ]]; then
-                    BEST_SUBNET="$sid"
-                    BEST_IPS=$ips
-                fi
+                PUBLIC_SUBNETS+=("$sid")
+                PUBLIC_SUBNET_IPS+=("$ips")
             else
                 log_info "  Subnet $sid ($az): no IGW default route (rt=$RT), skipping"
             fi
         done <<< "$CANDIDATE_SUBNETS"
         
-        if [[ -z "$BEST_SUBNET" ]]; then
+        if [[ ${#PUBLIC_SUBNETS[@]} -eq 0 ]]; then
             log_error "No truly public subnet found in VPC $VPC_ID."
             log_error "A public subnet needs: MapPublicIpOnLaunch=true AND a 0.0.0.0/0 route to an igw-*."
             log_error "Candidate subnets checked:"
@@ -1452,8 +1450,9 @@ if [[ $RUN_MODE -eq 0 ]]; then
             die "Set SUBNET_ID explicitly to a known public subnet."
         fi
         
-        SUBNET_ID="$BEST_SUBNET"
-        log_info "Auto-selected public subnet: $SUBNET_ID (VPC: $VPC_ID, available IPs: $BEST_IPS)"
+        SUBNET_ID="${PUBLIC_SUBNETS[0]}"
+        log_info "Auto-selected public subnet: $SUBNET_ID (VPC: $VPC_ID, available IPs: ${PUBLIC_SUBNET_IPS[0]})"
+        log_info "Total public subnets available for AZ fallback: ${#PUBLIC_SUBNETS[@]}"
     fi
     
     # Auto-create temporary security group if not set
@@ -1556,42 +1555,60 @@ if [[ $RUN_MODE -eq 0 ]]; then
         # Instance type fallback: try requested type first, then progressively smaller
         # alternatives if launch fails due to vCPU quota or capacity issues.
         # Chain: m6id (NVMe, best perf) → m6i (EBS-only) → t3 (burstable, free-tier accounts)
+        # For each type, try ALL available AZs/subnets before falling back to a smaller type.
         INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
         if [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
             INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large" "t3.medium" "t3.small" "t3.micro")
         fi
         
+        # Build list of subnets to try: auto-picked subnets across AZs, or just the one set
+        SUBNETS_TO_TRY=()
+        if [[ ${#PUBLIC_SUBNETS[@]} -gt 0 ]]; then
+            SUBNETS_TO_TRY=("${PUBLIC_SUBNETS[@]}")
+        else
+            SUBNETS_TO_TRY=("$SUBNET_ID")
+        fi
+        
         DRIVER_INSTANCE_ID=""
         for _try_type in "${INSTANCE_FALLBACKS[@]}"; do
-            log_info "Attempting instance type: $_try_type"
-            _launch_err=$(mktemp)
-            if DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
-                aws ec2 run-instances \
-                --region "$AWS_REGION" \
-                --image-id "$SEED_AMI_ID" \
-                --instance-type "$_try_type" \
-                "${KEY_NAME_ARGS[@]}" \
-                --subnet-id "$SUBNET_ID" \
-                --security-group-ids "$SG_ID" \
-                "${IAM_PROFILE_ARGS[@]}" \
-                --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
-                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
-                --query "Instances[0].InstanceId" \
-                --output text 2>"$_launch_err"); then
-                rm -f "$_launch_err"
-                INSTANCE_TYPE="$_try_type"
-                break
-            fi
-            _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
-            if [[ "$_err_msg" == *"VcpuLimitExceeded"* || "$_err_msg" == *"InsufficientInstanceCapacity"* || "$_err_msg" == *"InstanceLimitExceeded"* || "$_err_msg" == *"Unsupported"* ]]; then
-                log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
-                DRIVER_INSTANCE_ID=""
-                continue
-            fi
-            die "Failed to launch EC2 instance ($_try_type): $_err_msg"
+            for _try_subnet in "${SUBNETS_TO_TRY[@]}"; do
+                log_info "Attempting instance type: $_try_type in subnet $_try_subnet"
+                _launch_err=$(mktemp)
+                if DRIVER_INSTANCE_ID=$(MSYS2_ARG_CONV_EXCL="*" MSYS_NO_PATHCONV=1 \
+                    aws ec2 run-instances \
+                    --region "$AWS_REGION" \
+                    --image-id "$SEED_AMI_ID" \
+                    --instance-type "$_try_type" \
+                    "${KEY_NAME_ARGS[@]}" \
+                    --subnet-id "$_try_subnet" \
+                    --security-group-ids "$SG_ID" \
+                    "${IAM_PROFILE_ARGS[@]}" \
+                    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
+                    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
+                    --query "Instances[0].InstanceId" \
+                    --output text 2>"$_launch_err"); then
+                    rm -f "$_launch_err"
+                    INSTANCE_TYPE="$_try_type"
+                    SUBNET_ID="$_try_subnet"
+                    break 2
+                fi
+                _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
+                if [[ "$_err_msg" == *"InsufficientInstanceCapacity"* ]]; then
+                    log_warn "Instance type $_try_type unavailable in $(echo "$_try_subnet" | head -c 20)...: capacity issue, trying next AZ..."
+                    DRIVER_INSTANCE_ID=""
+                    continue
+                fi
+                if [[ "$_err_msg" == *"VcpuLimitExceeded"* || "$_err_msg" == *"InstanceLimitExceeded"* || "$_err_msg" == *"Unsupported"* ]]; then
+                    log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
+                    DRIVER_INSTANCE_ID=""
+                    break
+                fi
+                die "Failed to launch EC2 instance ($_try_type): $_err_msg"
+            done
+            [[ -n "$DRIVER_INSTANCE_ID" ]] && break
         done
         
-        [[ -n "$DRIVER_INSTANCE_ID" ]] || die "All instance types exhausted (tried: ${INSTANCE_FALLBACKS[*]}). Request a vCPU quota increase in AWS Service Quotas."
+        [[ -n "$DRIVER_INSTANCE_ID" ]] || die "All instance types and AZs exhausted (tried: ${INSTANCE_FALLBACKS[*]} across ${#SUBNETS_TO_TRY[@]} subnets). Request a vCPU quota increase in AWS Service Quotas."
     
         log_info "Instance launched: $DRIVER_INSTANCE_ID (type: $INSTANCE_TYPE)"
         
@@ -2253,7 +2270,7 @@ set_lambda_concurrency() {
     [[ "$requested" -le 0 ]] && return 0
 
     local -a chain=()
-    for lvl in 1000 500 100 10; do
+    for lvl in 900 500 100 50 25 10; do
         [[ $lvl -le $requested ]] && chain+=("$lvl")
     done
     [[ ${#chain[@]} -eq 0 ]] && chain=("$requested")
