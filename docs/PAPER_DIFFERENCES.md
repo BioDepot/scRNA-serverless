@@ -93,12 +93,28 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLEANUP_AWS` | `1` | `1` = delete all AWS resources after run. `0` = keep them for inspection. |
+| `CLEANUP_AWS` | `1` | `1` = delete AWS infrastructure after run. `0` = keep everything. On failure, always cleans up. |
+| `CLEANUP_RESULTS` | `1` | `1` = delete results S3 bucket after run. `0` = keep for manual download. On failure, always cleans up. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | `1` = terminate EC2 when done. `0` = leave it running. |
 | `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip QC. |
 | `WRITE_H5AD` | `1` | `1` = save `.h5ad` AnnData file (requires `RUN_QC=1`). `0` = skip. |
-| `DOWNLOAD_RESULTS` | `1` | `1` = download results to local machine. `0` = leave on EC2 only. |
+| `DOWNLOAD_RESULTS` | `1` | `1` = download results to local machine. `0` = leave on S3. |
 | `LOCAL_RESULTS_DIR` | `./serverless_runs` | Where downloaded results are saved. |
+
+> **Tip for PBMC 10K:** Results are ~15 GB. On slow wifi this download can take hours.
+> Set `DOWNLOAD_RESULTS=0 CLEANUP_RESULTS=0` to skip the download and keep the results bucket.
+> The pipeline prints the bucket name and download commands at the end. To download later:
+>
+> ```bash
+> # Find your results bucket
+> aws s3 ls --region us-east-2 | grep scrna-quant
+>
+> # Download everything
+> aws s3 sync s3://scrna-quant-<ACCOUNT_ID>-us-east-2-<RUN_ID>/ ./results/ --region us-east-2
+>
+> # Clean up when done
+> aws s3 rb s3://scrna-quant-<ACCOUNT_ID>-us-east-2-<RUN_ID> --force --region us-east-2
+> ```
 | `INSTANCE_TYPE` | `m6id.16xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
 | `ROOT_VOL_GB` | `200` | EBS root volume size in GB. |
 | `LAMBDA_MEMORY_MB` | `10240` | Lambda memory in MB (falls back to 3008 if quota exceeded). |

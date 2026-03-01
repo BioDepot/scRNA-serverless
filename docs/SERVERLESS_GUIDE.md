@@ -139,7 +139,7 @@ Checks credentials, AMI, subnet, security group, instance profile, and keypair. 
 **Minimal first run** (no QC, keep resources for inspection):
 
 ```bash
-export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0
+export CLEANUP_AWS=0 CLEANUP_RESULTS=0 TERMINATE_DRIVER_ON_EXIT=0
 export RUN_QC=0 WRITE_H5AD=0
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 ```
@@ -147,8 +147,6 @@ bash scripts/e2e_serverless_pbmc.sh pbmc1k
 **Full run** (QC + h5ad + auto-cleanup):
 
 ```bash
-export CLEANUP_AWS=1 TERMINATE_DRIVER_ON_EXIT=1
-export DOWNLOAD_RESULTS=1 RUN_QC=1 WRITE_H5AD=1
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 ```
 
@@ -157,6 +155,15 @@ bash scripts/e2e_serverless_pbmc.sh pbmc1k
 ```bash
 bash scripts/e2e_serverless_pbmc.sh pbmc10k
 ```
+
+**PBMC 10K on slow wifi** (skip download, fetch results later):
+
+```bash
+export DOWNLOAD_RESULTS=0 CLEANUP_RESULTS=0
+bash scripts/e2e_serverless_pbmc.sh pbmc10k
+```
+
+The pipeline prints the S3 bucket name and download commands at the end. Download at your own pace, then delete the bucket manually.
 
 The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 
@@ -182,7 +189,8 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 |---|---|---|
 | `RUN_QC` | `1` | QC analysis (UMAP + violin). `0` to skip. |
 | `WRITE_H5AD` | `0` | Save `.h5ad` file. Needs `RUN_QC=1`. |
-| `CLEANUP_AWS` | `1` | Delete all AWS resources after run. `0` to keep. |
+| `CLEANUP_AWS` | `1` | Delete AWS infrastructure after run. `0` to keep. |
+| `CLEANUP_RESULTS` | `1` | Delete results S3 bucket after run. `0` to keep for manual download. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | Terminate EC2 after run. `0` to keep. |
 | `DOWNLOAD_RESULTS` | `1` | Download results locally. `0` to skip. |
 
@@ -247,11 +255,13 @@ Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
 
 ## Cleanup
 
-**Auto-cleanup** (`CLEANUP_AWS=1`, default) deletes: EC2 instance, S3 buckets, Lambda, EventBridge rule, Lambda IAM role, ECR repo, and temp security group.
+**Auto-cleanup** (`CLEANUP_AWS=1`, default) deletes: EC2 instance, S3 buckets, Lambda, EventBridge rule, Lambda IAM role, ECR repo, and temp security group. With `CLEANUP_RESULTS=0`, the results S3 bucket is preserved for manual download.
+
+**On failure:** all AWS resources are always cleaned up regardless of `CLEANUP_AWS`, `CLEANUP_RESULTS`, or `TERMINATE_DRIVER_ON_EXIT` settings. Partial results have no value and leaving orphaned resources wastes money.
 
 **Not cleaned up:** your IAM role (reuse it), the seed AMI (shared resource), and `serverless_runs/` (your results).
 
-**Manual cleanup** (if a run failed midway with `CLEANUP_AWS=0`):
+**Manual cleanup** (after a run with `CLEANUP_AWS=0` or `CLEANUP_RESULTS=0`):
 
 ```bash
 # Leftover EC2 instances
@@ -259,10 +269,9 @@ aws ec2 describe-instances --filters "Name=tag:Name,Values=scrna-*" \
   "Name=instance-state-name,Values=running,stopped" \
   --query "Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key=='Name'].Value|[0]]" \
   --output table --region us-east-2
-
 # Terminate: aws ec2 terminate-instances --instance-ids i-xxxxx --region us-east-2
 
-# Leftover S3 buckets
+# Leftover S3 buckets (results bucket from CLEANUP_RESULTS=0, or all buckets from CLEANUP_AWS=0)
 aws s3 ls --region us-east-2 | grep scrna
 # Remove: aws s3 rb s3://bucket-name --force --region us-east-2
 

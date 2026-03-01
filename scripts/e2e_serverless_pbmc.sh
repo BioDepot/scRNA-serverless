@@ -41,7 +41,8 @@
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
 #   LAMBDA_CONCURRENCY     Max concurrent Lambda invocations (default: 1000, fallback: 500→100→10). Set 0 for unrestricted.
 #   THREADS                Number of CPU threads (default: nproc)
-#   CLEANUP_AWS            Clean up AWS resources after pipeline (default: 1)
+#   CLEANUP_AWS            Clean up AWS infrastructure after pipeline (default: 1)
+#   CLEANUP_RESULTS        Delete results S3 bucket after pipeline (default: 1). Set 0 to keep for manual download.
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
 #   DOWNLOAD_TO_LOCAL      Download results from EC2 to local machine (default: 1). Alias for DOWNLOAD_RESULTS.
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
@@ -75,17 +76,21 @@ cleanup_on_exit() {
     [[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true
 
     if [[ "${RUN_MODE:-0}" -ne 0 ]]; then return; fi
-    if [[ "${CLEANUP_AWS:-1}" -ne 1 ]]; then return; fi
+
+    # On failure: force full cleanup regardless of user settings
+    local _force_cleanup=0
+    if [[ $exit_code -ne 0 ]]; then
+        _force_cleanup=1
+        echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') Script failed (exit $exit_code). Forcing full cleanup..." >&2
+    fi
+
+    if [[ $_force_cleanup -eq 0 && "${CLEANUP_AWS:-1}" -ne 1 ]]; then return; fi
 
     local _have_resources=0
     [[ -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" ]] && _have_resources=1
     [[ -n "${LAMBDA_FUNCTION_NAME:-}" ]] && _have_resources=1
     [[ -n "${INPUT_FASTQ_BUCKET:-}" ]] && _have_resources=1
     [[ $_have_resources -eq 0 ]] && return
-
-    if [[ $exit_code -ne 0 ]]; then
-        echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') Script failed (exit $exit_code). Running automatic cleanup..." >&2
-    fi
 
     # --- EC2 / SG / SSH ---
     if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
@@ -96,7 +101,7 @@ cleanup_on_exit() {
             --cidr "${CALLER_IP_TO_REVOKE}/32" 2>/dev/null || true
     fi
 
-    if [[ -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" && "${TERMINATE_DRIVER_ON_EXIT:-1}" -eq 1 ]]; then
+    if [[ -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" && ( $_force_cleanup -eq 1 || "${TERMINATE_DRIVER_ON_EXIT:-1}" -eq 1 ) ]]; then
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Terminating driver instance ${DRIVER_INSTANCE_ID}..."
         aws ec2 terminate-instances --region "$_region" \
             --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
@@ -111,8 +116,8 @@ cleanup_on_exit() {
         fi
     fi
 
-    # --- SSM transfer bucket ---
-    if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
+    # --- SSM transfer bucket (holds results tarball — skip if CLEANUP_RESULTS=0 on success) ---
+    if [[ -n "${SSM_TRANSFER_BUCKET:-}" && ( $_force_cleanup -eq 1 || "${CLEANUP_RESULTS:-1}" -eq 1 ) ]]; then
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
         aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$_region" 2>/dev/null || true
         aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$_region" 2>/dev/null || true
@@ -178,6 +183,10 @@ cleanup_on_exit() {
     local _bucket
     for _bucket in "${INPUT_FASTQ_BUCKET:-}" "${INPUT_TXT_BUCKET:-}" "${OUTPUT_MAP_BUCKET:-}" "${OUTPUT_QUANT_BUCKET:-}"; do
         if [[ -n "$_bucket" ]]; then
+            if [[ $_force_cleanup -eq 0 && "${CLEANUP_RESULTS:-1}" -ne 1 && "$_bucket" == "${OUTPUT_QUANT_BUCKET:-}" ]]; then
+                echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Keeping results bucket: $_bucket (CLEANUP_RESULTS=0)"
+                continue
+            fi
             echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting S3 bucket ${_bucket}..."
             aws s3 rm "s3://$_bucket" --recursive --region "$_region" 2>/dev/null || true
             aws s3 rb "s3://$_bucket" --region "$_region" 2>/dev/null || true
@@ -243,6 +252,7 @@ LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
 CLEANUP_AWS="${CLEANUP_AWS:-1}"
+CLEANUP_RESULTS="${CLEANUP_RESULTS:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
 RUN_QC="${RUN_QC:-1}"
 DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-${DOWNLOAD_TO_LOCAL:-1}}"  # DOWNLOAD_TO_LOCAL is accepted alias
@@ -969,6 +979,7 @@ ssm_run_pipeline() {
         --arg timeout "$LAMBDA_TIMEOUT_SEC" \
         --arg threads "$THREADS" \
         --arg cleanup "$CLEANUP_AWS" \
+        --arg cleanup_results "$CLEANUP_RESULTS" \
         --arg fastq_path "${FASTQ_TAR_PATH:-}" \
         --arg fastq_url "${FASTQ_TAR_URL:-}" \
         --arg write_h5ad "$WRITE_H5AD" \
@@ -987,6 +998,7 @@ ssm_run_pipeline() {
             ("export LAMBDA_CONCURRENCY=" + $concurrency),
             ("export THREADS=" + $threads),
             ("export CLEANUP_AWS=" + $cleanup),
+            ("export CLEANUP_RESULTS=" + $cleanup_results),
             ("export FASTQ_TAR_PATH=" + $fastq_path),
             ("export FASTQ_TAR_URL=" + $fastq_url),
             ("export WRITE_H5AD=" + $write_h5ad),
@@ -1282,7 +1294,7 @@ validate_dry_run() {
     
     if [[ $fail -eq 0 ]]; then
         log_info "All checks passed! Ready to run:"
-        log_info "  export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=1 WRITE_H5AD=1"
+        log_info "  export CLEANUP_AWS=0 CLEANUP_RESULTS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=1 WRITE_H5AD=1"
         log_info "  bash scripts/e2e_serverless_pbmc.sh $DATASET"
         return 0
     else
@@ -1919,6 +1931,7 @@ export LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 export LAMBDA_CONCURRENCY=$LAMBDA_CONCURRENCY
 export THREADS=$THREADS
 export CLEANUP_AWS=$CLEANUP_AWS
+export CLEANUP_RESULTS=$CLEANUP_RESULTS
 export FASTQ_TAR_PATH=$FASTQ_TAR_PATH
 export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
@@ -1992,7 +2005,7 @@ SSHEOF
             aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
         fi
         
-        if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
+        if [[ -n "${SSM_TRANSFER_BUCKET:-}" && "${CLEANUP_RESULTS:-1}" -eq 1 ]]; then
             log_info "Cleaning up SSM transfer bucket: $SSM_TRANSFER_BUCKET"
             aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null || true
             aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
@@ -2754,6 +2767,10 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
     
     # Empty and delete S3 buckets
     for bucket in "$INPUT_FASTQ_BUCKET" "$INPUT_TXT_BUCKET" "$OUTPUT_MAP_BUCKET" "$OUTPUT_QUANT_BUCKET"; do
+        if [[ "$CLEANUP_RESULTS" -ne 1 && "$bucket" == "$OUTPUT_QUANT_BUCKET" ]]; then
+            log_info "Keeping results bucket: $bucket (CLEANUP_RESULTS=0)"
+            continue
+        fi
         log_info "Deleting bucket: $bucket"
         aws s3 rm "s3://$bucket" --recursive --region "$AWS_REGION" 2>/dev/null || true
         aws s3 rb "s3://$bucket" --region "$AWS_REGION" 2>/dev/null || true
@@ -2773,6 +2790,14 @@ log_info "Run ID: $RUN_ID"
 log_info "Dataset: $DATASET"
 log_info "Output directory: $RUN_DIR"
 log_info "Quantification output: s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/"
+
+if [[ "${CLEANUP_RESULTS:-1}" -ne 1 ]]; then
+    log_info "Results bucket preserved (CLEANUP_RESULTS=0). Download later with:"
+    log_info "  aws s3 sync s3://$OUTPUT_QUANT_BUCKET/ ./$RUN_ID/ --region $AWS_REGION"
+    if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
+        log_info "  aws s3 cp s3://$SSM_TRANSFER_BUCKET/results/${RUN_ID}_results.tgz . --region $AWS_REGION"
+    fi
+fi
 
 if [[ "${RUN_QC:-0}" == "1" ]]; then
     log_info "QC plots: $RUN_DIR/analysis/out/"
