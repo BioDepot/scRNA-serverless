@@ -66,54 +66,125 @@ set -euo pipefail
 
 # Cleanup temp files on exit (safe under set -u)
 # Cleanup function — called automatically on EXIT/INT/TERM.
-# Ensures EC2 instances and security groups created by this script are not
-# left running if the script fails at any point.
+# Ensures ALL AWS resources created by this script are cleaned up if the
+# script fails, is interrupted (Ctrl+C), or exits at any point.
 cleanup_on_exit() {
     local exit_code=$?
-    # Clean up temp FASTQ files
+    local _region="${AWS_REGION:-us-east-2}"
+
     [[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true
 
-    # Only run driver-mode cleanup when we are in driver mode and actually
-    # created resources (DRIVER_INSTANCE_ID is set after launch).
-    if [[ "${RUN_MODE:-0}" -eq 0 && -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" ]]; then
-        if [[ $exit_code -ne 0 ]]; then
-            echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') Script failed (exit $exit_code). Running automatic cleanup..." >&2
-        fi
+    if [[ "${RUN_MODE:-0}" -ne 0 ]]; then return; fi
+    if [[ "${CLEANUP_AWS:-1}" -ne 1 ]]; then return; fi
 
-        # Revoke caller IP from SG if it was authorized
-        if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
-            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Revoking SG ingress for ${CALLER_IP_TO_REVOKE}..."
-            aws ec2 revoke-security-group-ingress \
-                --region "${AWS_REGION:-us-east-2}" \
-                --group-id "${SG_ID:-}" \
-                --protocol tcp --port 22 \
-                --cidr "${CALLER_IP_TO_REVOKE}/32" 2>/dev/null || true
-        fi
+    local _have_resources=0
+    [[ -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" ]] && _have_resources=1
+    [[ -n "${LAMBDA_FUNCTION_NAME:-}" ]] && _have_resources=1
+    [[ -n "${INPUT_FASTQ_BUCKET:-}" ]] && _have_resources=1
+    [[ $_have_resources -eq 0 ]] && return
 
-        if [[ "${TERMINATE_DRIVER_ON_EXIT:-1}" -eq 1 ]]; then
-            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Terminating driver instance ${DRIVER_INSTANCE_ID}..."
-            aws ec2 terminate-instances --region "${AWS_REGION:-us-east-2}" \
-                --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
+    if [[ $exit_code -ne 0 ]]; then
+        echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') Script failed (exit $exit_code). Running automatic cleanup..." >&2
+    fi
 
-            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Waiting for instance to terminate..."
-            aws ec2 wait instance-terminated --region "${AWS_REGION:-us-east-2}" \
-                --instance-ids "$DRIVER_INSTANCE_ID" 2>/dev/null || true
+    # --- EC2 / SG / SSH ---
+    if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Revoking SG ingress for ${CALLER_IP_TO_REVOKE}..."
+        aws ec2 revoke-security-group-ingress \
+            --region "$_region" --group-id "${SG_ID:-}" \
+            --protocol tcp --port 22 \
+            --cidr "${CALLER_IP_TO_REVOKE}/32" 2>/dev/null || true
+    fi
 
-            # Delete auto-created SG after instance is gone
-            if [[ -n "${CREATED_SG_ID:-}" ]]; then
-                echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting temporary security group ${CREATED_SG_ID}..."
-                aws ec2 delete-security-group --region "${AWS_REGION:-us-east-2}" \
-                    --group-id "$CREATED_SG_ID" 2>/dev/null || true
-            fi
+    if [[ -n "${DRIVER_INSTANCE_ID:-}" && "${DRIVER_INSTANCE_ID:-}" != "None" && "${TERMINATE_DRIVER_ON_EXIT:-1}" -eq 1 ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Terminating driver instance ${DRIVER_INSTANCE_ID}..."
+        aws ec2 terminate-instances --region "$_region" \
+            --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Waiting for instance to terminate..."
+        aws ec2 wait instance-terminated --region "$_region" \
+            --instance-ids "$DRIVER_INSTANCE_ID" 2>/dev/null || true
 
-            # Clean up SSM transfer bucket if used
-            if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
-                echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
-                aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "${AWS_REGION:-us-east-2}" 2>/dev/null || true
-                aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "${AWS_REGION:-us-east-2}" 2>/dev/null || true
-            fi
+        if [[ -n "${CREATED_SG_ID:-}" ]]; then
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting temporary security group ${CREATED_SG_ID}..."
+            aws ec2 delete-security-group --region "$_region" \
+                --group-id "$CREATED_SG_ID" 2>/dev/null || true
         fi
     fi
+
+    # --- SSM transfer bucket ---
+    if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
+        aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$_region" 2>/dev/null || true
+        aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$_region" 2>/dev/null || true
+    fi
+
+    # --- Lambda function ---
+    if [[ -n "${LAMBDA_FUNCTION_NAME:-}" ]]; then
+        local _lambda_arn
+        _lambda_arn=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
+            --region "$_region" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting Lambda function ${LAMBDA_FUNCTION_NAME}..."
+        aws lambda delete-function --function-name "$LAMBDA_FUNCTION_NAME" \
+            --region "$_region" 2>/dev/null || true
+        aws logs delete-log-group --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
+            --region "$_region" 2>/dev/null || true
+
+        # --- EventBridge rules targeting this Lambda ---
+        if [[ -n "$_lambda_arn" && "$_lambda_arn" != "None" ]]; then
+            local _rules
+            _rules=$(aws events list-rule-names-by-target --target-arn "$_lambda_arn" \
+                --region "$_region" --query 'RuleNames[]' --output text 2>/dev/null || echo "")
+            for _rule in $_rules; do
+                local _tids
+                _tids=$(aws events list-targets-by-rule --rule "$_rule" \
+                    --region "$_region" --query 'Targets[].Id' --output text 2>/dev/null || echo "")
+                [[ -n "$_tids" ]] && aws events remove-targets --rule "$_rule" --ids $_tids \
+                    --region "$_region" 2>/dev/null || true
+                aws events delete-rule --name "$_rule" --region "$_region" 2>/dev/null || true
+            done
+        fi
+        aws events remove-targets --rule "${LAMBDA_FUNCTION_NAME}-rule" --ids "LambdaTarget" \
+            --region "$_region" 2>/dev/null || true
+        aws events delete-rule --name "${LAMBDA_FUNCTION_NAME}-rule" \
+            --region "$_region" 2>/dev/null || true
+    fi
+
+    # --- IAM execution role ---
+    if [[ -n "${LAMBDA_EXECUTION_ROLE_NAME:-}" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting IAM role ${LAMBDA_EXECUTION_ROLE_NAME}..."
+        aws iam list-attached-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+            --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r _pa; do
+                [[ -n "$_pa" ]] && aws iam detach-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+                    --policy-arn "$_pa" 2>/dev/null || true
+            done
+        aws iam list-role-policies --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+            --query 'PolicyNames[]' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r _pn; do
+                [[ -n "$_pn" ]] && aws iam delete-role-policy --role-name "$LAMBDA_EXECUTION_ROLE_NAME" \
+                    --policy-name "$_pn" 2>/dev/null || true
+            done
+        aws iam delete-role --role-name "$LAMBDA_EXECUTION_ROLE_NAME" 2>/dev/null || true
+    fi
+
+    # --- ECR repository ---
+    if [[ -n "${ECR_REPO_NAME:-}" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting ECR repository ${ECR_REPO_NAME}..."
+        aws ecr delete-repository --repository-name "$ECR_REPO_NAME" \
+            --force --region "$_region" 2>/dev/null || true
+    fi
+
+    # --- S3 buckets (FASTQ, TXT, MAP, QUANT) ---
+    local _bucket
+    for _bucket in "${INPUT_FASTQ_BUCKET:-}" "${INPUT_TXT_BUCKET:-}" "${OUTPUT_MAP_BUCKET:-}" "${OUTPUT_QUANT_BUCKET:-}"; do
+        if [[ -n "$_bucket" ]]; then
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting S3 bucket ${_bucket}..."
+            aws s3 rm "s3://$_bucket" --recursive --region "$_region" 2>/dev/null || true
+            aws s3 rb "s3://$_bucket" --region "$_region" 2>/dev/null || true
+        fi
+    done
+
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleanup complete."
 }
 trap cleanup_on_exit EXIT INT TERM
 
@@ -158,7 +229,7 @@ USE_SSM="${USE_SSM:-auto}"        # auto|1|0 — SSM fallback for SSH-blocked ne
 LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
-LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-900}"
+LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
 
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
@@ -2270,7 +2341,7 @@ set_lambda_concurrency() {
     [[ "$requested" -le 0 ]] && return 0
 
     local -a chain=()
-    for lvl in 900 500 100 50 25 10; do
+    for lvl in 1000 900 750 500 100 50 25 10; do
         [[ $lvl -le $requested ]] && chain+=("$lvl")
     done
     [[ ${#chain[@]} -eq 0 ]] && chain=("$requested")
