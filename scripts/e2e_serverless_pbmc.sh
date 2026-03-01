@@ -116,8 +116,8 @@ cleanup_on_exit() {
         fi
     fi
 
-    # --- SSM transfer bucket (holds results tarball — skip if CLEANUP_RESULTS=0 on success) ---
-    if [[ -n "${SSM_TRANSFER_BUCKET:-}" && ( $_force_cleanup -eq 1 || "${CLEANUP_RESULTS:-1}" -eq 1 ) ]]; then
+    # --- SSM transfer bucket (infrastructure, always clean up) ---
+    if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
         aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$_region" 2>/dev/null || true
         aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$_region" 2>/dev/null || true
@@ -2005,7 +2005,7 @@ SSHEOF
             aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$CREATED_SG_ID" 2>/dev/null || log_info "Could not delete SG (may still be in use)"
         fi
         
-        if [[ -n "${SSM_TRANSFER_BUCKET:-}" && "${CLEANUP_RESULTS:-1}" -eq 1 ]]; then
+        if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
             log_info "Cleaning up SSM transfer bucket: $SSM_TRANSFER_BUCKET"
             aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null || true
             aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
