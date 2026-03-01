@@ -184,6 +184,15 @@ cleanup_on_exit() {
         fi
     done
 
+    # --- Local results: remove partial output on failure, keep on success ---
+    if [[ $exit_code -ne 0 && -n "${RUN_ID:-}" && -n "${LOCAL_RESULTS_DIR:-}" ]]; then
+        local _run_dir="${LOCAL_RESULTS_DIR}/${RUN_ID}"
+        if [[ -d "$_run_dir" ]]; then
+            echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Removing incomplete local results: $_run_dir"
+            rm -rf "$_run_dir"
+        fi
+    fi
+
     echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleanup complete."
 }
 trap cleanup_on_exit EXIT INT TERM
@@ -2285,6 +2294,98 @@ cp -r /opt/scrna-seed/index_output_transcriptome "$BUILD_DIR/"
 sed -i '/COPY.*aws.*credentials\|COPY.*\.aws\|COPY.*AWS_/d' "$BUILD_DIR/Dockerfile"
 
 log_info "Build context ready"
+
+################################################################################
+# Step 5b: Pre-flight cleanup — remove stale scrna resources from prior runs
+#   Frees reserved concurrency and avoids resource conflicts.
+################################################################################
+
+log_info "Pre-flight cleanup: checking for stale scrna resources from prior runs..."
+
+_stale_lambdas=$(aws lambda list-functions --region "$AWS_REGION" \
+    --query "Functions[?starts_with(FunctionName,'scrna-map-')].FunctionName" \
+    --output text 2>/dev/null || echo "")
+
+if [[ -n "$_stale_lambdas" && "$_stale_lambdas" != "None" ]]; then
+    for _fn in $_stale_lambdas; do
+        log_warn "Removing stale Lambda function: $_fn"
+        _fn_arn=$(aws lambda get-function --function-name "$_fn" \
+            --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text 2>/dev/null || echo "")
+
+        aws lambda delete-function-concurrency --function-name "$_fn" \
+            --region "$AWS_REGION" 2>/dev/null || true
+        aws lambda delete-function --function-name "$_fn" \
+            --region "$AWS_REGION" 2>/dev/null || true
+        aws logs delete-log-group --log-group-name "/aws/lambda/$_fn" \
+            --region "$AWS_REGION" 2>/dev/null || true
+
+        if [[ -n "$_fn_arn" && "$_fn_arn" != "None" ]]; then
+            _stale_rules=$(aws events list-rule-names-by-target --target-arn "$_fn_arn" \
+                --region "$AWS_REGION" --query 'RuleNames[]' --output text 2>/dev/null || echo "")
+            for _sr in $_stale_rules; do
+                _tids=$(aws events list-targets-by-rule --rule "$_sr" \
+                    --region "$AWS_REGION" --query 'Targets[].Id' --output text 2>/dev/null || echo "")
+                [[ -n "$_tids" ]] && aws events remove-targets --rule "$_sr" --ids $_tids \
+                    --region "$AWS_REGION" 2>/dev/null || true
+                aws events delete-rule --name "$_sr" --region "$AWS_REGION" 2>/dev/null || true
+            done
+        fi
+        aws events remove-targets --rule "${_fn}-rule" --ids "LambdaTarget" \
+            --region "$AWS_REGION" 2>/dev/null || true
+        aws events delete-rule --name "${_fn}-rule" \
+            --region "$AWS_REGION" 2>/dev/null || true
+    done
+fi
+
+_stale_roles=$(aws iam list-roles \
+    --query "Roles[?starts_with(RoleName,'scrna-lambda-role-')].RoleName" \
+    --output text 2>/dev/null || echo "")
+if [[ -n "$_stale_roles" && "$_stale_roles" != "None" ]]; then
+    for _sr in $_stale_roles; do
+        log_warn "Removing stale IAM role: $_sr"
+        aws iam list-attached-role-policies --role-name "$_sr" \
+            --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r _pa; do
+                [[ -n "$_pa" ]] && aws iam detach-role-policy --role-name "$_sr" \
+                    --policy-arn "$_pa" 2>/dev/null || true
+            done
+        aws iam list-role-policies --role-name "$_sr" \
+            --query 'PolicyNames[]' --output text 2>/dev/null | \
+            tr '\t' '\n' | while read -r _pn; do
+                [[ -n "$_pn" ]] && aws iam delete-role-policy --role-name "$_sr" \
+                    --policy-name "$_pn" 2>/dev/null || true
+            done
+        aws iam delete-role --role-name "$_sr" 2>/dev/null || true
+    done
+fi
+
+_stale_ecr=$(aws ecr describe-repositories --region "$AWS_REGION" \
+    --query "repositories[?starts_with(repositoryName,'scrna-serverless-')].repositoryName" \
+    --output text 2>/dev/null || echo "")
+if [[ -n "$_stale_ecr" && "$_stale_ecr" != "None" ]]; then
+    for _er in $_stale_ecr; do
+        log_warn "Removing stale ECR repository: $_er"
+        aws ecr delete-repository --repository-name "$_er" \
+            --force --region "$AWS_REGION" 2>/dev/null || true
+    done
+fi
+
+_stale_buckets=$(aws s3api list-buckets --query "Buckets[?starts_with(Name,'scrna-')].Name" \
+    --output text 2>/dev/null || echo "")
+if [[ -n "$_stale_buckets" && "$_stale_buckets" != "None" ]]; then
+    for _sb in $_stale_buckets; do
+        if [[ "$_sb" == "$INPUT_FASTQ_BUCKET" || "$_sb" == "$INPUT_TXT_BUCKET" || \
+              "$_sb" == "$OUTPUT_MAP_BUCKET" || "$_sb" == "$OUTPUT_QUANT_BUCKET" || \
+              "$_sb" == "${SSM_TRANSFER_BUCKET:-}" || "$_sb" == scrna-ssm-xfer-* ]]; then
+            continue
+        fi
+        log_warn "Removing stale S3 bucket: $_sb"
+        aws s3 rm "s3://$_sb" --recursive --region "$AWS_REGION" 2>/dev/null || true
+        aws s3 rb "s3://$_sb" --region "$AWS_REGION" 2>/dev/null || true
+    done
+fi
+
+log_info "Pre-flight cleanup complete."
 
 ################################################################################
 # Step 6: Setup Lambda and EventBridge (pure bash — no python)
