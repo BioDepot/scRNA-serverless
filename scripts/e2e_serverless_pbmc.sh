@@ -914,7 +914,7 @@ ssm_run_pipeline() {
             ("export RUN_QC=" + $run_qc),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
-        ], executionTimeout:["21600"]}')
+        ], executionTimeout:["86400"]}')
 
     local cmd_id
     cmd_id=$(aws ssm send-command \
@@ -922,7 +922,7 @@ ssm_run_pipeline() {
         --instance-ids "$instance_id" \
         --document-name "AWS-RunShellScript" \
         --parameters "$cmds_json" \
-        --timeout-seconds 21600 \
+        --timeout-seconds 86400 \
         --output-s3-bucket-name "$transfer_bucket" \
         --output-s3-key-prefix "ssm-output/$run_id" \
         --query 'Command.CommandId' --output text)

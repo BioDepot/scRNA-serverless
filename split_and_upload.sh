@@ -34,19 +34,19 @@ R1_BASE="${R1_FILE%.fastq.gz}"
 R2_BASE="${R2_FILE%.fastq.gz}"
 
 echo "Streaming & Splitting FASTQ files from S3 (split every $SPLIT_LINES lines)..."
-aws s3 cp "$R1_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
-aws s3 cp "$R2_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+aws s3 cp "$R1_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+aws s3 cp "$R2_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
 wait
 
 # Rename files to remove zero padding (_p00 -> _p0, _p01 -> _p1, etc.)
 echo "Renaming split files..."
 find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" | while read file; do
-    new_name=$(echo "$file" | sed -E 's/_p0([0-9])([^0-9]|$)/_p\1\2/')
+    new_name=$(echo "$file" | sed -E 's/_p0+([0-9])/_p\1/')
     [[ "$file" != "$new_name" ]] && mv "$file" "$new_name"
 done
 
 find /mnt/nvme/ -type f -name "${R2_BASE}_p*.fastq" | while read file; do
-    new_name=$(echo "$file" | sed -E 's/_p0([0-9])([^0-9]|$)/_p\1\2/')
+    new_name=$(echo "$file" | sed -E 's/_p0+([0-9])/_p\1/')
     [[ "$file" != "$new_name" ]] && mv "$file" "$new_name"
 done
 
