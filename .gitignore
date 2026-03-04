@@ -14,3 +14,6 @@ serverless_runs/
 runs/
 onserver_runs/
 *.log
+
+# Temp tarballs created during SSM transfer
+scrna-repo-*.tar.gz

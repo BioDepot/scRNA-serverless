@@ -22,7 +22,7 @@
 #   SEED_AMI_ID            Required in driver mode. AMI with pre-installed reference data.
 #   AWS_REGION             AWS region (default: us-east-2)
 #   INSTANCE_TYPE          EC2 instance type (default: m6id.16xlarge)
-#   ROOT_VOL_GB            EBS root volume size in GB (default: 200)
+#   ROOT_VOL_GB            EBS root volume size in GB (default: 500)
 #   KEY_NAME               Required in driver mode when USE_SSM=0. Existing EC2 keypair name.
 #   KEY_PEM_PATH           Required in driver mode when USE_SSM=0. Path to .pem file for SSH.
 #   SUBNET_ID              Required in driver mode. VPC subnet ID.
@@ -49,7 +49,7 @@
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
 #   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar. Auto-set by DATASET if empty.
-#   WRITE_H5AD             Save h5ad output from QC (default: 0). Only matters if RUN_QC=1.
+#   WRITE_H5AD             Save h5ad output from QC (default: 1). Only matters if RUN_QC=1.
 #   RUN_ID                 Run identifier (auto-generated if empty). Set to reuse prior resources.
 #
 # NOTE ON S3 BUCKET NAMES:
@@ -74,6 +74,7 @@ cleanup_on_exit() {
     local _region="${AWS_REGION:-us-east-2}"
 
     [[ -n "${FASTQ_DIR:-}" ]] && rm -f "${FASTQ_DIR}"/*.tmp 2>/dev/null || true
+    rm -f "${BASH_SOURCE[0]:+$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)}/scrna-repo-"*.tar.gz 2>/dev/null || true
 
     if [[ "${RUN_MODE:-0}" -ne 0 ]]; then return; fi
 
@@ -215,7 +216,7 @@ DEFAULT_AWS_REGION="us-east-2"
 DEFAULT_KEY_NAME=""
 DEFAULT_KEY_PEM_PATH=""
 DEFAULT_EC2_INSTANCE_PROFILE_NAME=""
-DEFAULT_SEED_AMI_ID="ami-0b80485dc95b72c33"  # Author's seed AMI (hardcoded for reproducibility)
+DEFAULT_SEED_AMI_ID="ami-079f71ff8e580ef1f"  # Author's seed AMI (hardcoded for reproducibility)
 SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name (for reviewers)
 SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher account ID
 AUTO_PICK_SUBNET=1                 # Auto-pick subnet from default VPC
@@ -263,7 +264,7 @@ FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
-PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-21600}"
+PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 
 # Derived values (will be set later)
@@ -985,6 +986,7 @@ ssm_run_pipeline() {
         --arg write_h5ad "$WRITE_H5AD" \
         --arg run_id "$run_id" \
         --arg run_qc "$RUN_QC" \
+        --arg split_lines "$SPLIT_LINES" \
         --arg concurrency "${LAMBDA_CONCURRENCY:-0}" \
         --arg user "$SSH_USER" \
         --arg ds "$dataset" \
@@ -1004,6 +1006,7 @@ ssm_run_pipeline() {
             ("export WRITE_H5AD=" + $write_h5ad),
             ("export RUN_ID=" + $run_id),
             ("export RUN_QC=" + $run_qc),
+            ("export SPLIT_LINES=" + $split_lines),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
         ], executionTimeout:["86400"]}')
@@ -1885,9 +1888,12 @@ if [[ $RUN_MODE -eq 0 ]]; then
     ############################################################################
     log_info "Copying repository to instance..."
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-    TARBALL_LOCAL="/tmp/scrna-repo-${RUN_ID}.tar.gz"
+    TARBALL_LOCAL="$(dirname "$REPO_DIR")/scrna-repo-${RUN_ID}.tar.gz"
     
-    tar -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
+    tar --exclude='serverless_runs' --exclude='onserver_runs' --exclude='runs' \
+        --exclude='.git' --exclude='*.log' --exclude='scrna-repo-*.tar.gz' \
+        --exclude='MASTER_PROMPT.md' --exclude='.vscode' --exclude='.idea' \
+        -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
     
     if [[ "$CONNECT_METHOD" == "ssh" ]]; then
         TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
@@ -1937,6 +1943,7 @@ export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
 export RUN_ID=$RUN_ID
 export RUN_QC=$RUN_QC
+export SPLIT_LINES=$SPLIT_LINES
 
 cd /home/${SSH_USER}/scrna-repo
 bash scripts/e2e_serverless_pbmc.sh $DATASET --run
@@ -2475,6 +2482,15 @@ set_lambda_concurrency() {
     LAMBDA_CONCURRENCY="unrestricted"
 }
 set_lambda_concurrency "$LAMBDA_CONCURRENCY"
+
+# 6d3: Auto-adjust SPLIT_LINES for low-concurrency accounts
+if [[ "$LAMBDA_CONCURRENCY" != "unrestricted" && "$LAMBDA_CONCURRENCY" -le 25 && "$DATASET" == "pbmc10k" ]]; then
+    SPLIT_LINES="${SPLIT_LINES:-32000000}"
+    log_info "Low concurrency ($LAMBDA_CONCURRENCY) + pbmc10k: using SPLIT_LINES=$SPLIT_LINES (8M reads/shard)"
+else
+    SPLIT_LINES="${SPLIT_LINES:-16000000}"
+fi
+export SPLIT_LINES
 
 # 6e: Create EventBridge rule to trigger Lambda
 RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"

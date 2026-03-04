@@ -26,7 +26,9 @@ The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parall
 
 Free-tier instances (t3.micro/small/medium) are too small. The script selects the best instance your account supports automatically. You do not manually launch any EC2 instance. See [Paper Differences](PAPER_DIFFERENCES.md) for the full instance fallback chain.
 
-**Storage:** The script creates a 200 GB EBS root volume. A 200 GB volume for a 15-minute run costs ~$0.01-$0.02. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
+**Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
+
+**Local disk space:** Keep at least **1 GB free** (PBMC 1K) or **20 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
 
 ---
 
@@ -114,7 +116,7 @@ Set these every time before a run:
 
 ```bash
 export AWS_REGION="us-east-2"
-export SEED_AMI_ID="ami-0b80485dc95b72c33"
+export SEED_AMI_ID="ami-079f71ff8e580ef1f"
 export EC2_INSTANCE_PROFILE_NAME="scrna-serverless-ec2-role"
 export KEY_NAME="scrna-reviewer-key"
 export KEY_PEM_PATH="/d/Keys/scrna-reviewer-key.pem"
@@ -188,7 +190,7 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 | Flag | Default | Effect |
 |---|---|---|
 | `RUN_QC` | `1` | QC analysis (UMAP + violin). `0` to skip. |
-| `WRITE_H5AD` | `0` | Save `.h5ad` file. Needs `RUN_QC=1`. |
+| `WRITE_H5AD` | `1` | Save `.h5ad` file. Needs `RUN_QC=1`. |
 | `CLEANUP_AWS` | `1` | Delete AWS infrastructure after run. `0` to keep. |
 | `CLEANUP_RESULTS` | `1` | Delete results S3 bucket after run. `0` to keep for manual download. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | Terminate EC2 after run. `0` to keep. |
@@ -211,8 +213,8 @@ serverless_runs/
   │   └── unmapped_bc_count.bin
   ├── alevin_output/alevin/
   │   ├── quants_mat.mtx                <-- *** COUNT MATRIX ***
-  │   ├── quants_mat_rows.txt           <-- Gene names
-  │   └── quants_mat_cols.txt           <-- Cell barcodes
+  │   ├── quants_mat_rows.txt           <-- Cell barcodes
+  │   └── quants_mat_cols.txt           <-- Gene names
   └── qc_output/                        <-- If RUN_QC=1
       ├── umap_leiden.png
       ├── qc_violin.png
@@ -241,15 +243,15 @@ Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
 
 | Setting | Line | Default | Effect |
 |---|---|---|---|
-| `DEFAULT_SEED_AMI_ID` | 128 | `ami-0b80485dc95b72c33` | Seed AMI |
-| `DEFAULT_AWS_REGION` | 124 | `us-east-2` | Region |
-| `INSTANCE_TYPE` | 143 | `m6id.16xlarge` | EC2 type |
-| `ROOT_VOL_GB` | 144 | `200` | EBS size (GB) |
-| `LAMBDA_MEMORY_MB` | 157 | `10240` | Lambda RAM |
-| `LAMBDA_TIMEOUT_SEC` | 159 | `900` | Lambda timeout |
-| `RUN_QC` | 165 | `1` | QC on/off |
-| `WRITE_H5AD` | 172 | `0` | h5ad on/off |
-| `LOCAL_RESULTS_DIR` | 167 | `./serverless_runs` | Output dir |
+| `DEFAULT_SEED_AMI_ID` | 219 | `ami-079f71ff8e580ef1f` | Seed AMI |
+| `DEFAULT_AWS_REGION` | 215 | `us-east-2` | Region |
+| `INSTANCE_TYPE` | 234 | `m6id.16xlarge` | EC2 type |
+| `ROOT_VOL_GB` | 235 | `500` | EBS size (GB) |
+| `LAMBDA_MEMORY_MB` | 248 | `10240` | Lambda RAM |
+| `LAMBDA_TIMEOUT_SEC` | 250 | `900` | Lambda timeout |
+| `RUN_QC` | 258 | `1` | QC on/off |
+| `WRITE_H5AD` | 265 | `1` | h5ad on/off |
+| `LOCAL_RESULTS_DIR` | 260 | `./serverless_runs` | Output dir |
 
 ---
 

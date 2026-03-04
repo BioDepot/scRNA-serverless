@@ -4,7 +4,7 @@
 #
 # MAINTAINER-ONLY TOOL — DO NOT RUN
 #
-# This script documents how the public seed AMI (ami-0b80485dc95b72c33) was
+# This script documents how the public seed AMI (ami-079f71ff8e580ef1f) was
 # created. It is kept in the repository for reproducibility and transparency
 # so reviewers can see exactly how the AMI was built. The AMI is already
 # public in us-east-2 and hardcoded in e2e_serverless_pbmc.sh — there is no

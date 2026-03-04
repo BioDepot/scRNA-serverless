@@ -62,8 +62,8 @@ onserver_runs/<run-id>/
 ├── alevin_output/
 │   ├── alevin/
 │   │   ├── quants_mat.mtx          <-- *** COUNT MATRIX ***
-│   │   ├── quants_mat_rows.txt     <-- Gene names
-│   │   └── quants_mat_cols.txt     <-- Cell barcodes
+│   │   ├── quants_mat_rows.txt     <-- Cell barcodes
+│   │   └── quants_mat_cols.txt     <-- Gene names
 │   ├── map.collated.rad            <-- Collated RAD file
 │   ├── permit_freq.bin             <-- Permit frequencies
 │   ├── permit_map.bin              <-- Permit map

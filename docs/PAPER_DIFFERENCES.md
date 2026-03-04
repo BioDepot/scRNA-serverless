@@ -33,9 +33,9 @@ The paper uses a fixed **m6id.16xlarge** (64 vCPUs, 256 GB RAM). This repo tries
 | t3.xlarge | 4 | 16 GB | Min for PBMC 10K |
 | t3.large | 2 | 8 GB | Min for PBMC 1K |
 
-### EBS root volume: 500 GB → 200 GB
+### EBS root volume: 500 GB (unchanged)
 
-The paper uses a 500 GB root volume. This repo defaults to **200 GB**, which is sufficient for both datasets. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used.
+This repo defaults to **500 GB**, matching the paper. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
 
 ### NVMe storage: required → optional
 
@@ -52,9 +52,20 @@ The paper assumes NVMe instance storage (m6id family). This repo falls back to t
 | Split threshold | 7 GB | 7 GB or 0 (auto) |
 | Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads (unchanged) |
 | EC2 driver instance | m6id.16xlarge | m6id.16xlarge (fallback chain) |
-| EBS root volume | 500 GB | 200 GB |
+| EBS root volume | 500 GB | 500 GB (unchanged) |
 | NVMe storage | Required | Optional (EBS fallback) |
 | Lambda timeout | 900 s | 900 s (unchanged) |
+
+### Local disk space requirements
+
+The script creates a temporary tarball (~200 MB) in the repo directory during setup, uploads it to EC2, then deletes it. Results are also downloaded to the repo directory under `serverless_runs/`. Keep this much free space on the drive where you cloned the repository:
+
+| Dataset | Temp space (deleted after upload) | Results download | Total recommended free |
+|---|---|---|---|
+| PBMC 1K | ~200 MB | ~200 MB | ~1 GB |
+| PBMC 10K | ~200 MB | ~10-15 GB | ~20 GB |
+
+The FASTQs and intermediate files stay on the EC2 instance (500 GB EBS). Only the final count matrix, QC plots, and merged .rad file are downloaded locally.
 
 All other steps (alevin-fry generate-permit-list, collate, quant, resource creation, cleanup) are identical.
 
@@ -84,7 +95,7 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 | Variable | Example | Purpose |
 |---|---|---|
 | `AWS_REGION` | `us-east-2` | AWS region (must match AMI) |
-| `SEED_AMI_ID` | `ami-0b80485dc95b72c33` | Pre-built seed AMI |
+| `SEED_AMI_ID` | `ami-079f71ff8e580ef1f` | Pre-built seed AMI |
 | `EC2_INSTANCE_PROFILE_NAME` | `scrna-serverless-ec2-role` | IAM role for EC2 |
 | `KEY_NAME` | `scrna-reviewer-key` | EC2 keypair name |
 | `KEY_PEM_PATH` | `/d/Keys/scrna-reviewer-key.pem` | Path to PEM file |
@@ -116,7 +127,7 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 > aws s3 rb s3://scrna-quant-<ACCOUNT_ID>-us-east-2-<RUN_ID> --force --region us-east-2
 > ```
 | `INSTANCE_TYPE` | `m6id.16xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
-| `ROOT_VOL_GB` | `200` | EBS root volume size in GB. |
+| `ROOT_VOL_GB` | `500` | EBS root volume size in GB. |
 | `LAMBDA_MEMORY_MB` | `10240` | Lambda memory in MB (falls back to 3008 if quota exceeded). |
 | `LAMBDA_EPHEMERAL_MB` | `10240` | Lambda ephemeral storage in MB. |
 | `LAMBDA_TIMEOUT_SEC` | `900` | Lambda function timeout in seconds. |
