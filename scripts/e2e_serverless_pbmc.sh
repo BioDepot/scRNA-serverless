@@ -1689,17 +1689,21 @@ if [[ $RUN_MODE -eq 0 ]]; then
                     break 2
                 fi
                 _err_msg=$(cat "$_launch_err" 2>/dev/null); rm -f "$_launch_err"
+                # Hard-fail on errors that won't be fixed by trying a smaller instance
+                if [[ "$_err_msg" == *"AuthFailure"* || "$_err_msg" == *"UnauthorizedOperation"* \
+                   || "$_err_msg" == *"InvalidAMIID"* || "$_err_msg" == *"InvalidGroup"* \
+                   || "$_err_msg" == *"InvalidSubnetID"* || "$_err_msg" == *"InvalidKeyPair"* ]]; then
+                    die "Failed to launch EC2 instance ($_try_type): $_err_msg"
+                fi
                 if [[ "$_err_msg" == *"InsufficientInstanceCapacity"* ]]; then
                     log_warn "Instance type $_try_type unavailable in $(echo "$_try_subnet" | head -c 20)...: capacity issue, trying next AZ..."
                     DRIVER_INSTANCE_ID=""
                     continue
                 fi
-                if [[ "$_err_msg" == *"VcpuLimitExceeded"* || "$_err_msg" == *"InstanceLimitExceeded"* || "$_err_msg" == *"Unsupported"* ]]; then
-                    log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
-                    DRIVER_INSTANCE_ID=""
-                    break
-                fi
-                die "Failed to launch EC2 instance ($_try_type): $_err_msg"
+                # Any other error (quota, free-tier restriction, unsupported type, etc.) — try next instance type
+                log_warn "Instance type $_try_type unavailable: ${_err_msg##*:}"
+                DRIVER_INSTANCE_ID=""
+                break
             done
             [[ -n "$DRIVER_INSTANCE_ID" ]] && break
         done
