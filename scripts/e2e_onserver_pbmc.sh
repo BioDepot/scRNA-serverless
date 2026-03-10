@@ -48,16 +48,23 @@ set -euo pipefail
 # Helper Functions
 ################################################################################
 
+_mask() {
+    local s="$*"
+    [[ -n "${SERVER_HOST:-}" ]] && s="${s//$SERVER_HOST/***}"
+    [[ -n "${SSH_USER:-}" ]]   && s="${s//$SSH_USER/***}"
+    echo "$s"
+}
+
 log_info() {
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
+    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $(_mask "$*")" >&2
 }
 
 log_error() {
-    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
+    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') $(_mask "$*")" >&2
 }
 
 log_warn() {
-    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
+    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') $(_mask "$*")" >&2
 }
 
 die() {
@@ -132,7 +139,7 @@ load_dotenv
 # SSH Configuration & Helpers
 ################################################################################
 
-SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30 -o LogLevel=ERROR"
 SSH_KEY_FILE="$HOME/.ssh/id_ed25519_scrna"
 
 setup_ssh_keys() {
@@ -346,7 +353,7 @@ if [[ $RUN_MODE -eq 0 && $DRY_RUN_MODE -eq 0 ]]; then
     ########################################################################
     log_info "Testing SSH connectivity to $SSH_TARGET..."
     if ! run_ssh "echo SSH_OK" >/dev/null 2>&1; then
-        die "Cannot SSH to $SSH_TARGET. Check credentials in .env"
+        die "Cannot SSH to server. Check credentials in .env"
     fi
     log_info "SSH connection verified."
 
@@ -462,6 +469,8 @@ export T2G_PATH=\"${T2G_PATH}\"
 export FASTQ_BASE_DIR=\"${FASTQ_BASE_DIR}\"
 export SERVER_RUN_DIR=\"${SERVER_RUN_DIR}\"
 export PIPELINE_SUDO_PASS=\"${SSH_PASSWORD}\"
+export SSH_USER=\"${SSH_USER}\"
+export SERVER_HOST=\"${SERVER_HOST}\"
 
 cd ${REMOTE_REPO_DIR}
 bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
@@ -639,7 +648,7 @@ if [[ $DRY_RUN_MODE -eq 1 ]]; then
         if run_ssh "echo ok" >/dev/null 2>&1; then
             log_info "  [OK] SSH connection to server"
         else
-            log_error "  [FAIL] Cannot SSH into ${SSH_USER}@${SERVER_HOST}"
+            log_error "  [FAIL] Cannot SSH into server"
             ERRORS=$((ERRORS + 1))
         fi
     fi
