@@ -1654,7 +1654,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
         # For each type, try ALL available AZs/subnets before falling back to a smaller type.
         INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
         if [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
-            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large" "t3.medium" "t3.small" "t3.micro")
+            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large" "m7i-flex.large" "t3.medium" "c7i-flex.large" "t3.small" "t3.micro")
         fi
         
         # Build list of subnets to try: auto-picked subnets across AZs, or just the one set
