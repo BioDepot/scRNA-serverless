@@ -162,7 +162,7 @@ onserver_runs/<run-id>/
 
 ## Pipeline steps
 
-The pipeline executes the same steps described in Table 2 of the paper:
+The pipeline executes the Piscem-Alevin Fry steps described in the Methods section of the paper:
 
 | Step | Tool | Output |
 |---|---|---|
@@ -211,17 +211,13 @@ What is **never** deleted:
 
 ## Credentials
 
-Server credentials are stored as **GitHub Secrets** — encrypted, injected at runtime, never visible in logs or code. Three secrets are required:
+Server credentials are stored as **GitHub Secrets** — encrypted, injected at runtime, never visible in logs or code. Three secrets are required: `SSH_USER`, `SSH_PASSWORD`, and `SERVER_HOST`. All three must be configured for whichever method you use:
 
-| Secret | Description | Where to set |
-|---|---|---|
-| `SSH_USER` | Server username | GitHub Actions: repo **Settings → Secrets** |
-| `SSH_PASSWORD` | Server password | Codespaces: **github.com/settings/codespaces** |
-| `SERVER_HOST` | Server IP address | Local: `.env` file (see Option C) |
-
-- **GitHub Actions** reads secrets from the repository settings (set by the repo owner).
-- **Codespaces** reads secrets from your personal Codespaces settings (set by each user).
-- **Local terminal** reads from a `.env` file you create (never committed to Git).
+| Method | Where to set all 3 secrets |
+|---|---|
+| GitHub Actions | Repo **Settings → Secrets and variables → Actions** (set by repo owner) |
+| Codespaces | **github.com/settings/codespaces** (set by each user) |
+| Local terminal | `.env` file in the repo root (see Option C) |
 
 All output — including third-party tool logs from piscem, alevin-fry, and Python — is automatically masked. The username and IP are replaced with `***` in every log line.
 
