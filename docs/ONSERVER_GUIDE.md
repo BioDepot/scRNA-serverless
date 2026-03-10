@@ -1,29 +1,39 @@
 # On-Server Pipeline Guide
 
-Run the scRNA-seq pipeline on a dedicated Linux server at UW Tacoma. Trigger it by clicking a button on GitHub. No local setup required.
+Run the scRNA-seq pipeline on a dedicated Linux server at UW Tacoma. Three ways to trigger it — all produce identical results:
+
+| Method | What you need | Best for |
+|---|---|---|
+| **GitHub Actions** | Web browser + GitHub account | One-click runs, artifact download |
+| **GitHub Codespaces** | Web browser + GitHub account | Interactive terminal, live output |
+| **Local terminal** | Git Bash / terminal + `.env` file | Running against your own server |
 
 > **No AWS account needed.** No S3, no Lambda, no EC2.
 
-## What you need
+---
+
+## Option A: GitHub Actions (recommended)
+
+### What you need
 
 - A web browser
 - A GitHub account ([sign up free](https://github.com/signup))
 
-## Steps
+### Steps
 
-### 1. Go to the repository
+#### 1. Go to the repository
 
 Open **https://github.com/BioDepot/scRNA-serverless** in your browser.
 
-### 2. Open the Actions tab
+#### 2. Open the Actions tab
 
 Click **Actions** in the top navigation bar.
 
-### 3. Select the workflow
+#### 3. Select the workflow
 
 Click **On-Server scRNA Pipeline** in the left sidebar.
 
-### 4. Configure and run
+#### 4. Configure and run
 
 Click **Run workflow**. A dropdown appears with these options:
 
@@ -35,20 +45,86 @@ Click **Run workflow**. A dropdown appears with these options:
 
 Click the green **Run workflow** button.
 
-### 5. Wait for completion
+#### 5. Wait for completion
 
 Click the running workflow to watch live logs. A green checkmark means it finished successfully.
 
 - **PBMC 1K** typically takes 3–5 minutes total
 - **PBMC 10K** typically takes 15–25 minutes total (longer if FASTQs need downloading)
 
-### 6. Download results
+#### 6. Download results
 
 Scroll to **Artifacts** at the bottom of the completed run. Click the artifact (e.g. `onserver-pbmc1k-results`) to download a ZIP file.
 
-### 7. Open results
+---
 
-Unzip the file. Full contents:
+## Option B: GitHub Codespaces
+
+Run the pipeline from an interactive cloud terminal — no local software needed.
+
+### What you need
+
+- A web browser
+- A GitHub account ([sign up free](https://github.com/signup))
+
+### One-time setup
+
+#### 1. Add Codespaces secrets
+
+Go to **https://github.com/settings/codespaces** and add three secrets:
+
+| Secret name | Value | Repository access |
+|---|---|---|
+| `SSH_USER` | Server username | `BioDepot/scRNA-serverless` |
+| `SSH_PASSWORD` | Server password | `BioDepot/scRNA-serverless` |
+| `SERVER_HOST` | Server IP address | `BioDepot/scRNA-serverless` |
+
+These are the same credentials used by GitHub Actions. Set each secret's repository access to **BioDepot/scRNA-serverless** (or "All repositories").
+
+#### 2. Create a Codespace
+
+Go to the repository on GitHub. Click **Code** → **Codespaces** → **Create codespace on pr/repro-ami-e2e** (or the branch with the pipeline code).
+
+The Codespace will build automatically using the included `.devcontainer/devcontainer.json` configuration, which installs `sshpass` and Python.
+
+### Running the pipeline
+
+Once the Codespace terminal is ready:
+
+```bash
+# Dry-run (verify connectivity, tools, references, disk — takes < 1 min)
+bash scripts/e2e_onserver_pbmc.sh pbmc1k --dry-run
+
+# Full run — PBMC 1K (~3–5 min)
+bash scripts/e2e_onserver_pbmc.sh pbmc1k
+
+# Full run — PBMC 10K (~15–25 min)
+bash scripts/e2e_onserver_pbmc.sh pbmc10k
+```
+
+Optional flags:
+
+```bash
+RUN_QC=0 bash scripts/e2e_onserver_pbmc.sh pbmc1k          # skip QC
+WRITE_H5AD=1 bash scripts/e2e_onserver_pbmc.sh pbmc1k       # save h5ad
+```
+
+### Where are results?
+
+Results are downloaded to the `onserver_runs/` directory inside the Codespace. You can browse them in the Codespace file explorer (left sidebar) or download them from the terminal:
+
+1. Right-click any file in the file explorer → **Download**
+2. Or use the terminal: the files are at `onserver_runs/<run-id>/`
+
+### Credential safety
+
+Codespaces secrets are injected as environment variables at startup. They are **never** visible in code, terminal history, or logs — the pipeline automatically masks the username and IP in all output (including third-party tool logs), replacing them with `***`.
+
+---
+
+## Output structure
+
+Whether you use Actions, Codespaces, or a local terminal, the output directory looks the same:
 
 ```
 onserver_runs/<run-id>/
@@ -135,17 +211,23 @@ What is **never** deleted:
 
 ## Credentials
 
-Server credentials are stored as **GitHub Secrets** — encrypted, injected at runtime, never visible in logs or code. Three secrets are configured:
+Server credentials are stored as **GitHub Secrets** — encrypted, injected at runtime, never visible in logs or code. Three secrets are required:
 
-- `SSH_USER` — server username
-- `SSH_PASSWORD` — server password
-- `SERVER_HOST` — server IP address
+| Secret | Description | Where to set |
+|---|---|---|
+| `SSH_USER` | Server username | GitHub Actions: repo **Settings → Secrets** |
+| `SSH_PASSWORD` | Server password | Codespaces: **github.com/settings/codespaces** |
+| `SERVER_HOST` | Server IP address | Local: `.env` file (see Option C) |
 
-These are set once by the repository owner and never need to be touched by reviewers.
+- **GitHub Actions** reads secrets from the repository settings (set by the repo owner).
+- **Codespaces** reads secrets from your personal Codespaces settings (set by each user).
+- **Local terminal** reads from a `.env` file you create (never committed to Git).
+
+All output — including third-party tool logs from piscem, alevin-fry, and Python — is automatically masked. The username and IP are replaced with `***` in every log line.
 
 ---
 
-## Using your own server (advanced)
+## Option C: Local terminal / your own server (advanced)
 
 If you want to run the pipeline on your own server instead of the UW Tacoma server:
 
@@ -192,10 +274,12 @@ bash scripts/e2e_onserver_pbmc.sh pbmc10k                    # run 10K dataset
 
 | Error | Fix |
 |---|---|
-| "SERVER_HOST and SSH_USER are not set" | GitHub Secrets not configured. Contact the repository owner. |
+| "SERVER_HOST and SSH_USER are not set" | **Actions:** GitHub Secrets not configured — contact the repo owner. **Codespaces:** add secrets at github.com/settings/codespaces with access to this repo. **Local:** create a `.env` file from `.env.example`. |
 | "Insufficient disk space" | Previous run may not have cleaned up. The pre-run cleanup should handle this automatically. If it persists, contact authors. |
 | "No such file or directory: e2e_onserver_pbmc.sh" | Wrong branch selected. Make sure you pick the branch with the pipeline code (e.g. `pr/repro-ami-e2e`), not `master`. |
 | Stuck on "Downloading FASTQ files" | PBMC 1K is ~5 GB, 10K is ~44 GB. First download takes time. Subsequent runs use cache. |
-| No artifacts after run | Make sure you selected `full-run`, not `dry-run`. |
-| Where are old runs? | **Actions** tab → click any previous run → download artifact (kept 30 days). |
+| No artifacts after Actions run | Make sure you selected `full-run`, not `dry-run`. |
+| Where are old runs? | **Actions:** click any previous run → download artifact (kept 30 days). **Codespaces:** check `onserver_runs/` in the file explorer. |
 | Run cancelled / interrupted | No cleanup needed. The next run auto-cleans leftover files before starting. |
+| Codespace can't connect to server | Run `echo $SSH_USER` in the terminal — if blank, your Codespaces secrets aren't set or don't have access to this repo. |
+| Codespace shows raw IP/username | Pull the latest code: `git pull origin pr/repro-ami-e2e`. The masking fix requires the latest version. |

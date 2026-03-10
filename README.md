@@ -70,5 +70,5 @@ cd ~/refactored-serverless-pipeline
 | Guide | Description |
 |---|---|
 | [Reproducibility Notes](docs/REPRODUCIBILITY_NOTES.md) | Automatic fallbacks for AWS account limits, configuration reference, and local disk requirements |
-| [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) | Step-by-step instructions to run the pipeline on the UW Tacoma server via GitHub Actions |
+| [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) | Run the pipeline on the UW Tacoma server via GitHub Actions, Codespaces, or local terminal |
 | [Serverless Pipeline Guide](docs/SERVERLESS_GUIDE.md) | Step-by-step instructions to run the serverless pipeline on your own AWS account |
