@@ -8,8 +8,10 @@ The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parall
 
 ## Requirements
 
+**Tested on:** Windows (Git Bash).
+
 **Local software:**
-- [Git for Windows](https://gitforwindows.org/) (includes Git Bash) — Mac/Linux: built in
+- [Git for Windows](https://gitforwindows.org/) (includes Git Bash)
 - [AWS CLI v2](https://aws.amazon.com/cli/) — verify with `aws --version`
 
 **AWS account:**
@@ -36,7 +38,7 @@ Free-tier instances (t3.micro/small/medium) are too small. The script selects th
 
 ### A) Install software
 
-1. Install **Git for Windows** (includes Git Bash). Mac/Linux: skip this.
+1. Install **Git for Windows** (includes Git Bash).
 2. Install **AWS CLI v2**. Verify:
 
 ```bash
@@ -45,14 +47,19 @@ aws --version
 
 ### B) Configure AWS credentials
 
-1. In the AWS Console: **IAM → Users → your user → Security credentials → Create access key**
-2. Run in Git Bash:
+1. In the AWS Console: click your **username** (top right) → **Security credentials** → **Access keys** → **Create access key**. Follow the prompts; choose "Command Line Interface (CLI)" if asked. **Save the Access Key ID and Secret Access Key** — the secret is shown only once.
+2. Open **Git Bash** and run:
 
 ```bash
 aws configure
 ```
 
-3. Enter your Access Key ID, Secret Access Key, region `us-east-2`, output `json`.
+3. When prompted, enter:
+   - **AWS Access Key ID:** (paste the Access Key ID you saved)
+   - **AWS Secret Access Key:** (paste the Secret Access Key you saved)
+   - **Default region name:** `us-east-2`
+   - **Default output format:** `json`
+
 4. Verify:
 
 ```bash
@@ -64,9 +71,10 @@ aws sts get-caller-identity
 ### C) Create IAM role
 
 1. AWS Console → **IAM → Roles → Create role**
-2. Trusted entity: **AWS service → EC2** → Next
-3. Search `AdministratorAccess`, check it → Next
-4. Role name: `scrna-serverless-ec2-role` → Create role
+2. **Trusted entity type:** select **AWS service**
+3. **Use case:** select **EC2** (so the role can be used by EC2 instances) → Next
+4. Search `AdministratorAccess`, check it → Next
+5. Role name: `scrna-serverless-ec2-role` → Create role
 
 This role name is your `EC2_INSTANCE_PROFILE_NAME`.
 
@@ -78,9 +86,7 @@ This role name is your `EC2_INSTANCE_PROFILE_NAME`.
 2. Create key pair: name `scrna-reviewer-key`, type **RSA**, format **.pem**
 3. Save the downloaded `.pem` file to a permanent location (e.g. `D:\Keys\scrna-reviewer-key.pem`)
 
-**Fix PEM permissions:**
-
-Windows (run in **PowerShell**, not Git Bash):
+**Fix PEM permissions** (run in **PowerShell**, not Git Bash):
 
 ```powershell
 $Pem = "D:\Keys\scrna-reviewer-key.pem"
@@ -91,11 +97,7 @@ icacls "$Pem" /grant:r "SYSTEM:R"
 icacls "$Pem" /remove "Users" "Everyone"
 ```
 
-Mac/Linux:
-
-```bash
-chmod 600 ~/.ssh/scrna-reviewer-key.pem
-```
+Use the path where you saved your `.pem` file in place of `D:\Keys\scrna-reviewer-key.pem`.
 
 ### E) Clone the repository
 
@@ -315,4 +317,4 @@ With `t3.xlarge`: EC2 drops to ~$0.01-$0.03 for PBMC 1K.
 | Results not downloaded | Check `DOWNLOAD_RESULTS=1`. Results also on EC2 at `/mnt/nvme/runs/<RUN_ID>/` |
 | `$'\r': command not found` | Fix line endings: `sed -i 's/\r$//' scripts/*.sh install_scripts/*.sh *.sh` |
 | `icacls` fails in Git Bash | Run `icacls` in **PowerShell** only (Step D) |
-| `uname -a` shows Linux/Microsoft | You're in WSL. Open **Git Bash** instead. |
+| `uname -a` shows Linux/Microsoft | You're in WSL. Open **Git Bash** instead (this guide is for Windows). |
