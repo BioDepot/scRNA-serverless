@@ -574,7 +574,7 @@ bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
         if [[ -f "$LOCAL_RUN_DIR/timing_summary.txt" ]]; then
             log_info ""
             log_info "=== TIMING SUMMARY ==="
-            cat "$LOCAL_RUN_DIR/timing_summary.txt" >&2
+            while IFS= read -r _ts_line; do log_info "$_ts_line"; done < "$LOCAL_RUN_DIR/timing_summary.txt"
         fi
 
         ####################################################################
@@ -764,6 +764,17 @@ fi
 ##                                                                            ##
 ################################################################################
 ################################################################################
+
+################################################################################
+# Global output filter — masks credentials in ALL output (including
+# third-party tools like piscem, alevin-fry, python that print raw paths).
+################################################################################
+_MASK_SED=""
+[[ -n "${SSH_USER:-}" ]]   && _MASK_SED+="s/${SSH_USER}/***/g;"
+[[ -n "${SERVER_HOST:-}" ]] && _MASK_SED+="s/${SERVER_HOST}/***/g;"
+if [[ -n "$_MASK_SED" ]]; then
+    exec > >(sed -u "$_MASK_SED") 2> >(sed -u "$_MASK_SED" >&2)
+fi
 
 log_info "======== E2E On-Server scRNA Pipeline (RUN MODE) ========"
 log_info "Dataset: $DATASET"
@@ -1268,15 +1279,24 @@ RAM_GB=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}' || echo 'unknown')
 PISCEM_VERSION=$(piscem --version 2>&1 | head -1)
 ALEVIN_FRY_VERSION=$(alevin-fry --version 2>&1 | head -1)
 RADTK_VERSION=$(radtk --version 2>&1 | head -1 || echo 'unknown')
-PISCEM_INDEX_DIR=$PISCEM_INDEX_DIR
-T2G_PATH=$T2G_PATH
-FASTQ_DIR=$FASTQ_DIR
-RUN_DIR=$RUN_DIR
+PISCEM_INDEX_DIR=$(_mask "$PISCEM_INDEX_DIR")
+T2G_PATH=$(_mask "$T2G_PATH")
+FASTQ_DIR=$(_mask "$FASTQ_DIR")
+RUN_DIR=$(_mask "$RUN_DIR")
 RUN_QC=$RUN_QC
 WRITE_H5AD=$WRITE_H5AD
 EOF
 
 log_info "Run metadata saved to $RUN_DIR/run.env"
+
+################################################################################
+# Sanitize log files — strip credentials from saved artifacts
+################################################################################
+if [[ -n "${_MASK_SED:-}" ]]; then
+    for _lf in "$RUN_DIR"/*.log "$RUN_DIR/run.env"; do
+        [[ -f "$_lf" ]] && sed -i "$_MASK_SED" "$_lf"
+    done
+fi
 
 ################################################################################
 # Timing Summary
