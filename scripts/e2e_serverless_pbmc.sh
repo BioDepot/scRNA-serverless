@@ -264,6 +264,7 @@ FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
+SPLIT_LINES="${SPLIT_LINES:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
 
@@ -1974,7 +1975,7 @@ SSHEOF
             # SSM: create tarball on instance, upload to S3, download locally
             ssm_run_command "$DRIVER_INSTANCE_ID" \
                 "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
-                600
+                43200
             aws s3 cp "s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz" \
                 "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" \
                 --region "$AWS_REGION" --only-show-errors
@@ -2478,8 +2479,18 @@ set_lambda_concurrency() {
         fi
         log_warn "Concurrency $c rejected by account quota, trying lower..."
     done
-    log_warn "All concurrency levels rejected — running with unrestricted concurrency"
-    LAMBDA_CONCURRENCY="unrestricted"
+    # All reservation attempts failed — query actual account concurrency limit
+    local acct_limit
+    acct_limit=$(aws lambda get-account-settings --region "$AWS_REGION" \
+        --query 'AccountLimit.UnreservedConcurrentExecutions' --output text 2>/dev/null) || acct_limit=""
+
+    if [[ -n "$acct_limit" && "$acct_limit" =~ ^[0-9]+$ && "$acct_limit" -gt 0 ]]; then
+        LAMBDA_CONCURRENCY="$acct_limit"
+        log_warn "Could not reserve concurrency — account limit is $acct_limit (unreserved)"
+    else
+        LAMBDA_CONCURRENCY="unrestricted"
+        log_warn "Could not determine account concurrency limit — running unrestricted"
+    fi
 }
 set_lambda_concurrency "$LAMBDA_CONCURRENCY"
 
