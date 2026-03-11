@@ -8,7 +8,6 @@ scripts/__pycache__/
 # IDE/editor
 .vscode/
 .idea/
-.cursor/
 
 # Pipeline run outputs
 serverless_runs/
