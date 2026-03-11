@@ -5,8 +5,7 @@ set -euo pipefail
 #  compare_results.sh
 #  Compare two scRNA-seq pipeline result directories (e.g. serverless vs
 #  on-server / GitHub Actions).  Checks matrices, barcodes, gene lists,
-#  quantification metrics, per-barcode QC stats, and prints timing side by
-#  side.
+#  quantification metrics, and per-barcode QC stats.
 # ---------------------------------------------------------------------------
 
 # ── colour helpers ────────────────────────────────────────────────────────
@@ -61,7 +60,6 @@ The script compares:
   • Quantification metrics from quant.json
   • Permit-list metrics from generate_permit_list.json
   • Per-barcode QC stats from featureDump.txt
-  • Timing summaries (side by side, pipeline compute only)
   • File presence / sizes
 EOF
     exit 1
@@ -124,24 +122,15 @@ resolve_ref() {
 }
 
 # ── resolve local results directory ───────────────────────────────────────
-# Detects which dataset a result directory belongs to by reading run.env or
-# checking the timing_summary.txt header.
+# Detects which dataset a result directory belongs to by reading run.env.
 detect_dataset() {
     local dir="$1"
-    # Try run.env first
     local env_file=""
     env_file=$(find "$dir" -maxdepth 2 -name "run.env" 2>/dev/null | head -1)
     if [[ -n "$env_file" ]]; then
         local ds
         ds=$(grep "^DATASET=" "$env_file" 2>/dev/null | cut -d= -f2-)
         if [[ -n "$ds" ]]; then echo "$ds"; return; fi
-    fi
-    # Fall back to timing summary header
-    local ts_file=""
-    ts_file=$(find "$dir" -maxdepth 2 -name "timing_summary.txt" 2>/dev/null | head -1)
-    if [[ -n "$ts_file" ]]; then
-        if grep -qi "PBMC1K" "$ts_file" 2>/dev/null; then echo "pbmc1k"; return; fi
-        if grep -qi "PBMC10K" "$ts_file" 2>/dev/null; then echo "pbmc10k"; return; fi
     fi
     echo "unknown"
 }
@@ -477,113 +466,7 @@ json_cmp "$CJ_A" "$CJ_B" ".compressed_output" "compressed_output"
 json_cmp "$CJ_A" "$CJ_B" ".version_str"       "collate version"
 
 # ══════════════════════════════════════════════════════════════════════════
-header "8. Timing Comparison"
-# ══════════════════════════════════════════════════════════════════════════
-TIME_A="$REF_DIR/timing_summary.txt"
-TIME_B="$LOCAL_DIR/timing_summary.txt"
-
-# parse_timing FILE -> outputs "step_name<TAB>minutes" lines
-# Extracts data rows from timing summaries (skips headers/separators/blanks)
-parse_timing() {
-    local f="$1"
-    grep -v '^[[:space:]]*$' "$f" \
-    | grep -v '===\|---\|Step\|Task\|Time\|FASTQs:' \
-    | while IFS= read -r line; do
-        local mins
-        mins=$(echo "$line" | awk '{for(i=NF;i>=1;i--) if($i ~ /^[0-9]*\.?[0-9]+$/) {print $i; exit}}')
-        [[ -z "$mins" ]] && continue
-        local name
-        name=$(echo "$line" | sed 's/[0-9.,]*[[:space:]]*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [[ -z "$name" ]] && continue
-        printf '%s\t%s\n' "$name" "$mins"
-    done
-}
-
-# Steps to exclude from the "pipeline computation" total (infrastructure, not compute)
-EXCLUDE_PATTERN="FASTQ Download|FASTQ Upload|Docker Build|Upload Quant|Upload .* to S3"
-
-if [[ -f "$TIME_A" || -f "$TIME_B" ]]; then
-    # Parse both files
-    STEPS_A=""
-    STEPS_B=""
-    [[ -f "$TIME_A" ]] && STEPS_A=$(parse_timing "$TIME_A")
-    [[ -f "$TIME_B" ]] && STEPS_B=$(parse_timing "$TIME_B")
-
-    # Show step-by-step table
-    printf "\n  ${BOLD}%-40s %10s %10s${RESET}\n" "Step" "Ref (min)" "Local (min)"
-    printf "  %-40s %10s %10s\n" "$(printf '%0.s─' {1..40})" "──────────" "──────────"
-
-    COMPUTE_A="0"; COMPUTE_B="0"
-    TOTAL_A="0";   TOTAL_B="0"
-
-    # Print reference steps
-    if [[ -n "$STEPS_A" ]]; then
-        while IFS=$'\t' read -r name mins; do
-            [[ "$name" =~ ^Total ]] && { TOTAL_A="$mins"; continue; }
-            local_mins="-"
-            is_infra=0
-            echo "$name" | grep -qE "$EXCLUDE_PATTERN" && is_infra=1
-            if [[ $is_infra -eq 0 ]]; then
-                COMPUTE_A=$(awk "BEGIN{printf \"%.2f\", $COMPUTE_A + $mins}")
-            fi
-            printf "  %-40s %10s %10s\n" "$name" "$mins" "$local_mins"
-        done <<< "$STEPS_A"
-    fi
-
-    # Print local steps (skip those already in ref by nature)
-    if [[ -n "$STEPS_B" ]]; then
-        while IFS=$'\t' read -r name mins; do
-            [[ "$name" =~ ^Total ]] && { TOTAL_B="$mins"; continue; }
-            is_infra=0
-            echo "$name" | grep -qE "$EXCLUDE_PATTERN" && is_infra=1
-            if [[ $is_infra -eq 0 ]]; then
-                COMPUTE_B=$(awk "BEGIN{printf \"%.2f\", $COMPUTE_B + $mins}")
-            fi
-            # Check if this step only exists in local
-            if [[ $is_infra -eq 1 ]]; then
-                printf "  ${YELLOW}%-40s %10s %10s${RESET}\n" "$name (infra)" "-" "$mins"
-            else
-                printf "  %-40s %10s %10s\n" "$name" "-" "$mins"
-            fi
-        done <<< "$STEPS_B"
-    fi
-
-    printf "  %-40s %10s %10s\n" "$(printf '%0.s─' {1..40})" "──────────" "──────────"
-
-    # Compute-only totals (excluding FASTQ download + infrastructure)
-    printf "  ${BOLD}%-40s %10s %10s${RESET}\n" \
-        "Pipeline Compute (excl. infra)" "$COMPUTE_A" "$COMPUTE_B"
-
-    if [[ "$TOTAL_A" != "0" || "$TOTAL_B" != "0" ]]; then
-        printf "  %-40s %10s %10s\n" \
-            "Total (including everything)" \
-            "$([ "$TOTAL_A" != "0" ] && echo "$TOTAL_A" || echo "-")" \
-            "$([ "$TOTAL_B" != "0" ] && echo "$TOTAL_B" || echo "-")"
-    fi
-
-    echo
-    if [[ "$COMPUTE_A" != "0" && "$COMPUTE_B" != "0" ]]; then
-        RATIO=$(awk "BEGIN{printf \"%.1f\", $COMPUTE_B / $COMPUTE_A}")
-        info "Pipeline compute ratio: local is ${RATIO}x vs reference"
-    fi
-
-    # Still show raw summaries for full context
-    echo
-    if [[ -f "$TIME_A" ]]; then
-        printf "${CYAN}  Raw reference timing:${RESET}\n"
-        sed 's/^/    /' "$TIME_A"
-    fi
-    echo
-    if [[ -f "$TIME_B" ]]; then
-        printf "${CYAN}  Raw local timing:${RESET}\n"
-        sed 's/^/    /' "$TIME_B"
-    fi
-else
-    warn "No timing_summary.txt in either result set"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════
-header "9. Environment Comparison (run.env)"
+header "8. Environment Comparison (run.env)"
 # ══════════════════════════════════════════════════════════════════════════
 ENV_A="$REF_DIR/run.env"
 ENV_B="$LOCAL_DIR/run.env"
@@ -627,7 +510,7 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════
-header "10. File Inventory"
+header "9. File Inventory"
 # ══════════════════════════════════════════════════════════════════════════
 # Key files that should exist in both
 KEY_FILES=(
@@ -644,7 +527,6 @@ KEY_FILES=(
     "analysis/out/pbmc_adata.h5ad"
     "analysis/out/qc_violin.png"
     "run.env"
-    "timing_summary.txt"
 )
 
 printf "\n  %-50s  %10s  %10s\n" "File" "Ref" "Local"

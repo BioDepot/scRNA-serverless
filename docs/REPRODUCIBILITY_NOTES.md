@@ -216,56 +216,62 @@ bash scripts/e2e_onserver_pbmc.sh pbmc1k --dry-run
 
 ---
 
-### `scripts/compare_results.sh` — Results comparison
+### `scripts/compare_results.sh` — Comparing Results
 
-Compares outputs from two pipeline runs (typically serverless vs. on-server) to verify they produce identical results.
+This script verifies that two pipeline runs produced identical count matrices. Use it to compare your serverless results against on-server results (or any two runs against each other).
 
-**Usage:**
+**What you need:**
+
+1. **Run A (reference)** — a zip file or folder containing results from one pipeline run (e.g. the on-server results zip from GitHub Actions).
+2. **Run B (local)** — a folder containing results from another pipeline run (e.g. your serverless results in `serverless_runs/`).
+
+**Quick start:**
 
 ```bash
-bash scripts/compare_results.sh <dataset> <reference_zip_or_dir> [local_results_dir]
+bash scripts/compare_results.sh <1k|10k> <path-to-run-A> [path-to-run-B]
 ```
 
-- `<dataset>`: `1k` or `10k` — controls which local serverless run to auto-detect
-- `<reference_zip_or_dir>`: path to the on-server results zip (downloaded from GitHub Actions Artifacts) or an already-extracted directory
-- `[local_results_dir]`: *(optional)* explicit path to a serverless results directory. If omitted, the script finds the **latest** matching run (1k or 10k) under `serverless_runs/`.
+- First argument: `1k` or `10k` (which dataset you ran).
+- Second argument: path to Run A — can be a `.zip` file or a folder.
+- Third argument *(optional)*: path to Run B. If you skip this, the script automatically finds your **most recent** matching run inside `serverless_runs/`.
 
-**Auto-detection behavior:**
+**Step-by-step: comparing serverless vs on-server**
 
-- If you pass `1k`, the script scans `serverless_runs/` and picks the most recent run whose `run.env` contains `DATASET=pbmc1k`
-- If you pass `10k`, it picks the most recent `DATASET=pbmc10k` run
-- If no matching run exists, the script lists what runs are available and exits
-- Cross-comparisons work: you can compare a 1k zip against a 10k local run and vice versa — the dataset argument only controls which local run to auto-detect
-
-**What it compares:**
-
-| Check | Method |
-|---|---|
-| Count matrix (`quants_mat.mtx`) | Exact value match (barcode-normalised to handle row ordering) |
-| Cell barcodes (`quants_mat_rows.txt`) | Set equality (order-independent) |
-| Gene list (`quants_mat_cols.txt`) | Exact line-by-line match |
-| Quantification metrics (`quant.json`) | Key-by-key numeric comparison |
-| Permit-list metrics (`generate_permit_list.json`) | Key-by-key comparison |
-| Per-barcode QC (`featureDump.txt`) | Row-by-row comparison |
-| Timing (`timing_summary.txt`) | Side-by-side display, excluding infrastructure steps (FASTQ download, Docker build, S3 uploads) |
-| File presence and sizes | Lists all output files in both directories |
-
-**Log output:**
-
-The script automatically saves a log to `serverless_runs/compare_<dataset>_<timestamp>.log` (e.g. `serverless_runs/compare_pbmc1k_20260226_143022.log`). The full output is still printed to the terminal — the log is an additional copy for later reference.
-
-**Examples:**
+1. Run the serverless pipeline (results land in `serverless_runs/<RUN_ID>/`).
+2. Get the on-server results (e.g. download the zip from GitHub Actions Artifacts, or from wherever you have them).
+3. Compare:
 
 ```bash
-# Compare latest local 1k serverless run against the on-server 1k zip
+# PBMC 1K — auto-finds your latest 1K serverless run
 bash scripts/compare_results.sh 1k "C:/Users/me/Downloads/onserver-pbmc1k-results.zip"
 
-# Compare latest local 10k serverless run against the on-server 10k zip
+# PBMC 10K — auto-finds your latest 10K serverless run
 bash scripts/compare_results.sh 10k "C:/Users/me/Downloads/onserver-pbmc10k-results.zip"
-
-# Explicit local results directory
-bash scripts/compare_results.sh 1k "/path/to/ref.zip" "/path/to/local/results"
-
-# Compare cross-dataset (1k zip against 10k local run)
-bash scripts/compare_results.sh 10k "C:/Users/me/Downloads/onserver-pbmc1k-results.zip"
 ```
+
+**Step-by-step: comparing two specific folders**
+
+If you want to point at exact folders instead of using auto-detection:
+
+```bash
+bash scripts/compare_results.sh 1k "/path/to/run-A-folder" "/path/to/run-B-folder"
+```
+
+Each folder must contain `alevin_output/quant.json` somewhere inside it. The script will find it automatically (searches up to 4 levels deep).
+
+**What it checks:**
+
+| Check | What it does |
+|---|---|
+| Count matrix (`quants_mat.mtx`) | Exact value match (handles different barcode ordering) |
+| Cell barcodes (`quants_mat_rows.txt`) | Same barcodes in both |
+| Gene list (`quants_mat_cols.txt`) | Exact line-by-line match |
+| Quantification metrics (`quant.json`) | Compares cell count, gene count, versions |
+| Permit-list metrics (`generate_permit_list.json`) | Key-by-key match |
+| Per-barcode QC (`featureDump.txt`) | Row-by-row match |
+| File inventory | Lists all output files with sizes |
+
+**Output:**
+
+- Results print to the terminal with color-coded PASS/FAIL/WARN.
+- A log copy is saved to `serverless_runs/compare_<dataset>_<timestamp>.log`.

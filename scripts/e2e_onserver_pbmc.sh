@@ -101,14 +101,6 @@ time_cmd() {
     return $rc
 }
 
-fmt_secs() {
-    local secs="$1"
-    if need_cmd bc; then
-        printf "%.2f" "$(echo "scale=4; $secs / 60" | bc)"
-    else
-        echo "$(( secs / 60 ))m $(( secs % 60 ))s"
-    fi
-}
 
 ################################################################################
 # Load .env file (if present; credentials can also come from environment,
@@ -486,7 +478,7 @@ bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
         exit $RUN_EXIT
     fi
 
-    log_info "Pipeline completed in ${DRIVER_SECS}s ($(fmt_secs $DRIVER_SECS) min)"
+    log_info "Pipeline completed successfully"
 
     ########################################################################
     # Download results
@@ -498,10 +490,8 @@ bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
         REMOTE_RUN_DIR="${SERVER_RUN_DIR}/${RUN_ID}"
         mkdir -p "$LOCAL_RUN_DIR/logs"
 
-        # Download metadata & timing
+        # Download metadata
         log_info "  Downloading metadata..."
-        run_scp "${SSH_TARGET}:${REMOTE_RUN_DIR}/timing_summary.txt" \
-            "$LOCAL_RUN_DIR/" 2>/dev/null || true
         run_scp "${SSH_TARGET}:${REMOTE_RUN_DIR}/run.env" \
             "$LOCAL_RUN_DIR/" 2>/dev/null || true
 
@@ -538,10 +528,6 @@ bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
 
         # Verify download
         DOWNLOAD_OK=1
-        if [[ ! -f "$LOCAL_RUN_DIR/timing_summary.txt" ]]; then
-            log_warn "Download may be incomplete: timing_summary.txt missing"
-            DOWNLOAD_OK=0
-        fi
 
         QUANT_LOCAL=$(find "$LOCAL_RUN_DIR" -name 'quants_mat.mtx' -o -name 'quants_mat.mtx.gz' 2>/dev/null | head -1)
         if [[ -n "$QUANT_LOCAL" ]]; then
@@ -571,11 +557,6 @@ bash scripts/e2e_onserver_pbmc.sh ${DATASET} --run
         find "$LOCAL_RUN_DIR" -type f -printf "  %p (%s bytes)\n" 2>/dev/null || \
             find "$LOCAL_RUN_DIR" -type f | while read -r f; do log_info "  $f"; done
 
-        if [[ -f "$LOCAL_RUN_DIR/timing_summary.txt" ]]; then
-            log_info ""
-            log_info "=== TIMING SUMMARY ==="
-            while IFS= read -r _ts_line; do log_info "$_ts_line"; done < "$LOCAL_RUN_DIR/timing_summary.txt"
-        fi
 
         ####################################################################
         # Clean up server (after confirmed download)
@@ -836,18 +817,6 @@ RUN_DIR="${SERVER_RUN_DIR}/${RUN_ID}"
 mkdir -p "$RUN_DIR"/{piscem_output,alevin_output,analysis}
 log_info "Run directory: $RUN_DIR"
 
-################################################################################
-# Timing arrays
-################################################################################
-
-declare -A STEP_TIMES
-declare -a STEP_ORDER
-
-record_time() {
-    local name="$1" secs="$2"
-    STEP_TIMES["$name"]="$secs"
-    STEP_ORDER+=("$name")
-}
 
 ################################################################################
 # Step 0: Bootstrap Tools
@@ -855,7 +824,6 @@ record_time() {
 
 log_info "Step 0: Checking and installing tools..."
 
-STEP0_START=$(date +%s)
 
 wait_for_dpkg_lock() {
     for _w in $(seq 1 30); do
@@ -930,8 +898,7 @@ log_info "  piscem:     $(piscem --version 2>&1 | head -1)"
 log_info "  alevin-fry: $(alevin-fry --version 2>&1 | head -1)"
 log_info "  radtk:      $(radtk --version 2>&1 | head -1)"
 
-STEP0_END=$(date +%s)
-log_info "Step 0 completed in $(( STEP0_END - STEP0_START ))s"
+log_info "Step 0 complete"
 
 ################################################################################
 # Verify reference files
@@ -1104,7 +1071,6 @@ log_info "  Output: $RUN_DIR/piscem_output"
 
 PISCEM_OUTPUT="$RUN_DIR/piscem_output"
 
-STEP2_START=$(date +%s)
 
 piscem map-sc \
     -i "$PISCEM_INDEX_PREFIX" \
@@ -1115,10 +1081,7 @@ piscem map-sc \
     -o "$PISCEM_OUTPUT/map_output" \
     2>&1 | tee "$RUN_DIR/piscem_map.log" >&2
 
-STEP2_END=$(date +%s)
-STEP2_SECS=$(( STEP2_END - STEP2_START ))
-record_time "Piscem Map" "$STEP2_SECS"
-log_info "Step 2 completed in ${STEP2_SECS}s ($(fmt_secs $STEP2_SECS) min)"
+log_info "Step 2 complete"
 
 if [[ ! -f "$PISCEM_OUTPUT/map_output/map.rad" ]]; then
     die "piscem map failed: map.rad not found in $PISCEM_OUTPUT/map_output/"
@@ -1136,7 +1099,6 @@ log_info "Step 3: Running alevin-fry generate-permit-list..."
 
 ALEVIN_OUTPUT="$RUN_DIR/alevin_output"
 
-STEP3_START=$(date +%s)
 
 alevin-fry generate-permit-list \
     -d fw \
@@ -1145,10 +1107,7 @@ alevin-fry generate-permit-list \
     -o "$ALEVIN_OUTPUT" \
     2>&1 | tee "$RUN_DIR/alevin_gpl.log" >&2
 
-STEP3_END=$(date +%s)
-STEP3_SECS=$(( STEP3_END - STEP3_START ))
-record_time "Alevin-fry generate-permit-list" "$STEP3_SECS"
-log_info "Step 3 completed in ${STEP3_SECS}s ($(fmt_secs $STEP3_SECS) min)"
+log_info "Step 3 complete"
 
 ################################################################################
 # Step 4: Alevin-fry collate
@@ -1156,7 +1115,6 @@ log_info "Step 3 completed in ${STEP3_SECS}s ($(fmt_secs $STEP3_SECS) min)"
 
 log_info "Step 4: Running alevin-fry collate..."
 
-STEP4_START=$(date +%s)
 
 alevin-fry collate \
     -t "$THREADS" \
@@ -1164,10 +1122,7 @@ alevin-fry collate \
     -r "$PISCEM_OUTPUT/map_output" \
     2>&1 | tee "$RUN_DIR/alevin_collate.log" >&2
 
-STEP4_END=$(date +%s)
-STEP4_SECS=$(( STEP4_END - STEP4_START ))
-record_time "Alevin-fry collate" "$STEP4_SECS"
-log_info "Step 4 completed in ${STEP4_SECS}s ($(fmt_secs $STEP4_SECS) min)"
+log_info "Step 4 complete"
 
 ################################################################################
 # Step 5: Alevin-fry quant
@@ -1175,7 +1130,6 @@ log_info "Step 4 completed in ${STEP4_SECS}s ($(fmt_secs $STEP4_SECS) min)"
 
 log_info "Step 5: Running alevin-fry quant..."
 
-STEP5_START=$(date +%s)
 
 alevin-fry quant \
     -t "$THREADS" \
@@ -1186,10 +1140,7 @@ alevin-fry quant \
     --use-mtx \
     2>&1 | tee "$RUN_DIR/alevin_quant.log" >&2
 
-STEP5_END=$(date +%s)
-STEP5_SECS=$(( STEP5_END - STEP5_START ))
-record_time "Alevin-fry quant" "$STEP5_SECS"
-log_info "Step 5 completed in ${STEP5_SECS}s ($(fmt_secs $STEP5_SECS) min)"
+log_info "Step 5 complete"
 
 if [[ ! -f "$ALEVIN_OUTPUT/quants_mat.mtx" && ! -f "$ALEVIN_OUTPUT/alevin/quants_mat.mtx" ]]; then
     log_warn "quants_mat.mtx not found in expected location. Checking subdirectories..."
@@ -1204,11 +1155,8 @@ fi
 # Step 6: Optional QC Analysis (UMAP + violin plots)
 ################################################################################
 
-STEP6_SECS=0
 if [[ "${RUN_QC:-0}" == "1" ]]; then
     log_info "Step 6: Running QC analysis (UMAP + violin plots)..."
-
-    STEP6_START=$(date +%s)
 
     if ! need_cmd python3; then
         log_info "Installing python3 for QC..."
@@ -1243,13 +1191,9 @@ if [[ "${RUN_QC:-0}" == "1" ]]; then
 
     deactivate 2>/dev/null || true
 
-    STEP6_END=$(date +%s)
-    STEP6_SECS=$(( STEP6_END - STEP6_START ))
-    record_time "QC Analysis" "$STEP6_SECS"
-    log_info "Step 6 completed in ${STEP6_SECS}s ($(fmt_secs $STEP6_SECS) min)"
+    log_info "Step 6 complete"
 else
     log_info "Step 6: Skipping QC (RUN_QC=0)."
-    record_time "QC Analysis" "SKIPPED"
 fi
 
 ################################################################################
@@ -1298,50 +1242,6 @@ if [[ -n "${_MASK_SED:-}" ]]; then
     done
 fi
 
-################################################################################
-# Timing Summary
-################################################################################
-
-TOTAL_SECS=0
-for key in "${STEP_ORDER[@]}"; do
-    val="${STEP_TIMES[$key]}"
-    if [[ "$val" != "SKIPPED" ]]; then
-        TOTAL_SECS=$(( TOTAL_SECS + val ))
-    fi
-done
-
-{
-    echo ""
-    echo "========== ON-SERVER TIMING SUMMARY (${DATASET_UPPER}) =========="
-    printf "%-42s %s\n" "Task" "Time (min)"
-    echo "------------------------------------------------------------"
-    for key in "${STEP_ORDER[@]}"; do
-        val="${STEP_TIMES[$key]}"
-        if [[ "$val" == "SKIPPED" ]]; then
-            printf "%-42s %s\n" "$key" "SKIPPED"
-        else
-            printf "%-42s %s\n" "$key" "$(fmt_secs "$val")"
-        fi
-    done
-    echo "------------------------------------------------------------"
-    printf "%-42s %s\n" "Total On-Server Execution" "$(fmt_secs "$TOTAL_SECS")"
-    echo "============================================================"
-    echo ""
-    if [[ "$FASTQ_STATUS" == "downloaded" ]]; then
-        printf "%-42s %s\n" "FASTQ download (not in total):" "$(fmt_secs "$FASTQ_DOWNLOAD_SECS") min"
-        echo "  (outside the scope of the paper benchmark; pre-staged FASTQs assumed)"
-        echo ""
-        echo "FASTQs: downloaded fresh"
-    elif [[ "$FASTQ_STATUS" == "redownloaded" ]]; then
-        printf "%-42s %s\n" "FASTQ re-download (not in total):" "$(fmt_secs "$FASTQ_DOWNLOAD_SECS") min"
-        echo "  (outside the scope of the paper benchmark; pre-staged FASTQs assumed)"
-        echo ""
-        echo "FASTQs: re-downloaded (cached copy was corrupt)"
-    else
-        echo "FASTQs: cached (verified, no download needed)"
-    fi
-    echo ""
-} | tee "$RUN_DIR/timing_summary.txt" >&2
 
 ################################################################################
 # Summary
@@ -1360,7 +1260,6 @@ if [[ "${RUN_QC:-0}" == "1" ]]; then
     fi
 fi
 
-log_info "Timing summary: $RUN_DIR/timing_summary.txt"
 log_info "Run metadata: $RUN_DIR/run.env"
 
 exit 0

@@ -266,7 +266,7 @@ WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
 SPLIT_LINES="${SPLIT_LINES:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
-POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-30}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 
 # Derived values (will be set later)
 RUN_MODE=0
@@ -780,6 +780,7 @@ create_and_upload_input_txt() {
 process_fastq_bash() {
     local output_dir="$1"
 
+
     log_info "Finding FASTQ pairs in S3 bucket $INPUT_FASTQ_BUCKET ..."
 
     declare -A PF_R1_KEYS PF_R2_KEYS
@@ -847,6 +848,7 @@ process_fastq_bash() {
     log_info "Total input folders: $input_count"
     [[ $input_count -gt 0 ]] || die "No input folders created. Check FASTQ files in $INPUT_FASTQ_BUCKET"
 
+
     # Wait 30s for EventBridge propagation (matches process_fastq.py behavior)
     log_info "Waiting 30s for EventBridge/Lambda warm-up..."
     sleep 30
@@ -858,13 +860,25 @@ process_fastq_bash() {
 
     while true; do
         local completed=0
-        for folder in "${INPUT_FOLDERS[@]}"; do
-            if aws s3api head-object --bucket "$OUTPUT_MAP_BUCKET" \
-                --key "piscem_output/${folder}/output.txt" \
-                --region "$AWS_REGION" >/dev/null 2>&1; then
-                completed=$((completed + 1))
-            fi
-        done
+        local _keys
+        _keys=$(aws s3api list-objects-v2 --bucket "$OUTPUT_MAP_BUCKET" --prefix "piscem_output/" \
+                    --query "Contents[?ends_with(Key,'/output.txt')].Key" \
+                    --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+
+        if [[ -n "$_keys" && "$_keys" != "None" ]]; then
+            local _k
+            for _k in $_keys; do
+                local _folder
+                _folder="${_k#piscem_output/}"
+                _folder="${_folder%/output.txt}"
+                for _expected in "${INPUT_FOLDERS[@]}"; do
+                    if [[ "$_folder" == "$_expected" ]]; then
+                        completed=$((completed + 1))
+                        break
+                    fi
+                done
+            done
+        fi
 
         log_info "Output progress: $completed / $input_count"
 
@@ -882,7 +896,6 @@ process_fastq_bash() {
             aws s3 ls "s3://$OUTPUT_MAP_BUCKET/" --recursive --region "$AWS_REGION" 2>&1 | tail -30 >&2 || true
             die "Lambda did not complete in time. Check CloudWatch logs above for OOM / Runtime errors."
         fi
-        # Fail-fast: if zero progress after LAMBDA_TIMEOUT_SEC, Lambda likely failed
         if [[ $completed -eq 0 && $elapsed -gt $LAMBDA_TIMEOUT_SEC ]]; then
             log_warn "Zero outputs after $((elapsed/60))m (Lambda timeout: ${LAMBDA_TIMEOUT_SEC}s). Checking CloudWatch for errors..."
             aws logs tail "/aws/lambda/$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" \
@@ -897,14 +910,11 @@ process_fastq_bash() {
     local elapsed_sec=$(( $(date +%s) - poll_start ))
     log_info "All $input_count outputs ready ($((elapsed_sec / 60)) min $((elapsed_sec % 60)) sec)"
 
-    # Download outputs
+    # Download outputs (single bulk sync)
     log_info "Downloading output files from $OUTPUT_MAP_BUCKET ..."
-    for folder in "${INPUT_FOLDERS[@]}"; do
-        local local_dir="${output_dir}/piscem_output/${folder}"
-        mkdir -p "$local_dir"
-        aws s3 sync "s3://${OUTPUT_MAP_BUCKET}/piscem_output/${folder}/" "$local_dir/" \
-            --region "$AWS_REGION" --only-show-errors
-    done
+    mkdir -p "${output_dir}/piscem_output"
+    aws s3 sync "s3://${OUTPUT_MAP_BUCKET}/piscem_output/" "${output_dir}/piscem_output/" \
+        --region "$AWS_REGION" --only-show-errors
 
     log_info "All output files downloaded to $output_dir"
 }
@@ -2103,10 +2113,6 @@ mkdir -p "$RUN_DIR"
 
 log_info "Run directory: $RUN_DIR"
 
-# Timing instrumentation (matching paper Table 1)
-declare -A STEP_TIMES
-declare -a STEP_ORDER
-PIPELINE_START=$(date +%s)
 
 ################################################################################
 # Step 0: Bootstrap Tools
@@ -2178,7 +2184,6 @@ log_info "Tools ready"
 ################################################################################
 
 log_info "Step 1: Preparing FASTQs..."
-STEP_START=$(date +%s)
 
 FASTQ_DIR="$RUN_DIR/fastq"
 mkdir -p "$FASTQ_DIR"
@@ -2255,9 +2260,7 @@ mv -f "$tmp_r2" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz"
 
 log_info "FASTQ files ready"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["FASTQ Download"]=$STEP_ELAPSED; STEP_ORDER+=("FASTQ Download")
-log_info "Step 1 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 1 complete"
 
 ################################################################################
 # Step 2-4: Create S3 Buckets and Setup EventBridge
@@ -2283,7 +2286,6 @@ log_info "Buckets created and configured"
 ################################################################################
 
 log_info "Step 3: Uploading FASTQs to S3..."
-STEP_START=$(date +%s)
 
 aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
     "s3://$INPUT_FASTQ_BUCKET/$DATASET/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
@@ -2295,16 +2297,13 @@ aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
 
 log_info "FASTQs uploaded"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["FASTQ Upload to S3"]=$STEP_ELAPSED; STEP_ORDER+=("FASTQ Upload to S3")
-log_info "Step 3 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 3 complete"
 
 ################################################################################
 # Step 5: Prepare Lambda Build Context
 ################################################################################
 
 log_info "Step 5: Preparing Lambda build context..."
-STEP_START=$(date +%s)
 
 BUILD_DIR="$RUN_DIR/lambda_build"
 mkdir -p "$BUILD_DIR"
@@ -2424,9 +2423,7 @@ ECR_REPO_URI=$(create_ecr_repo_if_needed "$ECR_REPO_NAME")
 # 6b: Build and push Docker image to ECR
 IMAGE_URI=$(build_and_push_lambda_image "$ECR_REPO_URI" "$DOCKER_IMAGE_NAME" "$BUILD_DIR")
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["Docker Build + Push"]=$STEP_ELAPSED; STEP_ORDER+=("Docker Build + Push")
-log_info "Steps 5-6b completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Steps 5-6b complete"
 
 # 6c: Create Lambda execution role
 LAMBDA_ROLE_ARN=$(create_lambda_execution_role "$LAMBDA_EXECUTION_ROLE_NAME")
@@ -2538,16 +2535,13 @@ log_info "Lambda function ready"
 ################################################################################
 
 log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download)..."
-STEP_START=$(date +%s)
 
 OUTPUT_DIR="$RUN_DIR/output"
 mkdir -p "$OUTPUT_DIR"
 
 process_fastq_bash "$OUTPUT_DIR"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["Lambda Mapping"]=$STEP_ELAPSED; STEP_ORDER+=("Lambda Mapping")
-log_info "Step 7 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 7 complete"
 
 log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
 
@@ -2564,7 +2558,6 @@ bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
 bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
 
 log_info "Running combine scripts..."
-STEP_START=$(date +%s)
 
 COMBINED_DIR="$RUN_DIR/combined"
 mkdir -p "$COMBINED_DIR"
@@ -2572,12 +2565,9 @@ mkdir -p "$COMBINED_DIR"
 bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$OUTPUT_DIR" "$COMBINED_DIR"
 bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$OUTPUT_DIR" "$COMBINED_DIR"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["Combine Outputs"]=$STEP_ELAPSED; STEP_ORDER+=("Combine Outputs")
-log_info "Step 8a (combine) completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 8a (combine) complete"
 
 log_info "Running alevin-fry quant via alevin_process.sh..."
-STEP_START=$(date +%s)
 
 ALEVIN_OUTPUT="$RUN_DIR/alevin_output"
 mkdir -p "$ALEVIN_OUTPUT"
@@ -2586,9 +2576,7 @@ TRANSCRIPTOME_GENE_MAPPING="/opt/scrna-seed/reference/t2g.tsv"
 
 bash /home/ubuntu/scrna-repo/alevin_process.sh "$COMBINED_DIR" "$ALEVIN_OUTPUT" "$TRANSCRIPTOME_GENE_MAPPING"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["Alevin-fry Quant"]=$STEP_ELAPSED; STEP_ORDER+=("Alevin-fry Quant")
-log_info "Step 8b (quant) completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 8b (quant) complete"
 
 log_info "Quantification complete"
 
@@ -2597,14 +2585,11 @@ log_info "Quantification complete"
 ################################################################################
 
 log_info "Step 9: Uploading quantification outputs to S3..."
-STEP_START=$(date +%s)
 
 aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" \
     --region "$AWS_REGION"
 
-STEP_END=$(date +%s); STEP_ELAPSED=$((STEP_END - STEP_START))
-STEP_TIMES["Upload Quant to S3"]=$STEP_ELAPSED; STEP_ORDER+=("Upload Quant to S3")
-log_info "Step 9 completed in ${STEP_ELAPSED}s ($((STEP_ELAPSED/60))m $((STEP_ELAPSED%60))s)"
+log_info "Step 9 complete"
 
 log_info "Quant outputs uploaded"
 
@@ -2690,31 +2675,6 @@ EOF
 
 log_info "Run metadata saved to $RUN_DIR/run.env"
 
-################################################################################
-# Timing Summary
-################################################################################
-
-PIPELINE_END=$(date +%s)
-PIPELINE_TOTAL=$((PIPELINE_END - PIPELINE_START))
-
-DATASET_UPPER=$(echo "$DATASET" | tr '[:lower:]' '[:upper:]')
-
-{
-    echo ""
-    echo "========== SERVERLESS TIMING SUMMARY ($DATASET_UPPER) =========="
-    printf "%-30s %15s %10s\n" "Step" "Time (seconds)" "Time (min)"
-    echo "-----------------------------------------------------------"
-    for key in "${STEP_ORDER[@]}"; do
-        val="${STEP_TIMES[$key]}"
-        mins=$(echo "scale=2; $val / 60" | bc 2>/dev/null || echo "$((val/60)).$((val%60))")
-        printf "%-30s %15s %10s\n" "$key" "$val" "$mins"
-    done
-    echo "-----------------------------------------------------------"
-    total_mins=$(echo "scale=2; $PIPELINE_TOTAL / 60" | bc 2>/dev/null || echo "$((PIPELINE_TOTAL/60)).$((PIPELINE_TOTAL%60))")
-    printf "%-30s %15s %10s\n" "Total Pipeline" "$PIPELINE_TOTAL" "$total_mins"
-    echo "==========================================================="
-    echo ""
-} | tee "$RUN_DIR/timing_summary.txt" >&2
 
 ################################################################################
 # Cleanup

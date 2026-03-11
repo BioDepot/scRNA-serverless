@@ -128,7 +128,6 @@ Whether you use Actions, Codespaces, or a local terminal, the output directory l
 
 ```
 onserver_runs/<run-id>/
-├── timing_summary.txt              <-- Step-by-step timings
 ├── run.env                         <-- Server info, tool versions, settings
 ├── logs/
 │   ├── piscem_map.log              <-- Piscem mapping log
@@ -138,8 +137,8 @@ onserver_runs/<run-id>/
 ├── alevin_output/
 │   ├── alevin/
 │   │   ├── quants_mat.mtx          <-- *** COUNT MATRIX ***
-│   │   ├── quants_mat_rows.txt     <-- Cell barcodes
-│   │   └── quants_mat_cols.txt     <-- Gene names
+│   │   ├── quants_mat_rows.txt     <-- Gene names
+│   │   └── quants_mat_cols.txt     <-- Cell barcodes
 │   ├── map.collated.rad            <-- Collated RAD file
 │   ├── permit_freq.bin             <-- Permit frequencies
 │   ├── permit_map.bin              <-- Permit map

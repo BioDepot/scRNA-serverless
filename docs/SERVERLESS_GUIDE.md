@@ -208,15 +208,14 @@ Results appear in `serverless_runs/`:
 serverless_runs/
   <RUN_ID>.log                          <-- Pipeline log
   <RUN_ID>/
-  ├── timing_summary.txt                <-- Step timings
   ├── run.env                           <-- Run metadata
   ├── combined/
   │   ├── map.rad                       <-- Merged mapping output
   │   └── unmapped_bc_count.bin
   ├── alevin_output/alevin/
   │   ├── quants_mat.mtx                <-- *** COUNT MATRIX ***
-  │   ├── quants_mat_rows.txt           <-- Cell barcodes
-  │   └── quants_mat_cols.txt           <-- Gene names
+  │   ├── quants_mat_rows.txt           <-- Gene names
+  │   └── quants_mat_cols.txt           <-- Cell barcodes
   └── qc_output/                        <-- If RUN_QC=1
       ├── umap_leiden.png
       ├── qc_violin.png
