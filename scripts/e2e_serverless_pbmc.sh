@@ -1992,7 +1992,7 @@ SSHEOF
                 43200
             aws s3 cp "s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz" \
                 "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" \
-                --region "$AWS_REGION" --only-show-errors
+                --region "$AWS_REGION"
         fi
         
         # Extract locally
