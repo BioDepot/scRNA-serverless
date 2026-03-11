@@ -235,29 +235,33 @@ bash scripts/compare_results.sh <1k|10k> <path-to-run-A> [path-to-run-B]
 - Second argument: path to Run A — can be a `.zip` file or a folder.
 - Third argument *(optional)*: path to Run B. If you skip this, the script automatically finds your **most recent** matching run inside `serverless_runs/`.
 
-**Step-by-step: comparing serverless vs on-server**
+**Example 1 — Zip against a specific serverless run folder**
 
-1. Run the serverless pipeline (results land in `serverless_runs/<RUN_ID>/`).
-2. Get the on-server results (e.g. download the zip from GitHub Actions Artifacts, or from wherever you have them).
-3. Compare:
+After downloading the on-server results zip from GitHub Actions Artifacts:
 
 ```bash
-# PBMC 1K — auto-finds your latest 1K serverless run
-bash scripts/compare_results.sh 1k "C:/Users/me/Downloads/onserver-pbmc1k-results.zip"
-
-# PBMC 10K — auto-finds your latest 10K serverless run
-bash scripts/compare_results.sh 10k "C:/Users/me/Downloads/onserver-pbmc10k-results.zip"
+bash scripts/compare_results.sh 1k "D:/Users/me/Downloads/onserver-pbmc1k-results.zip" serverless_runs/pbmc-1773250297-b2057eb4
 ```
 
-**Step-by-step: comparing two specific folders**
+**Example 2 — Zip only (auto-detect local run)**
 
-If you want to point at exact folders instead of using auto-detection:
+If you skip the third argument, the script finds your latest matching run in `serverless_runs/` automatically:
 
 ```bash
-bash scripts/compare_results.sh 1k "/path/to/run-A-folder" "/path/to/run-B-folder"
+# PBMC 1K
+bash scripts/compare_results.sh 1k "D:/Users/me/Downloads/onserver-pbmc1k-results.zip"
+
+# PBMC 10K
+bash scripts/compare_results.sh 10k "D:/Users/me/Downloads/onserver-pbmc10k-results.zip"
 ```
 
-Each folder must contain `alevin_output/quant.json` somewhere inside it. The script will find it automatically (searches up to 4 levels deep).
+**Example 3 — Two serverless runs against each other**
+
+```bash
+bash scripts/compare_results.sh 1k serverless_runs/pbmc-1773250297-b2057eb4 serverless_runs/pbmc-1773260412-a1c3f9d0
+```
+
+Each path can be a `.zip` file or a folder. The folder must contain `alevin_output/` somewhere inside it (the script searches up to 4 levels deep).
 
 **What it checks:**
 
