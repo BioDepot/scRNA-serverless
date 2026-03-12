@@ -85,6 +85,8 @@ These are the same credentials used by GitHub Actions. Set each secret's reposit
 
 Go to the repository on GitHub. Click **Code** → **Codespaces** → **Create codespace on pr/repro-ami-e2e** (or the branch with the pipeline code).
 
+> **Configuration:** Select the default **2-core** machine and **US West** region. The 2-core machine is free-tier eligible and sufficient for this pipeline.
+
 The Codespace will build automatically using the included `.devcontainer/devcontainer.json` configuration, which installs `sshpass` and Python.
 
 ### Running the pipeline
