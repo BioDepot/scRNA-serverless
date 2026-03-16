@@ -1982,14 +1982,14 @@ SSHEOF
         
         if [[ "$CONNECT_METHOD" == "ssh" ]]; then
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@$DRIVER_INSTANCE_IP" \
-                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' -C /mnt/nvme/runs ${RUN_ID}"
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' --exclude='output' -C /mnt/nvme/runs ${RUN_ID}"
             scp "${SSH_OPTS[@]}" \
                 "${SSH_USER}@${DRIVER_INSTANCE_IP}:/tmp/${RUN_ID}_results.tgz" "$LOCAL_RESULTS_DIR/$RUN_ID/"
         else
             # SSM: create tarball on instance, upload to S3, download locally
             log_info "Preparing results tarball on EC2 and uploading to S3 (this may take several minutes)..."
             ssm_run_command "$DRIVER_INSTANCE_ID" \
-                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
+                "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' --exclude='output' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
                 43200
             log_info "Downloading results tarball from S3 to local machine..."
             local _dl_target="$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz"

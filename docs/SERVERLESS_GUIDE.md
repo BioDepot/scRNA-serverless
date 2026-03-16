@@ -30,7 +30,7 @@ Free-tier instances (t3.micro/small/medium) are too small. The script selects th
 
 **Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
 
-**Local disk space:** Keep at least **1 GB free** (PBMC 1K) or **20 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
+**Local disk space:** Keep at least **1 GB free** (PBMC 1K) or **10 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
 
 ---
 
