@@ -62,7 +62,7 @@ The script creates a temporary tarball (~200 MB) in the repo directory during se
 
 | Dataset | Temp space (deleted after upload) | Results download | Total recommended free |
 |---|---|---|---|
-| PBMC 1K | ~200 MB | ~200 MB | ~1 GB |
+| PBMC 1K | ~200 MB | ~1 GB | ~2 GB |
 | PBMC 10K | ~200 MB | ~3-5 GB | ~10 GB |
 
 The FASTQs and intermediate files stay on the EC2 instance (500 GB EBS). Only the final count matrix, QC plots, and merged .rad file are downloaded locally.

@@ -1992,16 +1992,15 @@ SSHEOF
                 "tar -czf /tmp/${RUN_ID}_results.tgz --exclude='fastq' --exclude='lambda_build' --exclude='venv_qc' --exclude='output' -C /mnt/nvme/runs ${RUN_ID} && aws s3 cp /tmp/${RUN_ID}_results.tgz s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz --region ${AWS_REGION} && rm -f /tmp/${RUN_ID}_results.tgz" \
                 43200
             log_info "Downloading results tarball from S3 to local machine..."
-            local _dl_target="$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz"
+            _dl_target="$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz"
             aws s3 cp "s3://${SSM_TRANSFER_BUCKET}/results/${RUN_ID}_results.tgz" \
                 "$_dl_target" \
                 --region "$AWS_REGION" --no-progress &
-            local _dl_pid=$! _dl_start=$SECONDS _dl_last=$SECONDS
+            _dl_pid=$!; _dl_start=$SECONDS; _dl_last=$SECONDS
             while kill -0 "$_dl_pid" 2>/dev/null; do
                 sleep 30
                 if (( SECONDS - _dl_last >= 900 )); then
                     if [[ -f "$_dl_target" ]]; then
-                        local _sz _gib _min
                         _sz=$(stat -c%s "$_dl_target" 2>/dev/null || echo 0)
                         _gib=$(awk "BEGIN {printf \"%.1f\", $_sz/1073741824}")
                         _min=$(( (SECONDS - _dl_start) / 60 ))
