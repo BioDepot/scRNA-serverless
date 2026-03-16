@@ -89,8 +89,9 @@ def find_matrix_file(quants_dir: Path) -> Path:
 
 
 def find_feature_file(quants_dir: Path) -> Path:
-    """Find the gene/feature file in quantification directory."""
-    common_names = ['quants_mat_rows.txt', 'genes.tsv', 'genes.tsv.gz']
+    """Find the gene/feature file in quantification directory.
+    In alevin-fry output, genes are in quants_mat_cols.txt."""
+    common_names = ['quants_mat_cols.txt', 'genes.tsv', 'genes.tsv.gz']
     result = _search_file(quants_dir, common_names)
     if result:
         return result
@@ -101,8 +102,9 @@ def find_feature_file(quants_dir: Path) -> Path:
 
 
 def find_barcode_file(quants_dir: Path) -> Path:
-    """Find the barcode/cell file in quantification directory."""
-    common_names = ['quants_mat_cols.txt', 'barcodes.tsv', 'barcodes.tsv.gz']
+    """Find the barcode/cell file in quantification directory.
+    In alevin-fry output, barcodes are in quants_mat_rows.txt."""
+    common_names = ['quants_mat_rows.txt', 'barcodes.tsv', 'barcodes.tsv.gz']
     result = _search_file(quants_dir, common_names)
     if result:
         return result
@@ -133,43 +135,43 @@ def load_mtx_data(quants_dir: Path) -> sc.AnnData:
     logger.info(f"Feature file: {feature_file.name}")
     logger.info(f"Barcode file: {barcode_file.name}")
     
-    # Load matrix (MTX is cells x genes, we need to transpose)
     logger.info("Reading matrix...")
     if str(matrix_file).endswith('.gz'):
         with gzip.open(matrix_file, 'rb') as fh:
             matrix = mmread(fh)
     else:
         matrix = mmread(str(matrix_file))
-    matrix = matrix.T.tocsr()  # Transpose: genes x cells -> cells x genes
-    
-    # Load features (genes)
+    matrix = matrix.tocsr()
+
+    # Load features (genes) from quants_mat_cols.txt
     logger.info("Reading features...")
     with open_maybe_gzip(feature_file, 'rt') as f:
-        # Try reading as TSV first (might have description column), then fallback to plain text
         genes = []
         for line in f:
             parts = line.strip().split('\t')
             genes.append(parts[0])
-    
-    # Load barcodes (cells)
+
+    # Load barcodes (cells) from quants_mat_rows.txt
     logger.info("Reading barcodes...")
     with open_maybe_gzip(barcode_file, 'rt') as f:
         barcodes = [line.strip() for line in f]
-    
+
     logger.info(f"Matrix shape: {matrix.shape}")
     logger.info(f"Genes: {len(genes)}, Barcodes: {len(barcodes)}")
-    
-    if matrix.shape[1] != len(genes):
+
+    # alevin-fry outputs rows=barcodes, cols=genes; detect and transpose if
+    # the matrix was written the other way (genes x barcodes).
+    if matrix.shape[0] == len(barcodes) and matrix.shape[1] == len(genes):
+        pass  # already cells x genes
+    elif matrix.shape[0] == len(genes) and matrix.shape[1] == len(barcodes):
+        logger.info("Transposing matrix (genes x cells -> cells x genes)")
+        matrix = matrix.T.tocsr()
+    else:
         raise ValueError(
-            f"Matrix genes ({matrix.shape[1]}) != loaded genes ({len(genes)})"
+            f"Matrix shape {matrix.shape} does not match "
+            f"barcodes ({len(barcodes)}) x genes ({len(genes)})"
         )
-    
-    if matrix.shape[0] != len(barcodes):
-        raise ValueError(
-            f"Matrix barcodes ({matrix.shape[0]}) != loaded barcodes ({len(barcodes)})"
-        )
-    
-    # Create AnnData
+
     adata = sc.AnnData(X=matrix)
     adata.obs_names = barcodes
     adata.var_names = genes
@@ -191,9 +193,19 @@ def compute_qc_metrics(adata: sc.AnnData) -> sc.AnnData:
     """
     logger.info("Computing QC metrics...")
     
-    # Identify mitochondrial genes (common patterns)
+    # Identify mitochondrial genes — try symbol prefixes first, then ENSG IDs
     mt_patterns = ['MT-', 'mt-', 'MT_', 'mt_']
     mt_genes = adata.var_names.str.contains('|'.join(mt_patterns), case=False)
+
+    if mt_genes.sum() == 0:
+        MT_ENSG = {
+            'ENSG00000198888', 'ENSG00000198763', 'ENSG00000198804',
+            'ENSG00000198712', 'ENSG00000228253', 'ENSG00000198899',
+            'ENSG00000198938', 'ENSG00000198727', 'ENSG00000198840',
+            'ENSG00000212907', 'ENSG00000198886', 'ENSG00000198786',
+            'ENSG00000198695',
+        }
+        mt_genes = adata.var_names.isin(MT_ENSG)
     
     logger.info(f"Found {mt_genes.sum()} mitochondrial genes")
     
