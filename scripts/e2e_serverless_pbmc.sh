@@ -2671,6 +2671,10 @@ fi
 
 log_info "Step 11: Saving run metadata..."
 
+PISCEM_VERSION=$(piscem --version 2>&1 | head -1 || echo 'unknown')
+ALEVIN_FRY_VERSION=$(alevin-fry --version 2>&1 | head -1 || echo 'unknown')
+RADTK_VERSION=$(radtk --version 2>&1 | head -1 || echo 'unknown')
+
 cat > "$RUN_DIR/run.env" <<EOF
 RUN_ID=$RUN_ID
 DATASET=$DATASET
@@ -2690,6 +2694,11 @@ LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 LAMBDA_CONCURRENCY=${LAMBDA_CONCURRENCY:-unrestricted}
 RUN_DIR=$RUN_DIR
 BASENAME_WITH_LANE=$BASENAME_WITH_LANE
+PISCEM_VERSION=$PISCEM_VERSION
+ALEVIN_FRY_VERSION=$ALEVIN_FRY_VERSION
+RADTK_VERSION=$RADTK_VERSION
+RUN_QC=$RUN_QC
+WRITE_H5AD=$WRITE_H5AD
 EOF
 
 log_info "Run metadata saved to $RUN_DIR/run.env"
