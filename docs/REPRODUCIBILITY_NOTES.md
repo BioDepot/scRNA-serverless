@@ -62,8 +62,8 @@ The script creates a temporary tarball (~200 MB) in the repo directory during se
 
 | Dataset | Temp space (deleted after upload) | Results download | Total recommended free |
 |---|---|---|---|
-| PBMC 1K | ~200 MB | ~1 GB | ~2 GB |
-| PBMC 10K | ~200 MB | ~3-5 GB | ~10 GB |
+| PBMC 1K | ~200 MB | ~1 GB | ~5 GB |
+| PBMC 10K | ~200 MB | ~9 GB | ~30 GB |
 
 The FASTQs and intermediate files stay on the EC2 instance (500 GB EBS). Only the final count matrix, QC plots, and merged .rad file are downloaded locally.
 
@@ -112,7 +112,7 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 | `DOWNLOAD_RESULTS` | `1` | `1` = download results to local machine. `0` = leave on S3. |
 | `LOCAL_RESULTS_DIR` | `./serverless_runs` | Where downloaded results are saved. |
 
-> **Tip for PBMC 10K:** Results are ~3-5 GB. On slow wifi this download can take a while.
+> **Tip for PBMC 10K:** The results tarball is ~9 GB. On slow wifi this download can take a while.
 > Set `DOWNLOAD_RESULTS=0 CLEANUP_RESULTS=0` to skip the download and keep the results bucket.
 > The pipeline prints the bucket name and download commands at the end. To download later:
 >

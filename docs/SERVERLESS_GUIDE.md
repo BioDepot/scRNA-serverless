@@ -30,7 +30,7 @@ Free-tier instances (t3.micro/small/medium) are too small. The script selects th
 
 **Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
 
-**Local disk space:** Keep at least **1 GB free** (PBMC 1K) or **10 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
+**Local disk space:** Keep at least **5 GB free** (PBMC 1K) or **30 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
 
 ---
 
@@ -216,7 +216,7 @@ serverless_runs/
   │   ├── quants_mat.mtx                <-- *** COUNT MATRIX ***
   │   ├── quants_mat_rows.txt           <-- Gene names
   │   └── quants_mat_cols.txt           <-- Cell barcodes
-  └── qc_output/                        <-- If RUN_QC=1
+  └── analysis/out/                      <-- If RUN_QC=1
       ├── umap_leiden.png
       ├── qc_violin.png
       └── pbmc_adata.h5ad               <-- If WRITE_H5AD=1
