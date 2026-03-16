@@ -216,8 +216,8 @@ def compute_qc_metrics(adata: sc.AnnData) -> sc.AnnData:
     
     # Manual MT gene percentage calculation
     if mt_genes.sum() > 0:
-        mt_counts = adata.X[:, mt_genes].sum(axis=1).A1 if hasattr(adata.X, 'A1') else adata.X[:, mt_genes].sum(axis=1)
-        total_counts = adata.obs['total_counts'].values
+        mt_counts = np.asarray(adata.X[:, mt_genes].sum(axis=1)).ravel()
+        total_counts = np.asarray(adata.obs['total_counts'].values).ravel()
         adata.obs['pct_mt'] = (mt_counts / total_counts) * 100
         logger.info(f"Computed MT% per cell (range: {adata.obs['pct_mt'].min():.2f}%-{adata.obs['pct_mt'].max():.2f}%)")
     else:
