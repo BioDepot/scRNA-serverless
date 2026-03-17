@@ -140,6 +140,8 @@ Checks credentials, AMI, subnet, security group, instance profile, and keypair. 
 
 ### H) Run the pipeline
 
+> **Do not run PBMC 1K and PBMC 10K at the same time.** Each run shares AWS resources (S3 buckets, security groups) that are cleaned up when the run finishes. Running two datasets in parallel will cause the first to finish to destroy resources the other is still using. Run one dataset at a time, wait for it to complete, then run the next.
+
 **Minimal first run** (no QC, keep resources for inspection):
 
 ```bash

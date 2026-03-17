@@ -35,6 +35,8 @@ Click **On-Server scRNA Pipeline** in the left sidebar.
 
 #### 4. Configure and run
 
+> **Do not run PBMC 1K and PBMC 10K at the same time.** Run one dataset, wait for it to complete, then run the next.
+
 Click **Run workflow**. A dropdown appears with these options:
 
 - **Branch:** select the branch containing the pipeline code (e.g. `pr/repro-ami-e2e`)
@@ -92,6 +94,8 @@ The Codespace will build automatically using the included `.devcontainer/devcont
 ### Running the pipeline
 
 Once the Codespace terminal is ready:
+
+> **Do not run PBMC 1K and PBMC 10K at the same time.** Each run shares server resources (working directories, lock files) that are cleaned up when the run finishes. Run one dataset at a time, wait for it to complete, then run the next.
 
 ```bash
 # Dry-run (verify connectivity, tools, references, disk — takes < 1 min)

@@ -2,6 +2,8 @@
 
 The script reproduces the paper's pipeline exactly when run on a fully provisioned AWS account. For accounts with lower quotas or limits, the script automatically falls back to compatible settings. No manual configuration is needed. The output count matrices are identical regardless of which settings are used.
 
+> **Important:** Do not run PBMC 1K and PBMC 10K at the same time. Each run shares resources (S3 buckets, security groups, working directories) that are cleaned up when the run finishes. Running two datasets in parallel will cause the first to finish to destroy resources the other is still using. Always run one dataset at a time.
+
 ---
 
 ## Automatic fallbacks for AWS account limits
