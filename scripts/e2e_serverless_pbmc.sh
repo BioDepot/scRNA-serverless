@@ -2001,10 +2001,15 @@ SSHEOF
             fi
         fi
         
-        # Extract locally
+        # Extract locally and remove tarball to reclaim disk space
         if [[ -f "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" ]]; then
             log_info "Extracting results to $LOCAL_RESULTS_DIR/$RUN_ID/"
-            tar -xzf "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" -C "$LOCAL_RESULTS_DIR/$RUN_ID"
+            if tar -xzf "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz" -C "$LOCAL_RESULTS_DIR/$RUN_ID"; then
+                rm -f "$LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz"
+                log_info "Results extracted and tarball removed to reclaim disk space."
+            else
+                log_error "Extraction failed — tarball kept at $LOCAL_RESULTS_DIR/$RUN_ID/${RUN_ID}_results.tgz"
+            fi
             log_info "Results downloaded to: $LOCAL_RESULTS_DIR/$RUN_ID/$RUN_ID/"
         fi
     fi
@@ -2660,9 +2665,9 @@ fi
 
 log_info "Step 11: Saving run metadata..."
 
-PISCEM_VERSION=$(piscem --version 2>&1 | head -1 || echo 'unknown')
-ALEVIN_FRY_VERSION=$(alevin-fry --version 2>&1 | head -1 || echo 'unknown')
-RADTK_VERSION=$(radtk --version 2>&1 | head -1 || echo 'unknown')
+PISCEM_VERSION=$(piscem --version 2>/dev/null | head -1 || true)
+ALEVIN_FRY_VERSION=$(alevin-fry --version 2>/dev/null | head -1 || true)
+RADTK_VERSION=$(radtk --version 2>/dev/null | head -1 || true)
 
 cat > "$RUN_DIR/run.env" <<EOF
 RUN_ID=$RUN_ID

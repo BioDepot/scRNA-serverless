@@ -198,10 +198,27 @@ resolve_local() {
 }
 
 # ── main ──────────────────────────────────────────────────────────────────
-cleanup() { [[ -n "${CLEANUP_TMPDIR:-}" ]] && rm -rf "$CLEANUP_TMPDIR"; }
-trap cleanup EXIT
+cleanup() { [[ -n "${CLEANUP_TMPDIR:-}" ]] && rm -rf "$CLEANUP_TMPDIR" && CLEANUP_TMPDIR=""; }
+trap cleanup EXIT INT TERM
 
-REF_DIR=$(resolve_ref "$REF_INPUT")
+# Extract reference zip in the main shell so CLEANUP_TMPDIR persists
+# (resolve_ref runs in a subshell via $() — variable assignments don't propagate)
+_ref_in="${REF_INPUT//\\//}"
+if [[ -f "$_ref_in" && ! -d "$_ref_in" ]]; then
+    CLEANUP_TMPDIR=$(mktemp -d)
+    info "Extracting $(basename "$_ref_in") to temp directory …"
+    if command -v unzip &>/dev/null; then
+        unzip -q "$_ref_in" -d "$CLEANUP_TMPDIR"
+    elif command -v powershell.exe &>/dev/null; then
+        powershell.exe -NoProfile -Command \
+            "Expand-Archive -Path '$(cygpath -w "$_ref_in")' -DestinationPath '$(cygpath -w "$CLEANUP_TMPDIR")'"
+    else
+        echo "ERROR: No unzip or powershell available to extract the zip" >&2; exit 1
+    fi
+    REF_DIR=$(resolve_ref "$CLEANUP_TMPDIR")
+else
+    REF_DIR=$(resolve_ref "$REF_INPUT")
+fi
 LOCAL_DIR=$(resolve_local "$LOCAL_INPUT" "$DATASET")
 
 # ── auto-save log ────────────────────────────────────────────────────────
@@ -575,6 +592,8 @@ if [[ $WARNINGS -gt 0 ]]; then
     printf "  ${YELLOW}Warnings:${RESET}    %d\n" "$WARNINGS"
 fi
 echo
+
+cleanup
 
 if [[ $FAILURES -eq 0 ]]; then
     printf "${GREEN}${BOLD}✓ All checks passed – results are consistent.${RESET}\n\n"

@@ -277,6 +277,11 @@ Each path can be a `.zip` file or a folder. The folder must contain `alevin_outp
 | Per-barcode QC (`featureDump.txt`) | Row-by-row match |
 | File inventory | Lists all output files with sizes |
 
+**Expected warnings (not failures):**
+
+- **Barcode order differs** — Normal for serverless runs. Lambda invocations process chunks in parallel, so barcode ordering can vary. The script normalises order before comparing matrix values, so the actual data is verified identical.
+- **PISCEM_VERSION not set** — `piscem` runs inside the Lambda Docker container and is not installed on the EC2 driver instance, so the version cannot be captured in the serverless `run.env`. This does not affect results.
+
 **Output:**
 
 - Results print to the terminal with color-coded PASS/FAIL/WARN.
