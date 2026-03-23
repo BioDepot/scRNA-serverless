@@ -39,7 +39,7 @@ Click **On-Server scRNA Pipeline** in the left sidebar.
 
 Click **Run workflow**. A dropdown appears with these options:
 
-- **Branch:** select the branch containing the pipeline code (e.g. `pr/repro-ami-e2e`)
+- **Branch:** select `master`
 - **Dataset:** `pbmc1k` (~2 min pipeline, ~5 GB data) or `pbmc10k` (~10 min pipeline, ~44 GB data)
 - **Run QC:** `1` (recommended — generates UMAP + violin plots) or `0` (skip)
 - **Save h5ad:** `1` (save AnnData file for downstream analysis) or `0` (default, skip)
@@ -85,7 +85,7 @@ These are the same credentials used by GitHub Actions. Set each secret's reposit
 
 #### 2. Create a Codespace
 
-Go to the repository on GitHub. Click **Code** → **Codespaces** → **Create codespace on pr/repro-ami-e2e** (or the branch with the pipeline code).
+Go to the repository on GitHub. Click **Code** → **Codespaces** → **Create codespace on master**.
 
 > **Configuration:** Select the default **2-core** machine and **US West** region. The 2-core machine is free-tier eligible and sufficient for this pipeline.
 
@@ -277,10 +277,10 @@ bash scripts/e2e_onserver_pbmc.sh pbmc10k                    # run 10K dataset
 |---|---|
 | "SERVER_HOST and SSH_USER are not set" | **Actions:** GitHub Secrets not configured — contact the repo owner. **Codespaces:** add secrets at github.com/settings/codespaces with access to this repo. **Local:** create a `.env` file from `.env.example`. |
 | "Insufficient disk space" | Previous run may not have cleaned up. The pre-run cleanup should handle this automatically. If it persists, contact authors. |
-| "No such file or directory: e2e_onserver_pbmc.sh" | Wrong branch selected. Make sure you pick the branch with the pipeline code (e.g. `pr/repro-ami-e2e`), not `master`. |
+| "No such file or directory: e2e_onserver_pbmc.sh" | Make sure you selected the `master` branch when triggering the workflow. |
 | Stuck on "Downloading FASTQ files" | PBMC 1K is ~5 GB, 10K is ~44 GB. First download takes time. Subsequent runs use cache. |
 | No artifacts after Actions run | Make sure you selected `full-run`, not `dry-run`. |
 | Where are old runs? | **Actions:** click any previous run → download artifact (kept 30 days). **Codespaces:** check `onserver_runs/` in the file explorer. |
 | Run cancelled / interrupted | No cleanup needed. The next run auto-cleans leftover files before starting. |
 | Codespace can't connect to server | Run `echo $SSH_USER` in the terminal — if blank, your Codespaces secrets aren't set or don't have access to this repo. |
-| Codespace shows raw IP/username | Pull the latest code: `git pull origin pr/repro-ami-e2e`. The masking fix requires the latest version. |
+| Codespace shows raw IP/username | Pull the latest code: `git pull origin master`. The masking fix requires the latest version. |
