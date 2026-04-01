@@ -3,13 +3,15 @@
 This pipeline processes single-cell RNA sequencing (scRNA-seq) data using the Piscem-Alevin-Fry workflow. It supports two execution modes:
 
 1. **Serverless (AWS Lambda)** — Parallel read mapping across multiple Lambda instances for large-scale speedup.
-2. **Standalone (any Linux machine)** — Run the full pipeline locally with no cloud dependencies.
+2. **On-server / Standalone (any Linux machine)** — Reproduces the traditional on-server execution baseline from the paper, running the full pipeline locally with no cloud dependencies.
 
 Both modes produce identical gene-by-cell count matrices.
 
 ---
 
-## Quick start (standalone)
+## Quick start (on-server baseline)
+
+The standalone script reproduces the "On-Server (SSD) Execution" baseline from the paper (Table 2). It runs the identical Piscem-Alevin-Fry pipeline on any Linux x86_64 machine:
 
 ```bash
 git clone https://github.com/BioDepot/scRNA-serverless.git
