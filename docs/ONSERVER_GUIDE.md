@@ -18,43 +18,43 @@ Run the scRNA-seq pipeline on a dedicated Linux server at UW Tacoma. Three ways 
 
 - A web browser
 - A GitHub account ([sign up free](https://github.com/signup))
+- Server credentials provided by the authors
 
 ### Steps
 
-#### 1. Go to the repository
+#### 1. Fork the repository
 
-Open **https://github.com/BioDepot/scRNA-serverless** in your browser.
+Open **https://github.com/BioDepot/scRNA-serverless** and click **Fork** (top right). This creates a copy under your own GitHub account.
 
-#### 2. Open the Actions tab
+#### 2. Add server credentials
 
-Click **Actions** in the top navigation bar.
+In your fork, go to **Settings → Secrets and variables → Actions** and add three secrets using the values provided by the authors:
 
-#### 3. Select the workflow
+| Secret name | Value |
+|---|---|
+| `SSH_USER` | *(provided by authors)* |
+| `SSH_PASSWORD` | *(provided by authors)* |
+| `SERVER_HOST` | *(provided by authors)* |
 
-Click **On-Server scRNA Pipeline** in the left sidebar.
+#### 3. Run the workflow
 
-#### 4. Configure and run
+Go to the **Actions** tab in your fork. Click **On-Server scRNA Pipeline** in the left sidebar, then click **Run workflow**.
 
-> **Do not run PBMC 1K and PBMC 10K at the same time.** Run one dataset, wait for it to complete, then run the next.
-
-Click **Run workflow**. A dropdown appears with these options:
-
-- **Branch:** select `master`
-- **Dataset:** `pbmc1k` (~2 min pipeline, ~5 GB data) or `pbmc10k` (~10 min pipeline, ~44 GB data)
-- **Run QC:** `1` (recommended — generates UMAP + violin plots) or `0` (skip)
-- **Save h5ad:** `1` (save AnnData file for downstream analysis) or `0` (default, skip)
-- **Execution mode:** `full-run` or `dry-run` (checks tools/refs/disk without running)
+- **Branch:** `master`
+- **Dataset:** `pbmc1k`
+- **Run QC:** `1` (recommended)
+- **Save h5ad:** `0` (default)
+- **Execution mode:** `full-run`
 
 Click the green **Run workflow** button.
 
-#### 5. Wait for completion
+#### 4. Wait for completion
 
 Click the running workflow to watch live logs. A green checkmark means it finished successfully.
 
 - **PBMC 1K** typically takes 3–5 minutes total
-- **PBMC 10K** typically takes 15–25 minutes total (longer if FASTQs need downloading)
 
-#### 6. Download results
+#### 5. Download results
 
 Scroll to **Artifacts** at the bottom of the completed run. Click the artifact (e.g. `onserver-pbmc1k-results`) to download a ZIP file.
 
@@ -68,34 +68,37 @@ Run the pipeline from an interactive cloud terminal — no local software needed
 
 - A web browser
 - A GitHub account ([sign up free](https://github.com/signup))
+- Server credentials provided by the authors
 
 ### One-time setup
 
-#### 1. Add Codespaces secrets
+#### 1. Fork the repository
 
-Go to **https://github.com/settings/codespaces** and add three secrets:
+If you haven't already (from Option A), fork **https://github.com/BioDepot/scRNA-serverless** to your own GitHub account.
+
+#### 2. Add Codespaces secrets
+
+Go to **https://github.com/settings/codespaces** and add three secrets using the values provided by the authors:
 
 | Secret name | Value | Repository access |
 |---|---|---|
-| `SSH_USER` | Server username | `BioDepot/scRNA-serverless` |
-| `SSH_PASSWORD` | Server password | `BioDepot/scRNA-serverless` |
-| `SERVER_HOST` | Server IP address | `BioDepot/scRNA-serverless` |
+| `SSH_USER` | *(provided by authors)* | Your fork (e.g. `your-username/scRNA-serverless`) |
+| `SSH_PASSWORD` | *(provided by authors)* | Your fork |
+| `SERVER_HOST` | *(provided by authors)* | Your fork |
 
-These are the same credentials used by GitHub Actions. Set each secret's repository access to **BioDepot/scRNA-serverless** (or "All repositories").
+Set each secret's repository access to your fork (or "All repositories").
 
-#### 2. Create a Codespace
+#### 3. Create a Codespace
 
-Go to the repository on GitHub. Click **Code** → **Codespaces** → **Create codespace on master**.
-
-> **Configuration:** Select the default **2-core** machine and **US West** region. The 2-core machine is free-tier eligible and sufficient for this pipeline.
+Go to **your fork** on GitHub. Click **Code** → **Codespaces** → **Create codespace on master**.
 
 The Codespace will build automatically using the included `.devcontainer/devcontainer.json` configuration, which installs `sshpass` and Python.
+
+> **Important:** Delete the Codespace when you're done (go to github.com/codespaces → delete). Stopped Codespaces still consume storage quota.
 
 ### Running the pipeline
 
 Once the Codespace terminal is ready:
-
-> **Do not run PBMC 1K and PBMC 10K at the same time.** Each run shares server resources (working directories, lock files) that are cleaned up when the run finishes. Run one dataset at a time, wait for it to complete, then run the next.
 
 ```bash
 # Dry-run (verify connectivity, tools, references, disk — takes < 1 min)
@@ -103,9 +106,6 @@ bash scripts/e2e_onserver_pbmc.sh pbmc1k --dry-run
 
 # Full run — PBMC 1K (~3–5 min)
 bash scripts/e2e_onserver_pbmc.sh pbmc1k
-
-# Full run — PBMC 10K (~15–25 min)
-bash scripts/e2e_onserver_pbmc.sh pbmc10k
 ```
 
 Optional flags:
@@ -117,7 +117,7 @@ WRITE_H5AD=1 bash scripts/e2e_onserver_pbmc.sh pbmc1k       # save h5ad
 
 ### Where are results?
 
-Results are downloaded to the `onserver_runs/` directory inside the Codespace. You can browse them in the Codespace file explorer (left sidebar) or download them from the terminal:
+Results are downloaded to the `onserver_runs/` directory inside the Codespace. You can browse them in the Codespace file explorer (left sidebar) or download them:
 
 1. Right-click any file in the file explorer → **Download**
 2. Or use the terminal: the files are at `onserver_runs/<run-id>/`
