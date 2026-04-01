@@ -212,7 +212,7 @@ This script verifies that two pipeline runs produced identical count matrices. U
 
 **What you need:**
 
-1. **Run A (reference)** — a zip file or folder containing results from one pipeline run (e.g. the on-server results zip from GitHub Actions).
+1. **Run A (reference)** — a zip file or folder containing results from one pipeline run (e.g. a standalone run from `standalone_runs/`).
 2. **Run B (local)** — a folder containing results from another pipeline run (e.g. your serverless results in `serverless_runs/`).
 
 **Quick start:**
@@ -225,24 +225,18 @@ bash scripts/compare_results.sh <1k|10k> <path-to-run-A> [path-to-run-B]
 - Second argument: path to Run A — can be a `.zip` file or a folder.
 - Third argument *(optional)*: path to Run B. If you skip this, the script automatically finds your **most recent** matching run inside `serverless_runs/`.
 
-**Example 1 — Zip against a specific serverless run folder**
-
-After downloading the on-server results zip from GitHub Actions Artifacts:
+**Example 1 — Standalone run against a serverless run**
 
 ```bash
-bash scripts/compare_results.sh 1k "D:/Users/me/Downloads/onserver-pbmc1k-results.zip" serverless_runs/pbmc-1773250297-b2057eb4
+bash scripts/compare_results.sh 1k standalone_runs/pbmc1k-1772013763-437c7c16 serverless_runs/pbmc-1773250297-b2057eb4
 ```
 
-**Example 2 — Zip only (auto-detect local run)**
+**Example 2 — Folder only (auto-detect local run)**
 
 If you skip the third argument, the script finds your latest matching run in `serverless_runs/` automatically:
 
 ```bash
-# PBMC 1K
-bash scripts/compare_results.sh 1k "D:/Users/me/Downloads/onserver-pbmc1k-results.zip"
-
-# PBMC 10K
-bash scripts/compare_results.sh 10k "D:/Users/me/Downloads/onserver-pbmc10k-results.zip"
+bash scripts/compare_results.sh 1k standalone_runs/pbmc1k-1772013763-437c7c16
 ```
 
 **Example 3 — Two serverless runs against each other**

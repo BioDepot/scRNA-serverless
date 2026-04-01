@@ -6,9 +6,6 @@ scripts/__pycache__/
 .env.enc
 *.pem
 
-# IDE/editor
-.vscode/
-.idea/
 
 # Pipeline run outputs
 serverless_runs/
