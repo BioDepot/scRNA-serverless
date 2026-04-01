@@ -9,7 +9,7 @@ on:
         type: choice
         options:
           - pbmc1k
-          - pbmc10k
+          # - pbmc10k  # Uncomment to enable PBMC 10K (see ONSERVER_GUIDE.md)
         default: pbmc1k
       run_qc:
         description: "Run QC analysis (UMAP + violin plots)"

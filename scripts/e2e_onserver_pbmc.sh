@@ -295,6 +295,22 @@ if [[ "$DATASET" != "pbmc1k" && "$DATASET" != "pbmc10k" ]]; then
     die "Unknown dataset: $DATASET (must be pbmc1k or pbmc10k)"
 fi
 
+# ── PBMC 10K is disabled by default ──────────────────────────────────────────
+# To enable, comment out or remove this block. See docs/ONSERVER_GUIDE.md
+# for full instructions.
+if [[ "$DATASET" == "pbmc10k" && "${ALLOW_10K:-0}" != "1" ]]; then
+    echo ""
+    echo "  PBMC 10K is disabled by default."
+    echo "  To enable, set ALLOW_10K=1 before running:"
+    echo ""
+    echo "    ALLOW_10K=1 bash scripts/e2e_onserver_pbmc.sh pbmc10k"
+    echo ""
+    echo "  See docs/ONSERVER_GUIDE.md for details."
+    echo ""
+    exit 1
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 if [[ $# -gt 1 ]]; then
     case "$2" in
         --run) RUN_MODE=1 ;;

@@ -182,6 +182,41 @@ FASTQ download time is **not included** in the pipeline total — the paper assu
 
 ---
 
+## Running PBMC 10K (optional)
+
+By default, only PBMC 1K is enabled. The pipeline fully supports PBMC 10K — it is disabled to conserve server disk space for routine reviewer runs. To enable it:
+
+### Via Codespaces
+
+Open a Codespace on the repository, then run:
+
+```bash
+ALLOW_10K=1 bash scripts/e2e_onserver_pbmc.sh pbmc10k
+```
+
+No file edits needed — the `ALLOW_10K=1` flag bypasses the guard.
+
+### Via GitHub Actions (requires a fork)
+
+1. **Fork** the repository to your own GitHub account
+2. In your fork, edit `.github/workflows/onserver-pipeline.yml`
+3. Find the `dataset` options and uncomment `pbmc10k`:
+
+```yaml
+        options:
+          - pbmc1k
+          - pbmc10k  # uncomment this line
+```
+
+4. Set your three secrets (`SSH_USER`, `SSH_PASSWORD`, `SERVER_HOST`) in your fork's **Settings → Secrets and variables → Actions**
+5. Run the workflow from your fork — select `pbmc10k` as the dataset
+
+### Disk requirements
+
+PBMC 10K requires **20 GB+ free** on the server (with cached FASTQs) or **60 GB+** (first run, FASTQs not yet downloaded). The PBMC 10K FASTQ dataset is approximately 44 GB.
+
+---
+
 ## FASTQ caching
 
 FASTQs are cached on the server after the first download. On subsequent runs:
@@ -216,15 +251,22 @@ What is **never** deleted:
 
 ## Credentials
 
-Server credentials are stored as **GitHub Secrets** — encrypted, injected at runtime, never visible in logs or code. Three secrets are required: `SSH_USER`, `SSH_PASSWORD`, and `SERVER_HOST`. All three must be configured for whichever method you use:
+The pipeline connects to the server over SSH. Three credentials are required: `SSH_USER`, `SSH_PASSWORD`, and `SERVER_HOST`.
+
+**For reviewers:** The authors will provide server credentials (a guest account). To use them:
+
+1. **Fork** the repository to your own GitHub account
+2. In your fork, go to **Settings → Secrets and variables → Actions**
+3. Add the three secrets with the values provided by the authors
+4. Run the workflow from your fork's **Actions** tab
+
+The secrets are encrypted by GitHub and injected at runtime — they are never visible in logs, code, or workflow output. All terminal output (including third-party tool logs) automatically masks the username and IP, replacing them with `***`.
 
 | Method | Where to set all 3 secrets |
 |---|---|
-| GitHub Actions | Repo **Settings → Secrets and variables → Actions** (set by repo owner) |
-| Codespaces | **github.com/settings/codespaces** (set by each user) |
+| GitHub Actions | Fork the repo → **Settings → Secrets and variables → Actions** |
+| Codespaces | **github.com/settings/codespaces** (set repository access to your fork) |
 | Local terminal | `.env` file in the repo root (see Option C) |
-
-All output — including third-party tool logs from piscem, alevin-fry, and Python — is automatically masked. The username and IP are replaced with `***` in every log line.
 
 ---
 
