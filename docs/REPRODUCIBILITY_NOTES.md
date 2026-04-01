@@ -161,33 +161,20 @@ bash scripts/e2e_serverless_pbmc.sh pbmc1k --dry-run
 
 ---
 
-### `scripts/e2e_onserver_pbmc.sh` — On-server pipeline
+### `scripts/e2e_standalone_pbmc.sh` — Standalone on-server pipeline
 
-Runs the pipeline on a dedicated Linux server (UW Tacoma) over SSH. Normally triggered by GitHub Actions, but can also be run locally.
+Runs the full Piscem-Alevin-Fry pipeline on **any Linux x86_64 machine**. No SSH, no credentials, no AWS. Downloads all tools, reference data, and FASTQs from public sources automatically.
+
+See [ONSERVER_GUIDE.md](ONSERVER_GUIDE.md) for full instructions.
 
 **Usage:**
 
 ```bash
-bash scripts/e2e_onserver_pbmc.sh <dataset> [--dry-run]
+bash scripts/e2e_standalone_pbmc.sh <dataset> [--dry-run]
 ```
 
 - `<dataset>`: `pbmc1k` or `pbmc10k`
-- `--dry-run`: check tools, references, and disk on the server without running
-
-**Via GitHub Actions** (recommended):
-
-1. Go to the repository **Actions** tab
-2. Select **On-Server scRNA Pipeline**
-3. Click **Run workflow**, choose branch, dataset, QC, h5ad, and mode
-4. Download results from **Artifacts** when finished
-
-**Required environment variables** (for local use — GitHub Actions sets these automatically):
-
-| Variable | Purpose |
-|---|---|
-| `SERVER_HOST` | Server IP or hostname |
-| `SSH_USER` | SSH username |
-| `SSH_PASSWORD` | SSH password |
+- `--dry-run`: check tools, download reference/FASTQs, validate — without running the pipeline
 
 **Optional environment variables:**
 
@@ -195,25 +182,26 @@ bash scripts/e2e_onserver_pbmc.sh <dataset> [--dry-run]
 |---|---|---|
 | `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip. |
 | `WRITE_H5AD` | `0` | `1` = save `.h5ad` file. `0` = skip. |
-| `DOWNLOAD_RESULTS` | `1` | `1` = download results locally. `0` = leave on server. |
-| `LOCAL_RESULTS_DIR` | `./onserver_runs` | Where downloaded results are saved. |
-| `THREADS` | auto (server cores) | CPU threads on the server. |
-| `RUN_ID` | auto-generated | Custom run identifier. |
+| `THREADS` | auto (`nproc`) | CPU threads for tools. |
+| `DATA_DIR` | `./data` | Where reference + FASTQs are cached. |
+| `TOOLS_DIR` | `./tools` | Where tools are installed. |
+| `RESULTS_DIR` | `./standalone_runs` | Where results are saved. |
+| `ALLOW_10K` | `0` | `1` = enable PBMC 10K (disabled by default). |
 
 **Examples:**
 
 ```bash
-# Local run (needs .env or exported vars)
-bash scripts/e2e_onserver_pbmc.sh pbmc1k
+# Full run
+bash scripts/e2e_standalone_pbmc.sh pbmc1k
 
 # Skip QC
-RUN_QC=0 bash scripts/e2e_onserver_pbmc.sh pbmc1k
+RUN_QC=0 bash scripts/e2e_standalone_pbmc.sh pbmc1k
 
 # 10K with h5ad
-WRITE_H5AD=1 bash scripts/e2e_onserver_pbmc.sh pbmc10k
+ALLOW_10K=1 WRITE_H5AD=1 bash scripts/e2e_standalone_pbmc.sh pbmc10k
 
 # Dry run
-bash scripts/e2e_onserver_pbmc.sh pbmc1k --dry-run
+bash scripts/e2e_standalone_pbmc.sh pbmc1k --dry-run
 ```
 
 ---

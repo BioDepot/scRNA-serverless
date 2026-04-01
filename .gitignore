@@ -1,9 +1,10 @@
 __pycache__/
 scripts/__pycache__/
 
-# Credentials — never commit
+# Credentials and keys — never commit
 .env
 .env.enc
+*.pem
 
 # IDE/editor
 .vscode/
@@ -13,7 +14,12 @@ scripts/__pycache__/
 serverless_runs/
 runs/
 onserver_runs/
+standalone_runs/
 *.log
+
+# Standalone pipeline data (downloaded at runtime)
+data/
+tools/
 
 # Temp tarballs created during SSM transfer
 scrna-repo-*.tar.gz

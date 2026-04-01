@@ -1,8 +1,0 @@
-{
-  "name": "scRNA-serverless",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y sshpass",
-  "features": {
-    "ghcr.io/devcontainers/features/python:1": {}
-  }
-}
