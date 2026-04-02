@@ -19,7 +19,7 @@ cd scRNA-serverless
 bash scripts/e2e_standalone_pbmc.sh pbmc1k
 ```
 
-Everything (tools, reference data, FASTQs) is downloaded automatically from public sources. See the [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) for details.
+Everything (tools, reference data, FASTQs) is downloaded automatically from public sources. The pre-built reference index is archived on Zenodo ([DOI: 10.5281/zenodo.19375096](https://doi.org/10.5281/zenodo.19375096)). See the [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) for details.
 
 ---
 

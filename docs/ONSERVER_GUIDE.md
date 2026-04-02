@@ -5,7 +5,7 @@ Run the scRNA-seq pipeline on **any Linux machine**. Everything is downloaded au
 | Component | Source | Size |
 |---|---|---|
 | Tools (piscem, alevin-fry, radtk) | [GitHub Releases](https://github.com/COMBINE-lab) | ~30 MB |
-| Reference index + t2g.tsv | [Zenodo (record 19375096)](https://zenodo.org/records/19375096) | ~177 MB |
+| Reference index + t2g.tsv | [Zenodo DOI: 10.5281/zenodo.19375096](https://doi.org/10.5281/zenodo.19375096) | ~177 MB |
 | PBMC 1K FASTQs | [10x Genomics](https://www.10xgenomics.com/datasets) | ~5 GB |
 
 > **No AWS account needed.** No S3, no Lambda, no EC2. No server credentials.
