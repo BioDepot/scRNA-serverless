@@ -21,6 +21,18 @@ bash scripts/e2e_standalone_pbmc.sh pbmc1k
 
 Everything (tools, reference data, FASTQs) is downloaded automatically from public sources. The pre-built reference index is archived on Zenodo ([DOI: 10.5281/zenodo.19375096](https://doi.org/10.5281/zenodo.19375096)). See the [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) for details.
 
+## Quick start (serverless)
+
+One script covers PBMC 1K, PBMC 10K, and the MSK KO dataset. After the one-time AWS setup in the [Serverless Pipeline Guide](docs/SERVERLESS_GUIDE.md):
+
+```bash
+bash scripts/e2e_serverless_pbmc.sh pbmc1k
+bash scripts/e2e_serverless_pbmc.sh pbmc10k
+bash scripts/e2e_serverless_pbmc.sh ko
+```
+
+The driver launches an **m5dn.8xlarge**, stripes both NVMe disks as RAID 0, splits FASTQs with rapidgzip `-P 8` and 2 lanes at a time, maps on Lambda, then runs alevin-fry on the instance.
+
 ---
 
 ## Documentation

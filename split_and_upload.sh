@@ -33,10 +33,30 @@ R2_FILE=$(basename "$R2_S3_PATH")
 R1_BASE="${R1_FILE%.fastq.gz}"
 R2_BASE="${R2_FILE%.fastq.gz}"
 
+# Caller sets DECOMP_THREADS so concurrent lanes still fit on the box.
+# Default is 8 (fastest setting we measured on a single gzip stream).
+DECOMP_THREADS="${DECOMP_THREADS:-8}"
+(( DECOMP_THREADS < 1 )) && DECOMP_THREADS=1
+
+# USE_RAPIDGZIP=0 uses zcat, which is how Table 1 in the paper was produced.
+if [[ "${USE_RAPIDGZIP:-1}" == "0" ]]; then
+    DECOMP=(zcat)
+    echo "Decompressing with zcat (USE_RAPIDGZIP=0)"
+elif command -v rapidgzip >/dev/null 2>&1; then
+    DECOMP=(rapidgzip -d -c -P "$DECOMP_THREADS")
+    echo "Decompressing with rapidgzip (-P $DECOMP_THREADS)"
+else
+    DECOMP=(zcat)
+    echo "WARNING: rapidgzip not on PATH, falling back to zcat" >&2
+fi
+
 echo "Streaming & Splitting FASTQ files from S3 (split every $SPLIT_LINES lines)..."
-aws s3 cp "$R1_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
-aws s3 cp "$R2_S3_FULL_PATH" - | zcat | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
-wait
+aws s3 cp "$R1_S3_FULL_PATH" - | "${DECOMP[@]}" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+R1_PID=$!
+aws s3 cp "$R2_S3_FULL_PATH" - | "${DECOMP[@]}" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+R2_PID=$!
+wait "$R1_PID" || { echo "ERROR: R1 stream failed for $R1_BASE" >&2; exit 1; }
+wait "$R2_PID" || { echo "ERROR: R2 stream failed for $R2_BASE" >&2; exit 1; }
 
 # Rename files to remove zero padding (_p00 -> _p0, _p01 -> _p1, etc.)
 echo "Renaming split files..."

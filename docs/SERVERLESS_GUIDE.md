@@ -19,14 +19,7 @@ The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parall
 - An IAM role with `AdministratorAccess` (created in Step C below)
 - An EC2 keypair in us-east-2 (created in Step D below)
 
-**Minimum EC2 instance (auto-selected by the script):**
-
-| Dataset | Min instance | RAM |
-|---|---|---|
-| PBMC 1K | t3.large | 8 GB |
-| PBMC 10K | t3.xlarge | 16 GB |
-
-Free-tier instances (t3.micro/small/medium) are too small. The script selects the best instance your account supports automatically. You do not manually launch any EC2 instance. See [Reproducibility Notes](REPRODUCIBILITY_NOTES.md) for the full instance fallback chain.
+**EC2 instance:** The script launches **m5dn.8xlarge** (32 vCPU, two NVMe disks). That is the machine used for the completed 1K, 10K, and KO runs. You do not launch the instance yourself. If that type is unavailable, the script tries smaller types. See [Reproducibility Notes](REPRODUCIBILITY_NOTES.md).
 
 **Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
 
@@ -140,7 +133,11 @@ Checks credentials, AMI, subnet, security group, instance profile, and keypair. 
 
 ### H) Run the pipeline
 
-> **Do not run PBMC 1K and PBMC 10K at the same time.** Each run shares AWS resources (S3 buckets, security groups) that are cleaned up when the run finishes. Running two datasets in parallel will cause the first to finish to destroy resources the other is still using. Run one dataset at a time, wait for it to complete, then run the next.
+Each of these uses m5dn.8xlarge, RAID 0 on both NVMe disks, rapidgzip `-P 8`, and 2 lanes at a time. No extra flags.
+
+> **Do not run two datasets at the same time.** Each run shares AWS resources that are cleaned up when it finishes.
+
+Run one dataset, wait until it finishes, then run the next.
 
 **Minimal first run** (no QC, keep resources for inspection):
 
@@ -162,6 +159,14 @@ bash scripts/e2e_serverless_pbmc.sh pbmc1k
 bash scripts/e2e_serverless_pbmc.sh pbmc10k
 ```
 
+**MSK KO:**
+
+```bash
+bash scripts/e2e_serverless_pbmc.sh ko
+```
+
+KO uses the same RAID 0, rapidgzip `-P 8`, and lane-concurrency settings as 1K/10K. QC and the local results download are turned off (the matrix is huge). `timings.csv` stays on the instance and in the run log. Set `DOWNLOAD_KO_RESULTS=1` only if you really want the matrix copied home.
+
 **PBMC 10K on slow wifi** (skip download, fetch results later):
 
 ```bash
@@ -179,13 +184,15 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 
 1. Launches an EC2 instance from the public seed AMI
 2. Uploads the repository code to the instance
-3. Builds a Docker image with piscem + reference index, pushes to ECR
-4. Creates S3 buckets, Lambda function, and EventBridge rule
-5. Downloads FASTQs, splits them, uploads splits to S3
-6. Lambda functions map each split in parallel (piscem)
-7. Downloads Lambda outputs, merges .rad files
-8. Runs alevin-fry (generate-permit-list, collate, quant)
-9. Runs QC (optional), downloads results locally, cleans up
+3. If two or more NVMe instance-store disks are present, stripes them as RAID 0 at `/mnt/nvme`
+4. Builds a Docker image with piscem + reference index, pushes to ECR
+5. Creates S3 buckets, Lambda function, and EventBridge rule
+6. Downloads FASTQs. Split and Upload uses rapidgzip `-P 8` per stream and only as many lanes at once as fit on the box
+7. Lambda functions map each split in parallel (piscem)
+8. If mapping stops making progress for longer than the Lambda timeout plus 3 minutes, the script exits and lists the missing shards
+9. Downloads Lambda outputs, merges .rad files
+10. Runs alevin-fry (generate-permit-list, collate, quant)
+11. Runs QC (optional), downloads results locally, cleans up
 
 ---
 
@@ -233,8 +240,10 @@ serverless_runs/
 | Lambda memory quota too low | Falls back to 3,008 MB automatically |
 | EC2 vCPU quota too low | Falls through instance chain automatically |
 | No NVMe storage | Uses EBS root volume |
+| Two or more NVMe disks | RAID 0 at `/mnt/nvme` |
 | SSH blocked | Falls back to SSM automatically |
-| Lambda timeout exceeded | Fails fast after 2x timeout |
+| Lambda shard dies mid-map | Stops polling after timeout + 3 min with no new `output.txt` |
+| Lambda produces zero outputs | Fails after 2x the Lambda timeout |
 
 For details on automatic fallbacks (instance types, memory, threads, splitting), see [Reproducibility Notes](REPRODUCIBILITY_NOTES.md).
 
@@ -248,7 +257,7 @@ Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
 |---|---|---|---|
 | `DEFAULT_SEED_AMI_ID` | 219 | `ami-079f71ff8e580ef1f` | Seed AMI |
 | `DEFAULT_AWS_REGION` | 215 | `us-east-2` | Region |
-| `INSTANCE_TYPE` | 234 | `m6id.16xlarge` | EC2 type |
+| `INSTANCE_TYPE` | 241 | `m5dn.8xlarge` | EC2 type |
 | `ROOT_VOL_GB` | 235 | `500` | EBS size (GB) |
 | `LAMBDA_MEMORY_MB` | 248 | `10240` | Lambda RAM |
 | `LAMBDA_TIMEOUT_SEC` | 250 | `900` | Lambda timeout |

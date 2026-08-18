@@ -14,6 +14,12 @@
 #   export EC2_INSTANCE_PROFILE_NAME=my-instance-profile  # REQUIRED
 #   bash scripts/e2e_serverless_pbmc.sh pbmc1k
 #   bash scripts/e2e_serverless_pbmc.sh pbmc10k
+#   bash scripts/e2e_serverless_pbmc.sh ko
+#
+# Split and Upload uses rapidgzip -P 8 per gzip stream. Lane concurrency is
+# capped so those 8 threads fit on the box (2 lanes on 32 vCPU, 4 on 64).
+# If two or more NVMe instance-store disks are present they are striped as
+# RAID 0 at /mnt/nvme.
 #
 #   # Run mode (on EC2 instance):
 #   bash scripts/e2e_serverless_pbmc.sh pbmc1k --run
@@ -21,7 +27,7 @@
 # ENVIRONMENT VARIABLES (set before calling):
 #   SEED_AMI_ID            Required in driver mode. AMI with pre-installed reference data.
 #   AWS_REGION             AWS region (default: us-east-2)
-#   INSTANCE_TYPE          EC2 instance type (default: m6id.16xlarge)
+#   INSTANCE_TYPE          EC2 instance type (default: m5dn.8xlarge)
 #   ROOT_VOL_GB            EBS root volume size in GB (default: 500)
 #   KEY_NAME               Required in driver mode when USE_SSM=0. Existing EC2 keypair name.
 #   KEY_PEM_PATH           Required in driver mode when USE_SSM=0. Path to .pem file for SSH.
@@ -46,6 +52,7 @@
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
 #   DOWNLOAD_TO_LOCAL      Download results from EC2 to local machine (default: 1). Alias for DOWNLOAD_RESULTS.
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
+#   USE_RAPIDGZIP          1 = rapidgzip -P 8 for Split and Upload (default). 0 = zcat.
 #
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
 #   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar. Auto-set by DATASET if empty.
@@ -215,7 +222,7 @@ trap cleanup_on_exit EXIT INT TERM
 DEFAULT_AWS_REGION="us-east-2"
 DEFAULT_KEY_NAME=""
 DEFAULT_KEY_PEM_PATH=""
-DEFAULT_EC2_INSTANCE_PROFILE_NAME=""
+DEFAULT_EC2_INSTANCE_PROFILE_NAME="scrna-serverless-ec2-role"
 DEFAULT_SEED_AMI_ID="ami-079f71ff8e580ef1f"  # Author's seed AMI (hardcoded for reproducibility)
 SEED_AMI_NAME_PREFIX="scrna-seed-"  # Used to auto-detect seed AMI by name (for reviewers)
 SEED_AMI_OWNER="${SEED_AMI_OWNER:-self}"  # For reviewers: set to publisher account ID
@@ -231,12 +238,15 @@ AUTO_DETECT_SEED_AMI=0             # For authors: disabled (use hardcoded AMI). 
 AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
-INSTANCE_TYPE="${INSTANCE_TYPE:-m6id.16xlarge}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-m5dn.8xlarge}"
 ROOT_VOL_GB="${ROOT_VOL_GB:-500}"
 KEY_NAME="${KEY_NAME:-$DEFAULT_KEY_NAME}"
 KEY_PEM_PATH="${KEY_PEM_PATH:-$DEFAULT_KEY_PEM_PATH}"
 SUBNET_ID="${SUBNET_ID:-}"
 SG_ID="${SG_ID:-}"
+# Only populated when subnets are auto-detected; stays empty when SUBNET_ID is
+# supplied, so it must exist up front for the AZ-fallback loop under `set -u`.
+PUBLIC_SUBNETS=()
 DRIVER_INSTANCE_ID="${DRIVER_INSTANCE_ID:-}"
 EC2_INSTANCE_PROFILE_NAME="${EC2_INSTANCE_PROFILE_NAME:-$DEFAULT_EC2_INSTANCE_PROFILE_NAME}"
 AUTO_SSH_INGRESS="${AUTO_SSH_INGRESS:-1}"
@@ -267,6 +277,7 @@ RUN_ID="${RUN_ID:-}"
 SPLIT_LINES="${SPLIT_LINES:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
+USE_RAPIDGZIP="${USE_RAPIDGZIP:-1}"
 
 # Derived values (will be set later)
 RUN_MODE=0
@@ -759,6 +770,100 @@ find_s3_fastq_pairs() {
     done
 }
 
+# Stream the MorPhiC KO R1/R2 FASTQs from ENA into a persistent S3 cache.
+# Index reads (I1/I2) are skipped. Fetch time is recorded but excluded from
+# Table 1, matching the paper caption. The cache survives CLEANUP_AWS so a
+# retry does not pull 450 GB from ENA again.
+fetch_ko_fastqs() {
+    local manifest="${KO_ENA_MANIFEST:-/home/ubuntu/scrna-repo/scripts/ko_ena_r1r2.tsv}"
+    [[ -f "$manifest" ]] || die "KO ENA manifest missing: $manifest"
+
+    KO_FASTQ_CACHE_BUCKET="${KO_FASTQ_CACHE_BUCKET:-scrna-ko-fastq-${AWS_ACCOUNT_ID}-${AWS_REGION}}"
+    export KO_FASTQ_CACHE_BUCKET
+    log_info "KO FASTQ cache: s3://$KO_FASTQ_CACHE_BUCKET/ko/"
+    aws s3 mb "s3://$KO_FASTQ_CACHE_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+
+    local work="$RUN_DIR/ko_fetch"
+    mkdir -p "$work"
+    local todo="$work/todo.tsv"
+    : > "$todo"
+    LANE_BASENAMES=()
+    LANE_R1_PATHS=()
+    LANE_R2_PATHS=()
+
+    local filename bytes url cached
+    while IFS=$'\t' read -r filename bytes url; do
+        [[ "$filename" == "filename" || -z "$filename" ]] && continue
+        cached=$(aws s3api head-object --bucket "$KO_FASTQ_CACHE_BUCKET" --key "ko/$filename" \
+            --query ContentLength --output text --region "$AWS_REGION" 2>/dev/null || echo 0)
+        if [[ "$cached" == "$bytes" ]]; then
+            :
+        else
+            printf '%s\t%s\t%s\n' "$filename" "$bytes" "$url" >> "$todo"
+        fi
+        if [[ "$filename" == *_R1_001.fastq.gz ]]; then
+            local lane="${filename%_R1_001.fastq.gz}"
+            LANE_BASENAMES+=("$lane")
+            LANE_R1_PATHS+=("s3://$KO_FASTQ_CACHE_BUCKET/ko/${lane}_R1_001.fastq.gz")
+            LANE_R2_PATHS+=("s3://$KO_FASTQ_CACHE_BUCKET/ko/${lane}_R2_001.fastq.gz")
+        fi
+    done < "$manifest"
+
+    local n_todo
+    n_todo=$(grep -c . "$todo" 2>/dev/null || echo 0)
+    if [[ "${n_todo:-0}" -gt 0 ]]; then
+        log_info "Downloading $n_todo KO file(s) from ENA into the cache (8 at a time)..."
+        local failf="$work/fail.txt"
+        : > "$failf"
+        _ko_fetch_one() {
+            local filename="$1" bytes="$2" url="$3"
+            local dest="$work/$filename"
+            local tries=0 got
+            while (( tries < 6 )); do
+                tries=$((tries + 1))
+                log_info "  ENA fetch $filename (try $tries, $((bytes / 1048576)) MB)"
+                rm -f "$dest"
+                # Write to disk first. Piping curl into `aws s3 cp -` uses
+                # multipart upload and can fail with MalformedXML on a reset.
+                if curl -fL --retry 5 --retry-delay 8 --retry-all-errors -o "$dest" "$url"; then
+                    got=$(stat --format=%s "$dest" 2>/dev/null || echo 0)
+                    if [[ "$got" == "$bytes" ]] && \
+                       aws s3 cp "$dest" "s3://${KO_FASTQ_CACHE_BUCKET}/ko/${filename}" \
+                           --region "$AWS_REGION" --only-show-errors; then
+                        rm -f "$dest"
+                        return 0
+                    fi
+                    log_warn "  size/upload mismatch $filename expected $bytes got $got"
+                else
+                    log_warn "  curl failed for $filename"
+                fi
+                rm -f "$dest"
+                sleep $((tries * 15))
+            done
+            echo "$filename" >> "$failf"
+            return 1
+        }
+        while IFS=$'\t' read -r filename bytes url; do
+            [[ -z "$filename" ]] && continue
+            while (( $(jobs -rp | wc -l) >= 8 )); do
+                sleep 2
+            done
+            _ko_fetch_one "$filename" "$bytes" "$url" &
+        done < "$todo"
+        wait
+        if [[ -s "$failf" ]]; then
+            die "ENA download failed for $(wc -l < "$failf") file(s): $(tr '\n' ' ' < "$failf")"
+        fi
+        log_info "ENA fetch complete ($n_todo new file(s))"
+    else
+        log_info "All KO R1/R2 FASTQs already in the cache — skipping ENA download"
+    fi
+
+    [[ ${#LANE_BASENAMES[@]} -gt 0 ]] || die "No KO R1 files listed in $manifest"
+    BASENAME_WITH_LANE="${LANE_BASENAMES[0]}"
+    log_info "Lanes found: ${#LANE_BASENAMES[@]}"
+}
+
 create_and_upload_input_txt() {
     local lane_id="$1" r1_s3_path="$2" r2_s3_path="$3" base_folder="$4"
     local input_file="/tmp/${lane_id}_p0_input.txt"
@@ -775,6 +880,37 @@ create_and_upload_input_txt() {
         --region "$AWS_REGION" --only-show-errors
     rm -f "$input_file"
     log_info "Uploaded input.txt for ${lane_id}_p0"
+}
+
+################################################################################
+# Step timing instrumentation
+#
+# Each phase below corresponds to a row of Table 1 in the manuscript and is
+# written to $RUN_DIR/timings.csv by the pipeline itself, so the published
+# breakdown can be regenerated from a run rather than copied by hand.
+################################################################################
+
+PHASE_LABEL=""
+PHASE_STEP=""
+PHASE_START=""
+
+phase_begin() {
+    PHASE_LABEL="$1"
+    PHASE_STEP="${2:-}"
+    PHASE_START=$(date +%s.%N)
+}
+
+phase_end() {
+    [[ -n "$PHASE_START" ]] || return 0
+    local end secs mins csv
+    end=$(date +%s.%N)
+    secs=$(awk -v a="$PHASE_START" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
+    mins=$(awk -v s="$secs" 'BEGIN{printf "%.2f", s/60}')
+    csv="${RUN_DIR:-/tmp}/timings.csv"
+    [[ -f "$csv" ]] || echo "phase,figure1_step,seconds,minutes" > "$csv"
+    echo "${PHASE_LABEL},${PHASE_STEP},${secs},${mins}" >> "$csv"
+    log_info "  [timing] ${PHASE_LABEL}: ${mins} min (${secs}s)"
+    PHASE_START=""
 }
 
 process_fastq_bash() {
@@ -798,6 +934,19 @@ process_fastq_bash() {
 
     local INPUT_FOLDERS=()
 
+    # Anything in the map bucket older than this instant belongs to an earlier
+    # run and must not count towards completion. Recorded before any input.txt
+    # is uploaded, so no Lambda for this run can have written yet.
+    local MAP_POLL_SINCE
+    MAP_POLL_SINCE=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+                     || date -u +%Y-%m-%dT%H:%M:%S)
+
+    phase_begin "Split and Upload [on-server]" 3
+
+    # Sizing is cheap and sequential; the split itself is expensive and is run for
+    # every lane pair at once, the way process_fastq.py's thread pool did it.
+    local -a SPLIT_LANES=() SPLIT_R1=() SPLIT_R2=() SPLIT_BASE=()
+
     for base in "${!PF_R1_KEYS[@]}"; do
         local r1_key="${PF_R1_KEYS[$base]}"
         local r2_key="${PF_R2_KEYS[$base]:-}"
@@ -815,6 +964,7 @@ process_fastq_bash() {
         r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
             --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
         combined_bytes=$(( r1_bytes + r2_bytes ))
+        TOTAL_INPUT_BYTES=$(( ${TOTAL_INPUT_BYTES:-0} + combined_bytes ))
         # Force splitting when Lambda memory <= 3008 MB (threshold=0) to avoid OOM/timeouts
         if [[ $LAMBDA_MEMORY_MB -le 3008 ]]; then
             split_threshold_bytes=0
@@ -830,40 +980,102 @@ process_fastq_bash() {
             create_and_upload_input_txt "$lane_id" "$r1_s3" "$r2_s3" "$base_folder"
             INPUT_FOLDERS+=("${lane_id}_p0")
         else
-            log_info "Splitting large files for $lane_id ..."
-            local num_parts
-            num_parts=$(bash /home/ubuntu/scrna-repo/split_and_upload.sh \
-                "$INPUT_FASTQ_BUCKET" "$r1_key" "$r2_key" "$base" "$INPUT_TXT_BUCKET" 2>&1 | tail -1)
-            if [[ "${num_parts:-0}" -gt 0 ]]; then
-                for idx in $(seq 0 $((num_parts - 1))); do
-                    INPUT_FOLDERS+=("${lane_id}_p${idx}")
-                done
-            else
-                die "split_and_upload.sh failed for $lane_id"
-            fi
+            SPLIT_LANES+=("$lane_id")
+            SPLIT_R1+=("$r1_key")
+            SPLIT_R2+=("$r2_key")
+            SPLIT_BASE+=("$base")
         fi
     done
 
+    if [[ ${#SPLIT_LANES[@]} -gt 0 ]]; then
+        # Fastest measured rapidgzip is -P 8 per stream (1.77 GB gzip: -P 4 =
+        # 3.29 s, -P 8 = 3.05 s, -P 16 = 3.29 s). Each lane is two streams
+        # (R1+R2). Bound how many lanes run at once so KO's ~130 pairs keep
+        # -P 8 instead of 32/260 flooring to -P 1.
+        local _cores; _cores=$(nproc 2>/dev/null || echo 4)
+        DECOMP_THREADS=8
+        (( DECOMP_THREADS > _cores / 2 )) && DECOMP_THREADS=$(( _cores / 2 ))
+        (( DECOMP_THREADS < 1 )) && DECOMP_THREADS=1
+        export DECOMP_THREADS
+        local _max_lanes=$(( _cores / (DECOMP_THREADS * 2) ))
+        (( _max_lanes < 1 )) && _max_lanes=1
+
+        log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (rapidgzip -P $DECOMP_THREADS per stream)"
+
+        local parts_dir="$RUN_DIR/split_parts"
+        rm -rf "$parts_dir"; mkdir -p "$parts_dir"
+
+        local -a split_pids=()
+        local i _rc=0
+        for i in "${!SPLIT_LANES[@]}"; do
+            while (( ${#split_pids[@]} >= _max_lanes )); do
+                wait "${split_pids[0]}" || _rc=1
+                split_pids=("${split_pids[@]:1}")
+            done
+            (
+                bash /home/ubuntu/scrna-repo/split_and_upload.sh \
+                    "$INPUT_FASTQ_BUCKET" "${SPLIT_R1[$i]}" "${SPLIT_R2[$i]}" \
+                    "${SPLIT_BASE[$i]}" "$INPUT_TXT_BUCKET" \
+                    > "$parts_dir/${SPLIT_LANES[$i]}.log" 2>&1
+                _split_rc=$?
+                tail -1 "$parts_dir/${SPLIT_LANES[$i]}.log" \
+                    > "$parts_dir/${SPLIT_LANES[$i]}.parts"
+                exit "$_split_rc"
+            ) &
+            split_pids+=("$!")
+        done
+        local _pid
+        for _pid in "${split_pids[@]}"; do
+            wait "$_pid" || _rc=1
+        done
+        [[ $_rc -eq 0 ]] || die "split_and_upload.sh failed for one or more lanes"
+
+        for i in "${!SPLIT_LANES[@]}"; do
+            local this_lane="${SPLIT_LANES[$i]}"
+            local num_parts
+            num_parts=$(cat "$parts_dir/${this_lane}.parts" 2>/dev/null || echo 0)
+            [[ "${num_parts:-0}" -gt 0 ]] || die "split_and_upload.sh produced no parts for $this_lane"
+            log_info "  $this_lane: $num_parts shard pair(s)"
+            for idx in $(seq 0 $((num_parts - 1))); do
+                INPUT_FOLDERS+=("${this_lane}_p${idx}")
+            done
+        done
+        rm -rf "$parts_dir"
+    fi
+
     local input_count=${#INPUT_FOLDERS[@]}
+
+    phase_end
+
     log_info "Total input folders: $input_count"
     [[ $input_count -gt 0 ]] || die "No input folders created. Check FASTQ files in $INPUT_FASTQ_BUCKET"
 
 
     # Wait 30s for EventBridge propagation (matches process_fastq.py behavior)
+    phase_begin "EventBridge propagation wait [on-server]" 3
     log_info "Waiting 30s for EventBridge/Lambda warm-up..."
     sleep 30
+    phase_end
 
     # Poll output bucket
+    phase_begin "Piscem Map [serverless]" 4
     log_info "Polling output bucket $OUTPUT_MAP_BUCKET for Lambda results..."
-    local poll_start
+    local poll_start last_completed=0 last_progress_ts stall_limit
     poll_start=$(date +%s)
+    last_progress_ts="$poll_start"
+    stall_limit=$(( LAMBDA_TIMEOUT_SEC + 180 ))
 
     while true; do
         local completed=0
+        local -a _have=()
         local _keys
+        # Filter on age in the shell rather than in JMESPath: comparing a
+        # timestamp against a string literal there needs nested quoting that
+        # does not survive being shipped through SSM.
         _keys=$(aws s3api list-objects-v2 --bucket "$OUTPUT_MAP_BUCKET" --prefix "piscem_output/" \
-                    --query "Contents[?ends_with(Key,'/output.txt')].Key" \
-                    --output text --region "$AWS_REGION" 2>/dev/null || echo "")
+                    --query "Contents[?ends_with(Key,'/output.txt')].[Key,to_string(LastModified)]" \
+                    --output text --region "$AWS_REGION" 2>/dev/null \
+                | awk -v since="$MAP_POLL_SINCE" '$2 >= since {print $1}' || echo "")
 
         if [[ -n "$_keys" && "$_keys" != "None" ]]; then
             local _k
@@ -874,6 +1086,7 @@ process_fastq_bash() {
                 for _expected in "${INPUT_FOLDERS[@]}"; do
                     if [[ "$_folder" == "$_expected" ]]; then
                         completed=$((completed + 1))
+                        _have+=("$_folder")
                         break
                     fi
                 done
@@ -882,11 +1095,38 @@ process_fastq_bash() {
 
         log_info "Output progress: $completed / $input_count"
 
+        if [[ $completed -gt $last_completed ]]; then
+            last_completed=$completed
+            last_progress_ts=$(date +%s)
+        fi
+
         if [[ $completed -ge $input_count ]]; then
             break
         fi
 
         local elapsed=$(( $(date +%s) - poll_start ))
+        local stalled=$(( $(date +%s) - last_progress_ts ))
+        if [[ $stalled -gt $stall_limit ]]; then
+            log_error "Mapping stalled at $completed / $input_count. No new output.txt for ${stalled}s."
+            log_error "A Lambda shard likely hit the ${LAMBDA_TIMEOUT_SEC}s timeout without writing output."
+            log_error "Shards still missing:"
+            local _exp _found _h
+            for _exp in "${INPUT_FOLDERS[@]}"; do
+                _found=0
+                if [[ ${#_have[@]} -gt 0 ]]; then
+                    for _h in "${_have[@]}"; do
+                        if [[ "$_h" == "$_exp" ]]; then
+                            _found=1
+                            break
+                        fi
+                    done
+                fi
+                [[ $_found -eq 0 ]] && log_error "  $_exp"
+            done
+            aws logs tail "/aws/lambda/$LAMBDA_FUNCTION_NAME" --region "$AWS_REGION" \
+                --since 30m --format short 2>&1 | tail -50 >&2 || true
+            die "Piscem Map stopped making progress. Missing shards are listed above."
+        fi
         if [[ $elapsed -gt $PROCESS_FASTQ_TIMEOUT_SEC ]]; then
             log_error "Timeout (${PROCESS_FASTQ_TIMEOUT_SEC}s) waiting for Lambda outputs."
             log_error "Checking CloudWatch logs for Lambda errors..."
@@ -907,14 +1147,18 @@ process_fastq_bash() {
         sleep "$POLL_INTERVAL_SECONDS"
     done
 
+    phase_end
+
     local elapsed_sec=$(( $(date +%s) - poll_start ))
     log_info "All $input_count outputs ready ($((elapsed_sec / 60)) min $((elapsed_sec % 60)) sec)"
 
     # Download outputs (single bulk sync)
+    phase_begin "Download Files [on-server]" 6
     log_info "Downloading output files from $OUTPUT_MAP_BUCKET ..."
     mkdir -p "${output_dir}/piscem_output"
     aws s3 sync "s3://${OUTPUT_MAP_BUCKET}/piscem_output/" "${output_dir}/piscem_output/" \
         --region "$AWS_REGION" --only-show-errors
+    phase_end
 
     log_info "All output files downloaded to $output_dir"
 }
@@ -955,22 +1199,38 @@ ssm_run_command() {
         --timeout-seconds "$timeout_sec" \
         --query 'Command.CommandId' --output text)
 
-    # Poll for completion
+    # Poll for completion. Request the status field on its own rather than the
+    # whole invocation: commands that emit CLI transfer progress produce a
+    # payload large enough that parsing it locally can fail, and an unparsed
+    # status would leave this loop spinning after the command has finished.
+    local status
     while true; do
-        local inv status
-        inv=$(aws ssm get-command-invocation \
+        status=$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
-            --output json 2>/dev/null || echo '{"Status":"Pending"}')
-        status=$(echo "$inv" | jq -r '.Status')
+            --query 'Status' --output text 2>/dev/null || true)
+        if [[ -z "$status" || "$status" == "None" ]]; then
+            status=$(aws ssm list-command-invocations \
+                --region "$AWS_REGION" \
+                --command-id "$cmd_id" \
+                --query 'CommandInvocations[0].Status' --output text 2>/dev/null || true)
+        fi
         case "$status" in
             Success)
-                echo "$inv" | jq -r '.StandardOutputContent // ""'
+                aws ssm get-command-invocation \
+                    --region "$AWS_REGION" \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query 'StandardOutputContent' --output text 2>/dev/null || true
                 return 0 ;;
             Failed|TimedOut|Cancelled)
                 log_error "SSM command $status (ID: $cmd_id)"
-                echo "$inv" | jq -r '.StandardErrorContent // ""' >&2
+                aws ssm get-command-invocation \
+                    --region "$AWS_REGION" \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query 'StandardErrorContent' --output text 2>/dev/null >&2 || true
                 return 1 ;;
             *) sleep 5 ;;
         esac
@@ -998,7 +1258,9 @@ ssm_run_pipeline() {
         --arg run_id "$run_id" \
         --arg run_qc "$RUN_QC" \
         --arg split_lines "$SPLIT_LINES" \
+        --arg use_rapidgzip "${USE_RAPIDGZIP:-1}" \
         --arg concurrency "${LAMBDA_CONCURRENCY:-0}" \
+        --arg ko_cache "${KO_FASTQ_CACHE_BUCKET:-}" \
         --arg user "$SSH_USER" \
         --arg ds "$dataset" \
         '{commands:[
@@ -1018,6 +1280,8 @@ ssm_run_pipeline() {
             ("export RUN_ID=" + $run_id),
             ("export RUN_QC=" + $run_qc),
             ("export SPLIT_LINES=" + $split_lines),
+            ("export USE_RAPIDGZIP=" + $use_rapidgzip),
+            ("export KO_FASTQ_CACHE_BUCKET=" + $ko_cache),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
         ], executionTimeout:["86400"]}')
@@ -1036,32 +1300,36 @@ ssm_run_pipeline() {
     log_info "SSM pipeline command sent: $cmd_id"
 
     # Poll for completion.
-    # NOTE: when --output-s3-bucket-name is used, get-command-invocation may
-    # return truncated JSON or empty StandardOutputContent (output goes to S3).
-    # We parse status only; stdout comes from the S3 log after completion.
-    local last_len=0
+    #
+    # Ask for the Status field alone. Fetching the whole invocation pulls
+    # StandardOutputContent with it, which reaches hundreds of kilobytes once the
+    # AWS CLI transfer progress lines are included, and parsing that payload
+    # locally fails often enough that the loop can spin forever while the remote
+    # pipeline has already finished. The full stdout is written to S3 by
+    # --output-s3-bucket-name and is retrieved once, below.
+    local waited=0
     while true; do
-        local inv status
-        inv=$(aws ssm get-command-invocation \
+        local status
+        status=$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$cmd_id" \
             --instance-id "$instance_id" \
-            --output json 2>&1 || true)
+            --query 'Status' --output text 2>/dev/null || true)
 
-        # Guard against truncated / malformed JSON from SSM
-        if ! status=$(echo "$inv" | jq -r '.Status' 2>/dev/null); then
-            log_info "SSM poll: waiting (response not valid JSON)..."
-            sleep 15
-            continue
+        # Fall back to the list API, which reports status even when the
+        # single-invocation call is briefly unavailable.
+        if [[ -z "$status" || "$status" == "None" ]]; then
+            status=$(aws ssm list-command-invocations \
+                --region "$AWS_REGION" \
+                --command-id "$cmd_id" \
+                --query 'CommandInvocations[0].Status' --output text 2>/dev/null || true)
         fi
 
-        # Stream stdout incrementally (may be empty when S3 output is used)
-        local stdout
-        stdout=$(echo "$inv" | jq -r '.StandardOutputContent // ""' 2>/dev/null) || stdout=""
-        local cur_len=${#stdout}
-        if [[ $cur_len -gt $last_len ]]; then
-            printf '%s' "${stdout:$last_len}"
-            last_len=$cur_len
+        if [[ -z "$status" || "$status" == "None" ]]; then
+            log_info "SSM poll: status unavailable, retrying (${waited}s elapsed)..."
+            sleep 15
+            waited=$((waited + 15))
+            continue
         fi
 
         case "$status" in
@@ -1075,14 +1343,24 @@ ssm_run_pipeline() {
                 return 0 ;;
             Failed|TimedOut|Cancelled)
                 log_error "Pipeline command $status (SSM ID: $cmd_id)"
-                echo "$inv" | jq -r '.StandardErrorContent // ""' 2>/dev/null >&2 || true
+                aws ssm get-command-invocation \
+                    --region "$AWS_REGION" \
+                    --command-id "$cmd_id" \
+                    --instance-id "$instance_id" \
+                    --query 'StandardErrorContent' --output text 2>/dev/null >&2 || true
                 # Download full log from S3
                 log_info "Downloading full SSM output log from S3..."
                 mkdir -p "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output"
                 aws s3 sync "s3://${transfer_bucket}/ssm-output/${run_id}/" \
                     "${LOCAL_RESULTS_DIR}/${run_id}/ssm-output/" --region "$AWS_REGION" 2>/dev/null || true
                 return 1 ;;
-            *) sleep 15 ;;
+            *)
+                sleep 15
+                waited=$((waited + 15))
+                if (( waited % 300 == 0 )); then
+                    log_info "SSM poll: $status (${waited}s elapsed)"
+                fi
+                ;;
         esac
     done
 }
@@ -1094,7 +1372,7 @@ ssm_run_pipeline() {
 if [[ $# -lt 1 ]]; then
     cat >&2 <<EOF
 Usage: $0 <dataset> [--run|--dry-run]
-  dataset: pbmc1k or pbmc10k
+  dataset: pbmc1k, pbmc10k, or ko
   --run: Execute in run mode on EC2 (default: driver mode)
   --dry-run: Validate requirements without creating AWS resources
 EOF
@@ -1102,8 +1380,17 @@ EOF
 fi
 
 DATASET="$1"
-if [[ "$DATASET" != "pbmc1k" && "$DATASET" != "pbmc10k" ]]; then
-    die "Unknown dataset: $DATASET (must be pbmc1k or pbmc10k)"
+if [[ "$DATASET" != "pbmc1k" && "$DATASET" != "pbmc10k" && "$DATASET" != "ko" ]]; then
+    die "Unknown dataset: $DATASET (must be pbmc1k, pbmc10k, or ko)"
+fi
+if [[ "$DATASET" == "ko" ]]; then
+    # Combined 86-line matrix is not useful for the paper QC plots, and the
+    # results tarball would be ~200 GB. Table 1 only needs timings.csv.
+    RUN_QC=0
+    WRITE_H5AD=0
+    if [[ "${DOWNLOAD_KO_RESULTS:-0}" != "1" ]]; then
+        DOWNLOAD_RESULTS=0
+    fi
 fi
 
 if [[ $# -gt 1 ]]; then
@@ -1267,21 +1554,31 @@ validate_dry_run() {
         log_info "[CHECK 5/7] (skipped, run mode)"
     fi
     
-    # FASTQ URL
-    log_info "[CHECK 6/7] FASTQ URL..."
-    local fastq_url="$FASTQ_TAR_URL"
-    if [[ -z "$fastq_url" ]]; then
-        case "$DATASET" in
-            pbmc1k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar" ;;
-            pbmc10k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_10k_v3/pbmc_10k_v3_fastqs.tar" ;;
-        esac
-    fi
-    if ! curl -s -I -m 10 "$fastq_url" 2>/dev/null | head -1 | grep -q "200\|302"; then
-        log_error "  FAIL: FASTQ URL not reachable"
-        fail=$((fail + 1))
+    # FASTQ URL / KO manifest
+    log_info "[CHECK 6/7] FASTQ source..."
+    if [[ "$DATASET" == "ko" ]]; then
+        if [[ -f "scripts/ko_ena_r1r2.tsv" ]]; then
+            log_info "  PASS: KO ENA manifest present (scripts/ko_ena_r1r2.tsv)"
+            pass=$((pass + 1))
+        else
+            log_error "  FAIL: scripts/ko_ena_r1r2.tsv missing"
+            fail=$((fail + 1))
+        fi
     else
-        log_info "  PASS: FASTQ URL reachable"
-        pass=$((pass + 1))
+        local fastq_url="$FASTQ_TAR_URL"
+        if [[ -z "$fastq_url" ]]; then
+            case "$DATASET" in
+                pbmc1k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar" ;;
+                pbmc10k) fastq_url="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_10k_v3/pbmc_10k_v3_fastqs.tar" ;;
+            esac
+        fi
+        if ! curl -s -I -m 10 "$fastq_url" 2>/dev/null | head -1 | grep -q "200\|302"; then
+            log_error "  FAIL: FASTQ URL not reachable"
+            fail=$((fail + 1))
+        else
+            log_info "  PASS: FASTQ URL reachable"
+            pass=$((pass + 1))
+        fi
     fi
     
     # Instance Profile  
@@ -1587,12 +1884,27 @@ if [[ $RUN_MODE -eq 0 ]]; then
             --query 'GroupId' \
             --output text 2>/dev/null || echo "")
         
+        # The group name is derived from RUN_ID, so a rerun under the same ID
+        # collides with the group left behind by the previous attempt. Adopt
+        # that one rather than failing, since it was created here and carries
+        # the same rules.
         if [[ -z "$SG_ID" || "$SG_ID" == "None" ]]; then
+            SG_ID=$(aws ec2 describe-security-groups \
+                --region "$AWS_REGION" \
+                --filters "Name=group-name,Values=scrna-driver-ssh-$RUN_ID" \
+                          "Name=vpc-id,Values=$VPC_ID" \
+                --query 'SecurityGroups[0].GroupId' \
+                --output text 2>/dev/null || echo "")
+            [[ "$SG_ID" == "None" ]] && SG_ID=""
+            [[ -n "$SG_ID" ]] && log_info "Reusing existing security group: $SG_ID"
+        fi
+
+        if [[ -z "$SG_ID" ]]; then
             die "Failed to create security group."
         fi
         
         CREATED_SG_ID="$SG_ID"
-        log_info "Created temporary security group: $SG_ID"
+        log_info "Temporary security group: $SG_ID"
         
         # Tag it
         aws ec2 create-tags \
@@ -1660,10 +1972,12 @@ if [[ $RUN_MODE -eq 0 ]]; then
         
         # Instance type fallback: try requested type first, then progressively smaller
         # alternatives if launch fails due to vCPU quota or capacity issues.
-        # Chain: m6id (NVMe, best perf) → m6i (EBS-only) → t3 (burstable, free-tier accounts)
-        # For each type, try ALL available AZs/subnets before falling back to a smaller type.
+        # Default is m5dn.8xlarge (32 vCPU, 2x NVMe). That is the box 1K, 10K,
+        # and KO actually completed on with RAID 0, rapidgzip -P 8, and 2 lanes.
         INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
-        if [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
+        if [[ "$INSTANCE_TYPE" == "m5dn.8xlarge" ]]; then
+            INSTANCE_FALLBACKS+=("m5dn.4xlarge" "m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large")
+        elif [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
             INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "m7i-flex.large" "t3.large" "c7i-flex.large" "t3.medium" "t3.small" "t3.micro")
         fi
         
@@ -1905,10 +2219,17 @@ if [[ $RUN_MODE -eq 0 ]]; then
     REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
     TARBALL_LOCAL="$(dirname "$REPO_DIR")/scrna-repo-${RUN_ID}.tar.gz"
     
+    # Only the code is needed on the instance. Collected results and downloaded
+    # inputs live under the repository too and reach several gigabytes once a
+    # few runs have accumulated, which is enough to break the upload.
     tar --exclude='serverless_runs' --exclude='onserver_runs' --exclude='runs' \
+        --exclude='standalone_runs' --exclude='benchmark_results' \
+        --exclude='data' --exclude='tools' \
         --exclude='.git' --exclude='*.log' --exclude='scrna-repo-*.tar.gz' \
         --exclude='MASTER_PROMPT.md' --exclude='.vscode' --exclude='.idea' \
         -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
+
+    log_info "Repository bundle: $(du -h "$TARBALL_LOCAL" | cut -f1)"
     
     if [[ "$CONNECT_METHOD" == "ssh" ]]; then
         TARBALL_REMOTE="/tmp/scrna-repo-${RUN_ID}.tar.gz"
@@ -1959,6 +2280,8 @@ export WRITE_H5AD=$WRITE_H5AD
 export RUN_ID=$RUN_ID
 export RUN_QC=$RUN_QC
 export SPLIT_LINES=$SPLIT_LINES
+export USE_RAPIDGZIP=${USE_RAPIDGZIP:-1}
+export KO_FASTQ_CACHE_BUCKET=${KO_FASTQ_CACHE_BUCKET:-}
 
 cd /home/${SSH_USER}/scrna-repo
 bash scripts/e2e_serverless_pbmc.sh $DATASET --run
@@ -2066,6 +2389,21 @@ fi
 log_info "======== E2E Serverless scRNA Pipeline (RUN MODE) ========"
 log_info "Dataset: $DATASET"
 log_info "Run ID: $RUN_ID"
+
+if ! command -v aws >/dev/null 2>&1; then
+    log_info "AWS CLI missing on this instance. Installing AWS CLI v2..."
+    for _i in $(seq 1 30); do
+        fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break
+        log_info "waiting for dpkg lock $_i/30"
+        sleep 10
+    done
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip curl
+    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    (cd /tmp && unzip -qo awscliv2.zip && sudo ./aws/install --update)
+    rm -rf /tmp/awscliv2.zip /tmp/aws
+    command -v aws >/dev/null 2>&1 || die "AWS CLI install failed"
+fi
 log_info "AWS CLI present: $(aws --version 2>&1)"
 
 # Auto-detect AWS account ID if not set
@@ -2086,8 +2424,10 @@ MOUNT_POINT="/mnt/nvme"
 if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
     log_info "$MOUNT_POINT already mounted — reusing"
 else
-    # Find an NVMe instance-store device (skip devices already mounted, e.g. root EBS on nvme0n1)
-    NVMe_DEVICE=""
+    # Collect every unmounted NVMe instance-store device (skip mounted ones, e.g. root EBS on nvme0n1).
+    # Storage layout follows install_scripts/install.sh: RAID 0 across all instance-store
+    # devices, XFS with RAID-aware geometry, and the same mount/scheduler/read-ahead tuning.
+    NVMe_DEVICES=()
     while read -r dev; do
         dev_path="/dev/$dev"
         # Skip if this device (or a partition of it) is already mounted
@@ -2095,29 +2435,64 @@ else
             log_info "Skipping $dev_path (already mounted)"
             continue
         fi
-        NVMe_DEVICE="$dev"
-        break
+        [[ -b "$dev_path" ]] && NVMe_DEVICES+=("$dev_path")
     done < <(lsblk -d -n -l -o NAME | grep nvme)
 
-    if [[ -n "$NVMe_DEVICE" ]]; then
-        NVMe_PATH="/dev/$NVMe_DEVICE"
-        log_info "Found unmounted NVMe device: $NVMe_PATH"
-        if [[ -b "$NVMe_PATH" ]]; then
-            # Check if filesystem exists; if not, create one
-            if ! sudo blkid "$NVMe_PATH" >/dev/null 2>&1; then
-                log_info "Creating ext4 filesystem on $NVMe_PATH..."
-                sudo mkfs.ext4 -F "$NVMe_PATH"
-            fi
-            log_info "Mounting $NVMe_PATH to $MOUNT_POINT..."
-            sudo mkdir -p "$MOUNT_POINT"
-            sudo mount "$NVMe_PATH" "$MOUNT_POINT"
-            sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
+    NVMe_COUNT=${#NVMe_DEVICES[@]}
+    log_info "Unmounted NVMe instance-store devices found: $NVMe_COUNT (${NVMe_DEVICES[*]:-none})"
+
+    if [[ $NVMe_COUNT -gt 0 ]]; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm xfsprogs >/dev/null 2>&1 || true
+
+        for d in "${NVMe_DEVICES[@]}"; do
+            sudo wipefs -a "$d" >/dev/null 2>&1 || true
+            base=$(basename "$d")
+            echo "none" | sudo tee "/sys/block/$base/queue/scheduler" >/dev/null 2>&1 || true
+        done
+
+        if [[ $NVMe_COUNT -ge 2 ]]; then
+            log_info "Creating RAID 0 across $NVMe_COUNT devices (256K chunk)..."
+            sudo mdadm --create --verbose /dev/md0 --level=0 \
+                --raid-devices="$NVMe_COUNT" --chunk=256K --run "${NVMe_DEVICES[@]}"
+            NVMe_TARGET="/dev/md0"
+            log_info "Creating XFS on $NVMe_TARGET (su=256k,sw=$NVMe_COUNT)..."
+            sudo mkfs.xfs -f -d "su=256k,sw=$NVMe_COUNT" "$NVMe_TARGET"
+        else
+            NVMe_TARGET="${NVMe_DEVICES[0]}"
+            log_warn "Only one instance-store device present; no RAID 0 possible"
+            log_info "Creating XFS on $NVMe_TARGET..."
+            sudo mkfs.xfs -f "$NVMe_TARGET"
         fi
+
+        log_info "Mounting $NVMe_TARGET to $MOUNT_POINT..."
+        sudo mkdir -p "$MOUNT_POINT"
+        sudo mount -o noatime,nodiratime,logbufs=8,logbsize=256k,allocsize=64m \
+            "$NVMe_TARGET" "$MOUNT_POINT"
+        sudo blockdev --setra 65536 "$NVMe_TARGET" || true
+        sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
+        log_info "NVMe storage ready: $(df -h "$MOUNT_POINT" | tail -1)"
     else
         log_info "No unmounted NVMe device found; using default storage"
         sudo mkdir -p "$MOUNT_POINT"
         sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
     fi
+fi
+
+# rapidgzip: parallel gzip decompression for Split and Upload. Falls back to
+# zcat if the install below does not land on PATH.
+export PATH="${HOME:-/home/ubuntu}/.local/bin:/usr/local/bin:$PATH"
+if ! command -v rapidgzip >/dev/null 2>&1; then
+    log_info "Installing rapidgzip..."
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip >/dev/null 2>&1 || true
+    sudo pip3 install --quiet --break-system-packages rapidgzip >/dev/null 2>&1 \
+        || sudo pip3 install --quiet rapidgzip >/dev/null 2>&1 \
+        || pip3 install --quiet --user rapidgzip >/dev/null 2>&1 \
+        || true
+fi
+if command -v rapidgzip >/dev/null 2>&1; then
+    log_info "rapidgzip available: $(rapidgzip --version 2>&1 | head -1)"
+else
+    log_warn "rapidgzip unavailable; Split and Upload will fall back to zcat"
 fi
 
 # Create run directory
@@ -2198,11 +2573,15 @@ log_info "Tools ready"
 
 log_info "Step 1: Preparing FASTQs..."
 
+# Reported for both arms but excluded from Overall Process, matching the Table 1
+# caption which states the times exclude fetching raw sequence data.
+phase_begin "Fetch raw FASTQs" ""
+
 FASTQ_DIR="$RUN_DIR/fastq"
 mkdir -p "$FASTQ_DIR"
 
 # Auto-set FASTQ_TAR_URL by dataset if not provided
-if [[ -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
+if [[ "$DATASET" != "ko" && -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
     case "$DATASET" in
         pbmc1k)
             FASTQ_TAR_URL="https://s3-us-west-2.amazonaws.com/10x.files/samples/cell-exp/3.0.0/pbmc_1k_v3/pbmc_1k_v3_fastqs.tar"
@@ -2218,8 +2597,10 @@ if [[ -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
     esac
 fi
 
-# Obtain FASTQ tar
-if [[ -n "$FASTQ_TAR_PATH" ]]; then
+# Obtain FASTQs
+if [[ "$DATASET" == "ko" ]]; then
+    fetch_ko_fastqs
+elif [[ -n "$FASTQ_TAR_PATH" ]]; then
     log_info "Extracting FASTQ tar from: $FASTQ_TAR_PATH"
     # Detect format and extract accordingly
     if [[ "$FASTQ_TAR_PATH" =~ \.(tar\.gz|tgz)$ ]]; then
@@ -2245,33 +2626,36 @@ else
     die "Either FASTQ_TAR_PATH or FASTQ_TAR_URL must be provided"
 fi
 
-# Find R1 files
-R1_FILES=($(find "$FASTQ_DIR" -name "*R1_001.fastq.gz" | sort))
-[[ ${#R1_FILES[@]} -gt 0 ]] || die "No R1_001.fastq.gz files found"
+if [[ "$DATASET" != "ko" ]]; then
+    # Find R1 files. The lanes are deliberately kept separate. process_fastq.py
+    # grouped FASTQs by lane and processed each pair concurrently; concatenating them
+    # leaves one oversized R2 stream, and since decompression is the critical path of
+    # Split and Upload, that serialises the phase.
+    R1_FILES=($(find "$FASTQ_DIR" -name "*R1_001.fastq.gz" | sort))
+    [[ ${#R1_FILES[@]} -gt 0 ]] || die "No R1_001.fastq.gz files found"
 
-# Extract basename from first R1
-FIRST_R1=$(basename "${R1_FILES[0]}")
-BASENAME_WITH_LANE="${FIRST_R1/_R1_001.fastq.gz/}"
+    # The tar extracts into its own subdirectory, so keep the real paths rather than
+    # rebuilding them from $FASTQ_DIR.
+    LANE_BASENAMES=()
+    LANE_R1_PATHS=()
+    LANE_R2_PATHS=()
+    for _r1 in "${R1_FILES[@]}"; do
+        _lane="$(basename "$_r1")"
+        _lane="${_lane/_R1_001.fastq.gz/}"
+        _r2="$(dirname "$_r1")/${_lane}_R2_001.fastq.gz"
+        [[ -f "$_r2" ]] || die "No R2 mate for lane $_lane (expected $_r2)"
+        LANE_BASENAMES+=("$_lane")
+        LANE_R1_PATHS+=("$_r1")
+        LANE_R2_PATHS+=("$_r2")
+    done
 
-log_info "BASENAME_WITH_LANE: $BASENAME_WITH_LANE"
-
-# Concatenate all R1 files (use temp file to avoid overwrites)
-log_info "Concatenating R1 files..."
-tmp_r1="$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz.tmp"
-cat "${R1_FILES[@]}" > "$tmp_r1"
-mv -f "$tmp_r1" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz"
-
-# Find and concatenate R2 files
-R2_FILES=($(find "$FASTQ_DIR" -name "*R2_001.fastq.gz" | sort))
-[[ ${#R2_FILES[@]} -gt 0 ]] || die "No R2_001.fastq.gz files found"
-
-# Concatenate all R2 files (use temp file to avoid overwrites)
-log_info "Concatenating R2 files..."
-tmp_r2="$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz.tmp"
-cat "${R2_FILES[@]}" > "$tmp_r2"
-mv -f "$tmp_r2" "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz"
+    BASENAME_WITH_LANE="${LANE_BASENAMES[0]}"
+    log_info "Lanes found: ${#LANE_BASENAMES[@]} (${LANE_BASENAMES[*]})"
+fi
 
 log_info "FASTQ files ready"
+
+phase_end
 
 log_info "Step 1 complete"
 
@@ -2285,6 +2669,25 @@ aws s3 mb "s3://$INPUT_FASTQ_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
 aws s3 mb "s3://$INPUT_TXT_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
 aws s3 mb "s3://$OUTPUT_MAP_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
 aws s3 mb "s3://$OUTPUT_QUANT_BUCKET" --region "$AWS_REGION" 2>/dev/null || true
+
+# Bucket names derive from the run id, which repeats across benchmark
+# invocations, and "mb" is a no-op on an existing bucket. Without this purge the
+# previous run's piscem_output/<lane>_p<N>/output.txt markers are still present,
+# so the readiness poll below reports every shard complete within seconds and
+# the download then races the Lambdas that are still writing those same objects,
+# which surfaces as "did not match expected ETag" failures.
+log_info "Purging previous outputs from $OUTPUT_MAP_BUCKET and $OUTPUT_QUANT_BUCKET..."
+for _ob in "$OUTPUT_MAP_BUCKET" "$OUTPUT_QUANT_BUCKET"; do
+    _stale=$(aws s3api list-objects-v2 --bucket "$_ob" --query 'length(Contents)' \
+                 --output text --region "$AWS_REGION" 2>/dev/null || echo "0")
+    [[ "$_stale" == "None" || -z "$_stale" ]] && _stale=0
+    if [[ "$_stale" != "0" ]]; then
+        log_info "  $_ob: removing $_stale stale object(s) from a previous run"
+        aws s3 rm "s3://${_ob}/" --recursive --region "$AWS_REGION" --only-show-errors || true
+    else
+        log_info "  $_ob: already empty"
+    fi
+done
 
 log_info "Step 4: Enabling EventBridge for input-txt bucket..."
 aws s3api put-bucket-notification-configuration \
@@ -2300,15 +2703,29 @@ log_info "Buckets created and configured"
 
 log_info "Step 3: Uploading FASTQs to S3..."
 
-aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
-    "s3://$INPUT_FASTQ_BUCKET/$DATASET/${BASENAME_WITH_LANE}_R1_001.fastq.gz" \
-    --region "$AWS_REGION"
+if [[ "$DATASET" == "ko" ]]; then
+    log_info "Copying KO FASTQs from cache to run bucket (S3-to-S3)..."
+    aws s3 sync "s3://$KO_FASTQ_CACHE_BUCKET/ko/" "s3://$INPUT_FASTQ_BUCKET/ko/" \
+        --region "$AWS_REGION" --only-show-errors
+else
+    _upload_pids=()
+    for _i in "${!LANE_BASENAMES[@]}"; do
+        _lane="${LANE_BASENAMES[$_i]}"
+        aws s3 cp "${LANE_R1_PATHS[$_i]}" \
+            "s3://$INPUT_FASTQ_BUCKET/$DATASET/${_lane}_R1_001.fastq.gz" \
+            --region "$AWS_REGION" &
+        _upload_pids+=("$!")
+        aws s3 cp "${LANE_R2_PATHS[$_i]}" \
+            "s3://$INPUT_FASTQ_BUCKET/$DATASET/${_lane}_R2_001.fastq.gz" \
+            --region "$AWS_REGION" &
+        _upload_pids+=("$!")
+    done
+    for _pid in "${_upload_pids[@]}"; do
+        wait "$_pid" || die "FASTQ upload to S3 failed"
+    done
+fi
 
-aws s3 cp "$FASTQ_DIR/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
-    "s3://$INPUT_FASTQ_BUCKET/$DATASET/${BASENAME_WITH_LANE}_R2_001.fastq.gz" \
-    --region "$AWS_REGION"
-
-log_info "FASTQs uploaded"
+log_info "FASTQs uploaded (${#LANE_BASENAMES[@]} lane pair(s))"
 
 log_info "Step 3 complete"
 
@@ -2413,7 +2830,8 @@ if [[ -n "$_stale_buckets" && "$_stale_buckets" != "None" ]]; then
     for _sb in $_stale_buckets; do
         if [[ "$_sb" == "$INPUT_FASTQ_BUCKET" || "$_sb" == "$INPUT_TXT_BUCKET" || \
               "$_sb" == "$OUTPUT_MAP_BUCKET" || "$_sb" == "$OUTPUT_QUANT_BUCKET" || \
-              "$_sb" == "${SSM_TRANSFER_BUCKET:-}" || "$_sb" == scrna-ssm-xfer-* ]]; then
+              "$_sb" == "${SSM_TRANSFER_BUCKET:-}" || "$_sb" == scrna-ssm-xfer-* || \
+              "$_sb" == "${KO_FASTQ_CACHE_BUCKET:-}" || "$_sb" == scrna-ko-fastq-* ]]; then
             continue
         fi
         log_warn "Removing stale S3 bucket: $_sb"
@@ -2575,8 +2993,13 @@ log_info "Running combine scripts..."
 COMBINED_DIR="$RUN_DIR/combined"
 mkdir -p "$COMBINED_DIR"
 
+phase_begin "Combined .rad [on-server]" 7
 bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$OUTPUT_DIR" "$COMBINED_DIR"
+phase_end
+
+phase_begin "Concatenate unmapped_bc_count.bin [on-server]" 7
 bash /home/ubuntu/scrna-repo/combine_unmapped_bc_count_bin.sh "$OUTPUT_DIR" "$COMBINED_DIR"
+phase_end
 
 log_info "Step 8a (combine) complete"
 
@@ -2587,7 +3010,9 @@ mkdir -p "$ALEVIN_OUTPUT"
 
 TRANSCRIPTOME_GENE_MAPPING="/opt/scrna-seed/reference/t2g.tsv"
 
+phase_begin "Alevin [on-server]" 7
 bash /home/ubuntu/scrna-repo/alevin_process.sh "$COMBINED_DIR" "$ALEVIN_OUTPUT" "$TRANSCRIPTOME_GENE_MAPPING"
+phase_end
 
 log_info "Step 8b (quant) complete"
 
@@ -2599,8 +3024,10 @@ log_info "Quantification complete"
 
 log_info "Step 9: Uploading quantification outputs to S3..."
 
+phase_begin "Upload Output Files [on-server]" 8
 aws s3 sync "$ALEVIN_OUTPUT" "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/alevin_output/" \
     --region "$AWS_REGION"
+phase_end
 
 log_info "Step 9 complete"
 
@@ -2669,6 +3096,19 @@ PISCEM_VERSION=$(piscem --version 2>/dev/null | head -1 || true)
 ALEVIN_FRY_VERSION=$(alevin-fry --version 2>/dev/null | head -1 || true)
 RADTK_VERSION=$(radtk --version 2>/dev/null | head -1 || true)
 
+# The remote side does not inherit INSTANCE_TYPE from the driver, so reading the
+# variable here would record the script default rather than the machine that ran
+# the work. Ask the instance itself instead.
+_imds_token=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+if [[ -n "$_imds_token" ]]; then
+    _imds_type=$(curl -fsS -H "X-aws-ec2-metadata-token: $_imds_token" \
+        "http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || true)
+    [[ -n "$_imds_type" ]] && INSTANCE_TYPE="$_imds_type"
+fi
+DRIVER_VCPUS=$(nproc 2>/dev/null || echo "")
+DRIVER_CPU_MODEL=$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo "")
+
 cat > "$RUN_DIR/run.env" <<EOF
 RUN_ID=$RUN_ID
 DATASET=$DATASET
@@ -2693,9 +3133,34 @@ ALEVIN_FRY_VERSION=$ALEVIN_FRY_VERSION
 RADTK_VERSION=$RADTK_VERSION
 RUN_QC=$RUN_QC
 WRITE_H5AD=$WRITE_H5AD
+ARM=serverless
+INSTANCE_TYPE=$INSTANCE_TYPE
+DRIVER_VCPUS=$DRIVER_VCPUS
+DRIVER_CPU_MODEL=$DRIVER_CPU_MODEL
+PISCEM_THREADS=${PISCEM_THREADS:-6}
+TOTAL_INPUT_BYTES=${TOTAL_INPUT_BYTES:-0}
+TOTAL_INPUT_GB=$(awk -v b="${TOTAL_INPUT_BYTES:-0}" 'BEGIN{printf "%.2f", b/1073741824}')
 EOF
 
 log_info "Run metadata saved to $RUN_DIR/run.env"
+
+# Publish the metadata and step timings to S3 directly from this instance.
+# Retrieving them via the results tarball depends on the SSM transfer, which is
+# the least reliable part of the run; a plain S3 copy is not.
+for _artifact in run.env timings.csv; do
+    if [[ -f "$RUN_DIR/$_artifact" ]]; then
+        aws s3 cp "$RUN_DIR/$_artifact" \
+            "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/$_artifact" \
+            --region "$AWS_REGION" >/dev/null 2>&1 \
+            && log_info "  published $_artifact to s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/"
+        if [[ "$DATASET" == "ko" && -n "${KO_FASTQ_CACHE_BUCKET:-}" ]]; then
+            aws s3 cp "$RUN_DIR/$_artifact" \
+                "s3://$KO_FASTQ_CACHE_BUCKET/results/$RUN_ID/$_artifact" \
+                --region "$AWS_REGION" >/dev/null 2>&1 \
+                && log_info "  published $_artifact to s3://$KO_FASTQ_CACHE_BUCKET/results/$RUN_ID/"
+        fi
+    fi
+done
 
 
 ################################################################################
