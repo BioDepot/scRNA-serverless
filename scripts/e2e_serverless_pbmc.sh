@@ -1000,7 +1000,7 @@ process_fastq_bash() {
         local _max_lanes=$(( _cores / (DECOMP_THREADS * 2) ))
         (( _max_lanes < 1 )) && _max_lanes=1
 
-        log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (rapidgzip -P $DECOMP_THREADS per stream)"
+        log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (download gzip, then rapidgzip -P $DECOMP_THREADS per file)"
 
         local parts_dir="$RUN_DIR/split_parts"
         rm -rf "$parts_dir"; mkdir -p "$parts_dir"
