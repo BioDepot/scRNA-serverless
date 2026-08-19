@@ -16,7 +16,9 @@ standalone_runs/
 
 # Standalone pipeline data (downloaded at runtime)
 data/
-tools/
+tools/*
+!tools/s3-rad-materializer/
+!tools/s3-rad-materializer/**
 
 # Temp tarballs created during SSM transfer
 scrna-repo-*.tar.gz
