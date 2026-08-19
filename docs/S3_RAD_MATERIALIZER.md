@@ -48,26 +48,16 @@ Measured fixture properties:
 | Final `map.rad` bytes | 1,177,529,777 |
 | RAD chunks | 8,218 |
 
-## Initial baseline
+## Correctness result
 
-The following result was recorded on the development host using `/storage`,
-the `uw` profile, and 32 requested workers (17 active workers):
+The development host has a 1 Gbit/s network limit, so its timings are not a
+valid performance baseline for this optimization. Performance conclusions are
+intentionally deferred until the comparison can run on the target cloud
+instance with its production S3 and NVMe bandwidth.
 
-| Path | Time |
-|---|---:|
-| `aws s3 sync` | 30.793 s |
-| `radtk cat` | 0.543 s |
-| Existing total | 31.336 s |
-| Ranged materializer total | 25.855 s |
-| End-to-end speedup | 1.212x |
-
-The result shows that, for this fixture on this host, local `radtk cat` is only
-about half a second because the freshly downloaded shards remain in the page
-cache. Most of the current bottleneck is S3 materialization. The ranged writer
-still removes the shard files and their local reread and reduced the measured
-end-to-end time by 5.481 seconds (17.5%). Network measurements vary, so the
-target pipeline EC2 instance should also be benchmarked before enabling this
-path by default.
+The local PBMC 1K run was used only to validate correctness. The ranged
+materializer and `radtk cat` consumed the same numeric shard order. Their final
+outputs were byte-for-byte identical under `cmp` and had the same SHA-256:
 
 Both outputs had this SHA-256 digest and passed `cmp`:
 
@@ -75,8 +65,9 @@ Both outputs had this SHA-256 digest and passed `cmp`:
 0317bac8c3d2420d74376f3520b0454408e8e723e39028e92342f0d52f7931f2
 ```
 
-`radtk view --rad-type single-cell --max-chunks 1` also parsed the ranged
-output successfully.
+The output size was 1,177,529,777 bytes with 8,218 RAD chunks.
+`radtk view --rad-type single-cell --max-chunks 1` parsed the ranged output
+successfully.
 
 ## Reproduce
 
@@ -86,7 +77,8 @@ Install the pinned S3-only AWS SDK and executable once:
 bash install_scripts/install_s3_rad_materializer.sh
 ```
 
-Run the comparison:
+Run the correctness comparison locally, or the performance comparison on the
+target cloud instance:
 
 ```bash
 AWS_PROFILE=uw bash scripts/benchmark_s3_rad_materializer.sh
