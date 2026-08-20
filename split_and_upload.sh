@@ -70,6 +70,11 @@ fi
 # Default is 8 (fastest setting we measured on a single gzip stream).
 DECOMP_THREADS="${DECOMP_THREADS:-8}"
 (( DECOMP_THREADS < 1 )) && DECOMP_THREADS=1
+FASTQ_DECOMPRESSOR="${FASTQ_DECOMPRESSOR:-rapidgzip}"
+[[ "$FASTQ_DECOMPRESSOR" == "gzip" || "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]] || {
+    echo "ERROR: FASTQ_DECOMPRESSOR must be gzip or rapidgzip" >&2
+    exit 1
+}
 
 # Download the gzip to NVMe first, then decompress the local file.
 # Piping `aws s3 cp -` into rapidgzip blocks multipart download and
@@ -89,28 +94,29 @@ else
     record_split_timing "download_compressed_fastq" "$DOWNLOAD_START_NS"
 fi
 
-# USE_RAPIDGZIP=0 uses zcat, which is how Table 1 in the paper was produced.
+# The driver chooses gzip for one CPU per file and rapidgzip when multiple CPUs
+# are apportioned to each active compressed input.
 DECOMPRESS_START_NS=$(date +%s%N)
-if [[ "${USE_RAPIDGZIP:-1}" == "0" ]]; then
-    echo "Decompressing local files with zcat (USE_RAPIDGZIP=0)"
+if [[ "$FASTQ_DECOMPRESSOR" == "gzip" ]]; then
+    echo "Decompressing local files with single-threaded gzip"
     echo "Splitting local FASTQ files (split every $SPLIT_LINES lines)..."
-    zcat "$R1_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+    gzip -dc -- "$R1_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
     R1_PID=$!
-    zcat "$R2_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+    gzip -dc -- "$R2_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
     R2_PID=$!
 elif command -v rapidgzip >/dev/null 2>&1; then
     echo "Decompressing local files with rapidgzip (-P $DECOMP_THREADS)"
     echo "Splitting local FASTQ files (split every $SPLIT_LINES lines)..."
-    rapidgzip -d -c -P "$DECOMP_THREADS" "$R1_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+    rapidgzip -d -c -P "$DECOMP_THREADS" "$R1_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
     R1_PID=$!
-    rapidgzip -d -c -P "$DECOMP_THREADS" "$R2_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+    rapidgzip -d -c -P "$DECOMP_THREADS" "$R2_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
     R2_PID=$!
 else
     echo "WARNING: rapidgzip not on PATH, falling back to zcat" >&2
     echo "Splitting local FASTQ files (split every $SPLIT_LINES lines)..."
-    zcat "$R1_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
+    gzip -dc -- "$R1_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R1_BASE}_p" &
     R1_PID=$!
-    zcat "$R2_LOCAL_PATH" | split -l $SPLIT_LINES -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
+    gzip -dc -- "$R2_LOCAL_PATH" | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "/mnt/nvme/${R2_BASE}_p" &
     R2_PID=$!
 fi
 wait "$R1_PID" || { echo "ERROR: R1 split failed for $R1_BASE" >&2; rm -f "$R1_LOCAL_PATH" "$R2_LOCAL_PATH"; exit 1; }

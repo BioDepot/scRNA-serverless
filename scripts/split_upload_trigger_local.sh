@@ -18,16 +18,35 @@ S3_BASE="$4"
 INPUT_TXT_BUCKET="$5"
 SPLIT_LINES="${6:-${SPLIT_LINES:-16000000}}"
 DECOMP_THREADS="${DECOMP_THREADS:-8}"
+FASTQ_DECOMPRESSOR="${FASTQ_DECOMPRESSOR:-rapidgzip}"
 AWS_REGION_VALUE="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-2}}"
 SPLIT_TIMINGS_FILE="${SPLIT_TIMINGS_FILE:-}"
+# Optional shared benchmark sentinel.  When multiple lane workers receive the
+# same path, noclobber makes the first worker the sole writer.  The stored value
+# is the nanosecond epoch immediately before that lane launches decompression.
+PIPELINE_START_FILE="${PIPELINE_START_FILE:-}"
+# Optional driver-side core scheduler. Each R1/R2 producer returns its static
+# CPU allocation independently when decompression and split have finished.
+CORE_RELEASE_FIFO="${CORE_RELEASE_FIFO:-}"
 
 [[ -f "$R1_GZ" ]] || { echo "ERROR: R1 gzip not found: $R1_GZ" >&2; exit 1; }
 [[ -f "$R2_GZ" ]] || { echo "ERROR: R2 gzip not found: $R2_GZ" >&2; exit 1; }
 [[ "$SPLIT_LINES" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: SPLIT_LINES must be positive" >&2; exit 1; }
 (( SPLIT_LINES % 4 == 0 )) || { echo "ERROR: SPLIT_LINES must be divisible by 4" >&2; exit 1; }
 [[ "$DECOMP_THREADS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: DECOMP_THREADS must be positive" >&2; exit 1; }
-command -v rapidgzip >/dev/null 2>&1 || { echo "ERROR: rapidgzip not found" >&2; exit 1; }
+[[ "$FASTQ_DECOMPRESSOR" == "gzip" || "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]] || {
+    echo "ERROR: FASTQ_DECOMPRESSOR must be gzip or rapidgzip" >&2
+    exit 1
+}
+command -v "$FASTQ_DECOMPRESSOR" >/dev/null 2>&1 || {
+    echo "ERROR: $FASTQ_DECOMPRESSOR not found" >&2
+    exit 1
+}
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws not found" >&2; exit 1; }
+[[ -z "$CORE_RELEASE_FIFO" || -p "$CORE_RELEASE_FIFO" ]] || {
+    echo "ERROR: CORE_RELEASE_FIFO is not a named pipe: $CORE_RELEASE_FIFO" >&2
+    exit 1
+}
 
 LANE=$(basename "$S3_BASE")
 WORK_DIR=$(mktemp -d "/mnt/nvme/${LANE}.stream.XXXXXX")
@@ -80,31 +99,57 @@ is_complete_shard() {
     [[ -f "$next" || -f "$status_file" ]]
 }
 
+release_decompressor_cores() {
+    [[ -n "$CORE_RELEASE_FIFO" ]] || return 0
+    # One short write is atomic for a FIFO. The driver adds this many available
+    # cores and admits the next pair only when it has 2 * DECOMP_THREADS.
+    printf '%s\n' "$DECOMP_THREADS" > "$CORE_RELEASE_FIFO"
+}
+
 TOTAL_START_NS=$(now_ns)
+if [[ -n "$PIPELINE_START_FILE" ]]; then
+    mkdir -p "$(dirname -- "$PIPELINE_START_FILE")"
+    (
+        set -o noclobber
+        printf '%s\n' "$TOTAL_START_NS" > "$PIPELINE_START_FILE"
+    ) 2>/dev/null || true
+fi
 DECOMPRESS_START_NS="$TOTAL_START_NS"
 R1_STATUS="$WORK_DIR/r1.status"
 R2_STATUS="$WORK_DIR/r2.status"
 R1_PREFIX="$WORK_DIR/r1_p"
 R2_PREFIX="$WORK_DIR/r2_p"
 
-echo "Starting $LANE from local NVMe with two rapidgzip -P $DECOMP_THREADS processes"
+if [[ "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]]; then
+    echo "Starting $LANE from local NVMe with two rapidgzip -P $DECOMP_THREADS processes"
+else
+    echo "Starting $LANE from local NVMe with two single-threaded gzip processes"
+fi
 (
     set +e
     set -o pipefail
-    rapidgzip -d -c -P "$DECOMP_THREADS" "$R1_GZ" | \
-        split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "$R1_PREFIX"
+    if [[ "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]]; then
+        rapidgzip -d -c -P "$DECOMP_THREADS" "$R1_GZ"
+    else
+        gzip -dc -- "$R1_GZ"
+    fi | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "$R1_PREFIX"
     rc=$?
     printf '%s %s\n' "$rc" "$(now_ns)" > "$R1_STATUS"
+    release_decompressor_cores
 ) &
 R1_PRODUCER_PID=$!
 
 (
     set +e
     set -o pipefail
-    rapidgzip -d -c -P "$DECOMP_THREADS" "$R2_GZ" | \
-        split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "$R2_PREFIX"
+    if [[ "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]]; then
+        rapidgzip -d -c -P "$DECOMP_THREADS" "$R2_GZ"
+    else
+        gzip -dc -- "$R2_GZ"
+    fi | split -l "$SPLIT_LINES" -d -a 4 --additional-suffix=.fastq - "$R2_PREFIX"
     rc=$?
     printf '%s %s\n' "$rc" "$(now_ns)" > "$R2_STATUS"
+    release_decompressor_cores
 ) &
 R2_PRODUCER_PID=$!
 
@@ -164,8 +209,8 @@ while true; do
     if [[ -f "$R1_STATUS" && -f "$R2_STATUS" ]]; then
         R1_RC=$(status_rc "$R1_STATUS")
         R2_RC=$(status_rc "$R2_STATUS")
-        (( R1_RC == 0 )) || { echo "ERROR: R1 rapidgzip/split failed with $R1_RC" >&2; exit 1; }
-        (( R2_RC == 0 )) || { echo "ERROR: R2 rapidgzip/split failed with $R2_RC" >&2; exit 1; }
+        (( R1_RC == 0 )) || { echo "ERROR: R1 decompression/split failed with $R1_RC" >&2; exit 1; }
+        (( R2_RC == 0 )) || { echo "ERROR: R2 decompression/split failed with $R2_RC" >&2; exit 1; }
 
         if [[ ! -f "$R1_SHARD" && ! -f "$R2_SHARD" ]]; then
             break

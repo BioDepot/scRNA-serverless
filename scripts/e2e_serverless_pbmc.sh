@@ -16,8 +16,9 @@
 #   bash scripts/e2e_serverless_pbmc.sh pbmc10k
 #   bash scripts/e2e_serverless_pbmc.sh ko
 #
-# Split and Upload uses rapidgzip -P 8 per gzip stream. Lane concurrency is
-# capped so those 8 threads fit on the box (2 lanes on 32 vCPU, 4 on 64).
+# Split and Upload apportions CPUs across all active R1/R2 gzip streams. It
+# uses rapidgzip with at most 8 threads per stream when more than one CPU is
+# available per file, and gzip with one worker per file otherwise.
 # If two or more NVMe instance-store disks are present they are striped as
 # RAID 0 at /mnt/nvme.
 #
@@ -57,7 +58,13 @@
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
 #   DOWNLOAD_TO_LOCAL      Download results from EC2 to local machine (default: 1). Alias for DOWNLOAD_RESULTS.
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
-#   USE_RAPIDGZIP          1 = rapidgzip -P 8 for Split and Upload (default). 0 = zcat.
+#   READ_PAIRS_PER_SHARD   Target read pairs per Lambda shard (default: 4000000;
+#                          8000000 on accounts limited to <=25 concurrent Lambdas).
+#   SPLIT_LINES            Legacy override; must equal read pairs per shard * 4.
+#   DIRECT_GZIP_MAX_BYTES  Pass a compressed R1/R2 pair directly to Lambda when
+#                          its combined size is below this value (default: 1 GiB).
+#   USE_RAPIDGZIP          auto/1 enables CPU-aware rapidgzip selection (default:
+#                          auto); 0 forces single-threaded gzip workers.
 #   MATERIALIZER_THREADS   Concurrent S3 RAD materializer workers (default: 32).
 #   EXECUTION_MODE         synchronous (default) or async-submit. The latter
 #                          exits after publishing all immediate shard triggers.
@@ -322,11 +329,13 @@ FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-1}"
 RUN_ID="${RUN_ID:-}"
+READ_PAIRS_PER_SHARD="${READ_PAIRS_PER_SHARD:-}"
 SPLIT_LINES="${SPLIT_LINES:-}"
+DIRECT_GZIP_MAX_BYTES="${DIRECT_GZIP_MAX_BYTES:-1073741824}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 POST_UPLOAD_PROPAGATION_WAIT_SECONDS="${POST_UPLOAD_PROPAGATION_WAIT_SECONDS:-0}"
-USE_RAPIDGZIP="${USE_RAPIDGZIP:-1}"
+USE_RAPIDGZIP="${USE_RAPIDGZIP:-auto}"
 EXECUTION_MODE="${EXECUTION_MODE:-synchronous}"
 
 # Derived values (will be set later)
@@ -981,7 +990,7 @@ process_fastq_bash() {
 
     declare -A PF_R1_KEYS PF_R2_KEYS
     local local_fastq_mode=0
-    if [[ -n "${LOCAL_FASTQ_DIR:-}" && "$DATASET" != "ko" ]]; then
+    if [[ -n "${LOCAL_FASTQ_DIR:-}" ]]; then
         local_fastq_mode=1
         log_info "Using compressed FASTQs directly from NVMe: $LOCAL_FASTQ_DIR"
         local _local_i _local_base
@@ -1016,22 +1025,19 @@ process_fastq_bash() {
 
     phase_begin "Split and Upload [on-server]" 3
 
-    # Sizing is cheap and sequential; the split itself is expensive and is run for
-    # every lane pair at once, the way process_fastq.py's thread pool did it.
+    # Size first, then process lane pairs in descending combined compressed
+    # bytes. Large work units therefore enter the decompression queue first.
+    local -a ORDERED_BASES=()
     local -a SPLIT_LANES=() SPLIT_R1=() SPLIT_R2=() SPLIT_BASE=()
+    local -a DIRECT_LANES=() DIRECT_R1=() DIRECT_R2=() DIRECT_BASE=()
+    local -A PF_PAIR_BYTES=()
+    local base r1_key r2_key r1_bytes r2_bytes combined_bytes
 
+    TOTAL_INPUT_BYTES=0
     for base in "${!PF_R1_KEYS[@]}"; do
-        local r1_key="${PF_R1_KEYS[$base]}"
-        local r2_key="${PF_R2_KEYS[$base]:-}"
+        r1_key="${PF_R1_KEYS[$base]}"
+        r2_key="${PF_R2_KEYS[$base]:-}"
         [[ -z "$r2_key" ]] && { log_warn "No R2 for $base, skipping"; continue; }
-
-        local lane_id base_folder
-        lane_id=$(basename "$base")
-        base_folder=$(dirname "$base")
-        [[ "$base_folder" == "." ]] && base_folder=""
-
-        # Check combined file size
-        local r1_bytes r2_bytes combined_bytes split_threshold_bytes
         if (( local_fastq_mode == 1 )); then
             r1_bytes=$(stat --format=%s "$r1_key")
             r2_bytes=$(stat --format=%s "$r2_key")
@@ -1041,37 +1047,37 @@ process_fastq_bash() {
             r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
                 --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
         fi
-        combined_bytes=$(( r1_bytes + r2_bytes ))
-        TOTAL_INPUT_BYTES=$(( ${TOTAL_INPUT_BYTES:-0} + combined_bytes ))
-        # Force splitting when Lambda memory <= 3008 MB (threshold=0) to avoid OOM/timeouts
-        if [[ $LAMBDA_MEMORY_MB -le 3008 ]]; then
-            split_threshold_bytes=0
-        else
-            split_threshold_bytes=$(( 2 * 1024 * 1024 * 1024 ))
-        fi
-        log_info "Pair $lane_id: combined size $(( combined_bytes / 1048576 )) MB (split threshold: $(( split_threshold_bytes / 1048576 )) MB)"
+        [[ "$r1_bytes" =~ ^[0-9]+$ && "$r2_bytes" =~ ^[0-9]+$ ]] || \
+            die "Could not determine compressed size for $base"
+        combined_bytes=$((r1_bytes + r2_bytes))
+        PF_PAIR_BYTES["$base"]="$combined_bytes"
+        TOTAL_INPUT_BYTES=$((TOTAL_INPUT_BYTES + combined_bytes))
+    done
 
-        if [[ $split_threshold_bytes -gt 0 && $combined_bytes -lt $split_threshold_bytes ]]; then
-            local r1_s3 r2_s3
-            if (( local_fastq_mode == 1 )); then
-                local r1_object="${base}_R1_001.fastq.gz"
-                local r2_object="${base}_R2_001.fastq.gz"
-                aws s3 cp "$r1_key" "s3://${INPUT_FASTQ_BUCKET}/${r1_object}" \
-                    --region "$AWS_REGION" --only-show-errors &
-                local r1_upload_pid=$!
-                aws s3 cp "$r2_key" "s3://${INPUT_FASTQ_BUCKET}/${r2_object}" \
-                    --region "$AWS_REGION" --only-show-errors &
-                local r2_upload_pid=$!
-                wait "$r1_upload_pid" || die "R1 upload failed for $lane_id"
-                wait "$r2_upload_pid" || die "R2 upload failed for $lane_id"
-                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_object}"
-                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_object}"
-            else
-                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_key}"
-                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_key}"
-            fi
-            sleep 3
-            create_and_upload_input_txt "$lane_id" "$r1_s3" "$r2_s3" "$base_folder"
+    mapfile -t ORDERED_BASES < <(
+        for base in "${!PF_PAIR_BYTES[@]}"; do
+            printf '%s\t%s\n' "${PF_PAIR_BYTES[$base]}" "$base"
+        done | LC_ALL=C sort -t $'\t' -k1,1nr -k2,2 | cut -f2-
+    )
+
+    local lane_id direct_threshold_bytes
+    if [[ $LAMBDA_MEMORY_MB -le 3008 ]]; then
+        direct_threshold_bytes=0
+    else
+        direct_threshold_bytes=$DIRECT_GZIP_MAX_BYTES
+    fi
+    for base in "${ORDERED_BASES[@]}"; do
+        r1_key="${PF_R1_KEYS[$base]}"
+        r2_key="${PF_R2_KEYS[$base]}"
+        combined_bytes="${PF_PAIR_BYTES[$base]}"
+        lane_id=$(basename "$base")
+        log_info "Pair $lane_id: combined compressed size $combined_bytes bytes; direct-pass cutoff $direct_threshold_bytes bytes"
+
+        if (( direct_threshold_bytes > 0 && combined_bytes < direct_threshold_bytes )); then
+            DIRECT_LANES+=("$lane_id")
+            DIRECT_R1+=("$r1_key")
+            DIRECT_R2+=("$r2_key")
+            DIRECT_BASE+=("$base")
             INPUT_FOLDERS+=("${lane_id}_p0")
         else
             SPLIT_LANES+=("$lane_id")
@@ -1081,23 +1087,69 @@ process_fastq_bash() {
         fi
     done
 
+    publish_direct_pairs() {
+        local i lane base_path base_folder direct_r1 direct_r2 r1_s3 r2_s3
+        local r1_object r2_object r1_upload_pid r2_upload_pid
+        for i in "${!DIRECT_LANES[@]}"; do
+            lane="${DIRECT_LANES[$i]}"
+            base_path="${DIRECT_BASE[$i]}"
+            base_folder=$(dirname "$base_path")
+            [[ "$base_folder" == "." ]] && base_folder=""
+            direct_r1="${DIRECT_R1[$i]}"
+            direct_r2="${DIRECT_R2[$i]}"
+            if (( local_fastq_mode == 1 )); then
+                r1_object="${base_path}_R1_001.fastq.gz"
+                r2_object="${base_path}_R2_001.fastq.gz"
+                aws s3 cp "$direct_r1" "s3://${INPUT_FASTQ_BUCKET}/${r1_object}" \
+                    --region "$AWS_REGION" --only-show-errors &
+                r1_upload_pid=$!
+                aws s3 cp "$direct_r2" "s3://${INPUT_FASTQ_BUCKET}/${r2_object}" \
+                    --region "$AWS_REGION" --only-show-errors &
+                r2_upload_pid=$!
+                wait "$r1_upload_pid" || return 1
+                wait "$r2_upload_pid" || return 1
+                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_object}"
+                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_object}"
+            else
+                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${direct_r1}"
+                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${direct_r2}"
+            fi
+            create_and_upload_input_txt "$lane" "$r1_s3" "$r2_s3" "$base_folder" || return 1
+        done
+    }
+
+    local DIRECT_PUBLISH_PID=""
+
     if [[ ${#SPLIT_LANES[@]} -gt 0 ]]; then
-        # Fastest measured rapidgzip is -P 8 per stream (1.77 GB gzip: -P 4 =
-        # 3.29 s, -P 8 = 3.05 s, -P 16 = 3.29 s). Each lane is two streams
-        # (R1+R2). Bound how many lanes run at once so KO's ~130 pairs keep
-        # -P 8 instead of 32/260 flooring to -P 1.
-        local _cores; _cores=$(nproc 2>/dev/null || echo 4)
-        DECOMP_THREADS=8
-        (( DECOMP_THREADS > _cores / 2 )) && DECOMP_THREADS=$(( _cores / 2 ))
-        (( DECOMP_THREADS < 1 )) && DECOMP_THREADS=1
-        export DECOMP_THREADS
+        # Apportion CPUs across the compressed files that actually require
+        # splitting. More files than cores means one gzip worker per file.
+        # Otherwise divide CPUs evenly and cap rapidgzip at its measured sweet
+        # spot of eight threads per file.
+        local _cores _split_file_count
+        _cores=$(nproc 2>/dev/null || echo 4)
+        _split_file_count=$(( ${#SPLIT_LANES[@]} * 2 ))
+        DECOMP_THREADS=1
+        FASTQ_DECOMPRESSOR=gzip
+        if [[ "$USE_RAPIDGZIP" != "0" ]] && (( _split_file_count < _cores )); then
+            DECOMP_THREADS=$(( _cores / _split_file_count ))
+            (( DECOMP_THREADS > 8 )) && DECOMP_THREADS=8
+            if (( DECOMP_THREADS > 1 )) && command -v rapidgzip >/dev/null 2>&1; then
+                FASTQ_DECOMPRESSOR=rapidgzip
+            else
+                DECOMP_THREADS=1
+            fi
+        fi
+        export DECOMP_THREADS FASTQ_DECOMPRESSOR
         local _max_lanes=$(( _cores / (DECOMP_THREADS * 2) ))
         (( _max_lanes < 1 )) && _max_lanes=1
 
+        local _decompressor_description="$FASTQ_DECOMPRESSOR"
+        [[ "$FASTQ_DECOMPRESSOR" == "rapidgzip" ]] && \
+            _decompressor_description="rapidgzip -P $DECOMP_THREADS"
         if (( local_fastq_mode == 1 )); then
-            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (NVMe gzip, rapidgzip -P $DECOMP_THREADS per file)"
+            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time from NVMe with $_decompressor_description per file"
         else
-            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (download gzip, then rapidgzip -P $DECOMP_THREADS per file)"
+            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time after S3 download with $_decompressor_description per file"
         fi
 
         local parts_dir="$RUN_DIR/split_parts"
@@ -1106,14 +1158,51 @@ process_fastq_bash() {
         mkdir -p "$split_timings_dir"
 
         local -a split_pids=()
-        local i _rc=0
-        for i in "${!SPLIT_LANES[@]}"; do
-            while (( ${#split_pids[@]} >= _max_lanes )); do
-                wait "${split_pids[0]}" || _rc=1
-                split_pids=("${split_pids[@]:1}")
+        local i _rc=0 _finished_pid _pid
+        local _core_release_dir="" _core_release_fifo="" _core_release_fd=""
+        local _available_cores="$_cores" _pair_core_cost=$((DECOMP_THREADS * 2))
+        reap_one_split_pair() {
+            local _wait_rc=0
+            local -a _remaining=()
+            _finished_pid=""
+            wait -n -p _finished_pid "${split_pids[@]}" || _wait_rc=$?
+            (( _wait_rc == 0 )) || _rc=1
+            [[ -n "$_finished_pid" ]] || die "Could not identify completed split-pair worker"
+            for _pid in "${split_pids[@]}"; do
+                [[ "$_pid" == "$_finished_pid" ]] || _remaining+=("$_pid")
             done
+            split_pids=("${_remaining[@]}")
+        }
+
+        # NVMe workers can return the R1 and R2 allocations independently.
+        # The next pair starts as soon as any two complete streams have freed
+        # enough cores; the streams need not belong to the same prior pair.
+        if (( local_fastq_mode == 1 )); then
+            _core_release_dir=$(mktemp -d "$RUN_DIR/core_release.XXXXXX")
+            _core_release_fifo="$_core_release_dir/releases.fifo"
+            mkfifo "$_core_release_fifo"
+            exec {_core_release_fd}<>"$_core_release_fifo"
+        fi
+
+        for i in "${!SPLIT_LANES[@]}"; do
+            if (( local_fastq_mode == 1 )); then
+                while (( _available_cores < _pair_core_cost )); do
+                    local _released_cores
+                    IFS= read -r _released_cores <&"$_core_release_fd" || \
+                        die "Core-release scheduler pipe closed unexpectedly"
+                    [[ "$_released_cores" =~ ^[1-9][0-9]*$ ]] || \
+                        die "Invalid core-release notification: $_released_cores"
+                    _available_cores=$((_available_cores + _released_cores))
+                done
+                _available_cores=$((_available_cores - _pair_core_cost))
+            else
+                while (( ${#split_pids[@]} >= _max_lanes )); do
+                    reap_one_split_pair
+                done
+            fi
             (
                 if (( local_fastq_mode == 1 )); then
+                    CORE_RELEASE_FIFO="$_core_release_fifo" \
                     SPLIT_TIMINGS_FILE="$split_timings_dir/${SPLIT_LANES[$i]}.csv" \
                     bash /home/ubuntu/scrna-repo/scripts/split_upload_trigger_local.sh \
                         "$INPUT_FASTQ_BUCKET" "${SPLIT_R1[$i]}" "${SPLIT_R2[$i]}" \
@@ -1132,11 +1221,28 @@ process_fastq_bash() {
                 exit "$_split_rc"
             ) &
             split_pids+=("$!")
+            # Start direct-pass pairs only after the first full batch of the
+            # largest split jobs has claimed the decompression cores. Direct
+            # pairs use Lambda/S3 capacity and can overlap without displacing
+            # those larger local jobs.
+            if [[ -z "$DIRECT_PUBLISH_PID" && ${#DIRECT_LANES[@]} -gt 0 ]] && \
+               (( ${#split_pids[@]} >= _max_lanes || i == ${#SPLIT_LANES[@]} - 1 )); then
+                publish_direct_pairs &
+                DIRECT_PUBLISH_PID=$!
+            fi
         done
-        local _pid
-        for _pid in "${split_pids[@]}"; do
-            wait "$_pid" || _rc=1
-        done
+        if (( local_fastq_mode == 1 )); then
+            for _pid in "${split_pids[@]}"; do
+                wait "$_pid" || _rc=1
+            done
+            exec {_core_release_fd}>&-
+            rm -f -- "$_core_release_fifo"
+            rmdir -- "$_core_release_dir"
+        else
+            while (( ${#split_pids[@]} > 0 )); do
+                reap_one_split_pair
+            done
+        fi
         [[ $_rc -eq 0 ]] || die "split_and_upload.sh failed for one or more lanes"
 
         for i in "${!SPLIT_LANES[@]}"; do
@@ -1150,6 +1256,14 @@ process_fastq_bash() {
             done
         done
         rm -rf "$parts_dir"
+    fi
+
+    if [[ -z "$DIRECT_PUBLISH_PID" && ${#DIRECT_LANES[@]} -gt 0 ]]; then
+        publish_direct_pairs &
+        DIRECT_PUBLISH_PID=$!
+    fi
+    if [[ -n "$DIRECT_PUBLISH_PID" ]]; then
+        wait "$DIRECT_PUBLISH_PID" || die "Direct gzip-pair publication failed"
     fi
 
     local input_count=${#INPUT_FOLDERS[@]}
@@ -1387,8 +1501,10 @@ ssm_run_pipeline() {
         --arg write_h5ad "$WRITE_H5AD" \
         --arg run_id "$run_id" \
         --arg run_qc "$RUN_QC" \
+        --arg read_pairs_per_shard "$READ_PAIRS_PER_SHARD" \
         --arg split_lines "$SPLIT_LINES" \
-        --arg use_rapidgzip "${USE_RAPIDGZIP:-1}" \
+        --arg direct_gzip_max_bytes "$DIRECT_GZIP_MAX_BYTES" \
+        --arg use_rapidgzip "${USE_RAPIDGZIP:-auto}" \
         --arg execution_mode "$EXECUTION_MODE" \
         --arg concurrency "${LAMBDA_CONCURRENCY:-0}" \
         --arg ko_cache "${KO_FASTQ_CACHE_BUCKET:-}" \
@@ -1417,7 +1533,9 @@ ssm_run_pipeline() {
             ("export WRITE_H5AD=" + $write_h5ad),
             ("export RUN_ID=" + $run_id),
             ("export RUN_QC=" + $run_qc),
+            ("export READ_PAIRS_PER_SHARD=" + $read_pairs_per_shard),
             ("export SPLIT_LINES=" + $split_lines),
+            ("export DIRECT_GZIP_MAX_BYTES=" + $direct_gzip_max_bytes),
             ("export USE_RAPIDGZIP=" + $use_rapidgzip),
             ("export EXECUTION_MODE=" + $execution_mode),
             ("export KO_FASTQ_CACHE_BUCKET=" + $ko_cache),
@@ -1530,6 +1648,22 @@ fi
 [[ "$CLAIM_HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "CLAIM_HEARTBEAT_SECONDS must be positive"
 (( CLAIM_HEARTBEAT_SECONDS < CLAIM_LEASE_SECONDS )) || \
     die "CLAIM_HEARTBEAT_SECONDS must be less than CLAIM_LEASE_SECONDS"
+[[ "$USE_RAPIDGZIP" == "auto" || "$USE_RAPIDGZIP" == "0" || "$USE_RAPIDGZIP" == "1" ]] || \
+    die "USE_RAPIDGZIP must be auto, 0, or 1"
+[[ "$DIRECT_GZIP_MAX_BYTES" =~ ^[1-9][0-9]*$ ]] || \
+    die "DIRECT_GZIP_MAX_BYTES must be a positive integer"
+if [[ -n "$READ_PAIRS_PER_SHARD" ]]; then
+    [[ "$READ_PAIRS_PER_SHARD" =~ ^[1-9][0-9]*$ ]] || \
+        die "READ_PAIRS_PER_SHARD must be a positive integer"
+fi
+if [[ -n "$SPLIT_LINES" ]]; then
+    [[ "$SPLIT_LINES" =~ ^[1-9][0-9]*$ ]] || die "SPLIT_LINES must be a positive integer"
+    (( SPLIT_LINES % 4 == 0 )) || die "SPLIT_LINES must be divisible by four"
+    if [[ -n "$READ_PAIRS_PER_SHARD" ]] && \
+       (( SPLIT_LINES != READ_PAIRS_PER_SHARD * 4 )); then
+        die "SPLIT_LINES must equal READ_PAIRS_PER_SHARD * 4 when both are set"
+    fi
+fi
 if [[ "$DATASET" == "ko" ]]; then
     # Combined 86-line matrix is not useful for the paper QC plots, and the
     # results tarball would be ~200 GB. Table 1 only needs timings.csv.
@@ -2433,8 +2567,10 @@ export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
 export RUN_ID=$RUN_ID
 export RUN_QC=$RUN_QC
+export READ_PAIRS_PER_SHARD=$READ_PAIRS_PER_SHARD
 export SPLIT_LINES=$SPLIT_LINES
-export USE_RAPIDGZIP=${USE_RAPIDGZIP:-1}
+export DIRECT_GZIP_MAX_BYTES=$DIRECT_GZIP_MAX_BYTES
+export USE_RAPIDGZIP=${USE_RAPIDGZIP:-auto}
 export EXECUTION_MODE=$EXECUTION_MODE
 export KO_FASTQ_CACHE_BUCKET=${KO_FASTQ_CACHE_BUCKET:-}
 
@@ -2762,7 +2898,7 @@ if [[ "$DATASET" != "ko" && -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
 fi
 
 # Obtain FASTQs
-if [[ "$DATASET" == "ko" ]]; then
+if [[ "$DATASET" == "ko" && -z "$LOCAL_FASTQ_DIR" ]]; then
     fetch_ko_fastqs
 elif [[ -n "$LOCAL_FASTQ_DIR" ]]; then
     log_info "Reusing already-extracted FASTQs from NVMe: $LOCAL_FASTQ_DIR"
@@ -2792,7 +2928,7 @@ else
     die "Either FASTQ_TAR_PATH or FASTQ_TAR_URL must be provided"
 fi
 
-if [[ "$DATASET" != "ko" ]]; then
+if [[ "$DATASET" != "ko" || -n "$LOCAL_FASTQ_DIR" ]]; then
     # Find R1 files. The lanes are deliberately kept separate. process_fastq.py
     # grouped FASTQs by lane and processed each pair concurrently; concatenating them
     # leaves one oversized R2 stream, and since decompression is the critical path of
@@ -2869,7 +3005,7 @@ log_info "Buckets created and configured"
 
 log_info "Step 3: Uploading FASTQs to S3..."
 
-if [[ "$DATASET" == "ko" ]]; then
+if [[ "$DATASET" == "ko" && -z "$LOCAL_FASTQ_DIR" ]]; then
     log_info "Copying KO FASTQs from cache to run bucket (S3-to-S3)..."
     aws s3 sync "s3://$KO_FASTQ_CACHE_BUCKET/ko/" "s3://$INPUT_FASTQ_BUCKET/ko/" \
         --region "$AWS_REGION" --only-show-errors
@@ -3097,14 +3233,22 @@ set_lambda_concurrency() {
 }
 set_lambda_concurrency "$LAMBDA_CONCURRENCY"
 
-# 6d3: Auto-adjust SPLIT_LINES for low-concurrency accounts
-if [[ "$LAMBDA_CONCURRENCY" != "unrestricted" && "$LAMBDA_CONCURRENCY" -le 25 && "$DATASET" == "pbmc10k" ]]; then
-    SPLIT_LINES="${SPLIT_LINES:-32000000}"
-    log_info "Low concurrency ($LAMBDA_CONCURRENCY) + pbmc10k: using SPLIT_LINES=$SPLIT_LINES (8M reads/shard)"
+# 6d3: Select a read-pair target, then translate it to FASTQ lines. Explicit
+# values win; the low-concurrency fallback applies to every large dataset.
+if [[ -n "$SPLIT_LINES" ]]; then
+    READ_PAIRS_PER_SHARD=$((SPLIT_LINES / 4))
+elif [[ -n "$READ_PAIRS_PER_SHARD" ]]; then
+    SPLIT_LINES=$((READ_PAIRS_PER_SHARD * 4))
+elif [[ "$LAMBDA_CONCURRENCY" != "unrestricted" && "$LAMBDA_CONCURRENCY" -le 25 ]]; then
+    READ_PAIRS_PER_SHARD=8000000
+    SPLIT_LINES=$((READ_PAIRS_PER_SHARD * 4))
+    log_info "Low Lambda concurrency ($LAMBDA_CONCURRENCY): using 8M read pairs per shard"
 else
-    SPLIT_LINES="${SPLIT_LINES:-16000000}"
+    READ_PAIRS_PER_SHARD=4000000
+    SPLIT_LINES=$((READ_PAIRS_PER_SHARD * 4))
 fi
-export SPLIT_LINES
+export READ_PAIRS_PER_SHARD SPLIT_LINES
+log_info "Shard policy: $READ_PAIRS_PER_SHARD read pairs ($SPLIT_LINES FASTQ lines) per Lambda"
 
 # 6e: Create EventBridge rule to trigger Lambda
 RULE_NAME="${LAMBDA_FUNCTION_NAME}-rule"
@@ -3157,6 +3301,9 @@ OUTPUT_MAP_BUCKET=$OUTPUT_MAP_BUCKET
 OUTPUT_QUANT_BUCKET=$OUTPUT_QUANT_BUCKET
 LAMBDA_FUNCTION=$LAMBDA_FUNCTION_NAME
 S3_CLAIM_PREFIX=$S3_CLAIM_PREFIX
+READ_PAIRS_PER_SHARD=$READ_PAIRS_PER_SHARD
+SPLIT_LINES=$SPLIT_LINES
+DIRECT_GZIP_MAX_BYTES=$DIRECT_GZIP_MAX_BYTES
 EXPECTED_FOLDERS_FILE=$EXPECTED_RAD_FOLDERS
 NOT_BEFORE=$(<"${EXPECTED_RAD_FOLDERS}.not-before")
 SUBMITTED_AT=$ASYNC_SUBMITTED_AT
@@ -3346,6 +3493,9 @@ LAMBDA_CONCURRENCY=${LAMBDA_CONCURRENCY:-unrestricted}
 S3_CLAIM_PREFIX=$S3_CLAIM_PREFIX
 CLAIM_LEASE_SECONDS=$CLAIM_LEASE_SECONDS
 CLAIM_HEARTBEAT_SECONDS=$CLAIM_HEARTBEAT_SECONDS
+READ_PAIRS_PER_SHARD=$READ_PAIRS_PER_SHARD
+SPLIT_LINES=$SPLIT_LINES
+DIRECT_GZIP_MAX_BYTES=$DIRECT_GZIP_MAX_BYTES
 ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP
 ALLOW_S3_DELETE=$ALLOW_S3_DELETE
 CLEANUP_AWS=$CLEANUP_AWS
