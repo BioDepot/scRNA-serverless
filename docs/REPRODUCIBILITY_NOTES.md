@@ -22,12 +22,13 @@ The script processes PBMC 1K (~5 GB) in a single Lambda, matching the paper. If 
 
 ### EC2 instance type fallback
 
-The script uses **m6id.16xlarge** (64 vCPUs, 256 GB RAM), matching the paper. If the account's vCPU quota is too low, it automatically falls back through smaller instances:
+The script uses **m5dn.8xlarge** (32 vCPU, 128 GB RAM, two NVMe disks). That is the instance 1K, 10K, and KO completed on. If launch fails (quota or capacity), it tries smaller types:
 
 | Instance | vCPUs | RAM | Notes |
 |---|---|---|---|
-| m6id.16xlarge | 64 | 256 GB | Paper configuration |
-| m6id.8xlarge | 32 | 128 GB | Fits default 32 vCPU quota |
+| m5dn.8xlarge | 32 | 128 GB | Default. RAID 0, rapidgzip `-P 8`, 2 lanes |
+| m5dn.4xlarge | 16 | 64 GB | Still has NVMe |
+| m6id.8xlarge | 32 | 128 GB | NVMe |
 | m6id.4xlarge | 16 | 64 GB | |
 | m6id.xlarge | 4 | 16 GB | |
 | m6i.xlarge | 4 | 16 GB | EBS only, no NVMe |
@@ -35,13 +36,15 @@ The script uses **m6id.16xlarge** (64 vCPUs, 256 GB RAM), matching the paper. If
 | t3.xlarge | 4 | 16 GB | Min for PBMC 10K |
 | t3.large | 2 | 8 GB | Min for PBMC 1K |
 
+To use the paper's m6id.16xlarge instead: `export INSTANCE_TYPE=m6id.16xlarge`
+
 ### EBS root volume: 500 GB (unchanged)
 
-The script defaults to **500 GB**, matching the paper. On m6id instances, most data goes on the NVMe instance-store SSD, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
+The script defaults to **500 GB**, matching the paper. On m5dn.8xlarge, FASTQs and intermediates go on the RAID 0 NVMe, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
 
 ### NVMe storage fallback
 
-The script uses NVMe instance storage (m6id family), matching the paper. If the EC2 instance has no NVMe device (m6i, t3 families), it automatically falls back to the EBS root volume.
+m5dn.8xlarge has two instance-store NVMe disks. The script stripes them as RAID 0 at `/mnt/nvme`. If the instance has no NVMe (m6i, t3), it uses the EBS root volume.
 
 ### Configuration summary
 
@@ -51,12 +54,14 @@ The script uses NVMe instance storage (m6id family), matching the paper. If the 
 | Lambda ephemeral storage | 10,240 MB | 10,240 MB | *(unchanged)* |
 | Piscem threads | 6 | 6 | 2 (at 3,008 MB) |
 | PBMC 1K splitting | Not split (1 Lambda) | Not split (1 Lambda) | 17 parts (at 3,008 MB) |
-| Split threshold | 7 GB | 7 GB | 0 GB (at 3,008 MB — forces splitting) |
+| Split threshold | 7 GB | 2 GB | 0 GB (at 3,008 MB — forces splitting) |
 | Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads | *(unchanged)* |
-| EC2 driver instance | m6id.16xlarge | m6id.16xlarge | Falls through smaller instances |
+| EC2 driver instance | m6id.16xlarge | m5dn.8xlarge | Falls through smaller instances |
 | EBS root volume | 500 GB | 500 GB | *(unchanged)* |
-| NVMe storage | Available (m6id) | Used if available | EBS root volume (m6i/t3 families) |
-| Lambda timeout | 900 s | 900 s | *(unchanged)* |
+| NVMe storage | Available (m6id) | RAID 0 when 2+ disks | EBS root volume (m6i/t3 families) |
+| Split decompression | zcat | rapidgzip `-P 8` | zcat if rapidgzip is missing |
+| Split lane concurrency | all lanes at once | `nproc / (8 * 2)` | 1 lane if the box is small |
+| Lambda timeout | 900 s | 900 s | Stops polling after 900s + 3 min with no new output |
 
 ### Local disk space requirements
 
@@ -75,7 +80,7 @@ All other steps (alevin-fry generate-permit-list, collate, quant, resource creat
 
 ## Script reference
 
-This repository includes three scripts. Each can run PBMC 1K or PBMC 10K.
+This repository includes three scripts. The serverless script runs PBMC 1K, PBMC 10K, and KO.
 
 ---
 
@@ -89,8 +94,8 @@ Provisions AWS resources (EC2, Lambda, S3, ECR, EventBridge), runs the mapping/q
 bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 ```
 
-- `<dataset>`: `pbmc1k` or `pbmc10k`
-- `--dry-run`: validate credentials, AMI, network, keypair — creates nothing
+- `<dataset>`: `pbmc1k`, `pbmc10k`, or `ko`
+- `--dry-run`: validate credentials, AMI, network, keypair. Creates nothing.
 
 **Required environment variables** (set before every run):
 
@@ -106,8 +111,11 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLEANUP_AWS` | `1` | `1` = delete AWS infrastructure after run. `0` = keep everything. On failure, always cleans up. |
-| `CLEANUP_RESULTS` | `1` | `1` = delete results S3 bucket after run. `0` = keep for manual download. On failure, always cleans up. |
+| `ALLOW_DESTRUCTIVE_CLEANUP` | `0` | Master gate; no AWS cleanup runs unless this is explicitly `1`. |
+| `ALLOW_S3_DELETE` | `0` | Second gate required before S3 objects or buckets can be deleted. |
+| `CLEANUP_AWS` | `0` | Request AWS infrastructure cleanup; also requires the master gate. |
+| `CLEANUP_RESULTS` | `0` | Request results-bucket cleanup; also requires both cleanup gates. |
+| `DELETE_CLOUDWATCH_LOGS` | `0` | Request log-group deletion; also requires the master gate. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | `1` = terminate EC2 when done. `0` = leave it running. |
 | `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip QC. |
 | `WRITE_H5AD` | `1` | `1` = save `.h5ad` AnnData file (requires `RUN_QC=1`). `0` = skip. |
@@ -128,7 +136,7 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 > # Clean up when done
 > aws s3 rb s3://scrna-quant-<ACCOUNT_ID>-us-east-2-<RUN_ID> --force --region us-east-2
 > ```
-| `INSTANCE_TYPE` | `m6id.16xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
+| `INSTANCE_TYPE` | `m5dn.8xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
 | `ROOT_VOL_GB` | `500` | EBS root volume size in GB. |
 | `LAMBDA_MEMORY_MB` | `10240` | Lambda memory in MB (falls back to 3008 if quota exceeded). |
 | `LAMBDA_EPHEMERAL_MB` | `10240` | Lambda ephemeral storage in MB. |
@@ -148,8 +156,10 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=0 WRITE_H5AD=0
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 
-# Full run with QC + cleanup
-export CLEANUP_AWS=1 TERMINATE_DRIVER_ON_EXIT=1 RUN_QC=1 WRITE_H5AD=1
+# Full run with QC + explicitly authorized cleanup
+export ALLOW_DESTRUCTIVE_CLEANUP=1 ALLOW_S3_DELETE=1
+export CLEANUP_AWS=1 CLEANUP_RESULTS=1 TERMINATE_DRIVER_ON_EXIT=1
+export RUN_QC=1 WRITE_H5AD=1
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 
 # PBMC 10K
