@@ -59,6 +59,8 @@
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
 #   USE_RAPIDGZIP          1 = rapidgzip -P 8 for Split and Upload (default). 0 = zcat.
 #   MATERIALIZER_THREADS   Concurrent S3 RAD materializer workers (default: 32).
+#   EXECUTION_MODE         synchronous (default) or async-submit. The latter
+#                          exits after publishing all immediate shard triggers.
 #
 #   LOCAL_FASTQ_DIR        Optional: directory of already-extracted .fastq.gz
 #                          files on the instance. rapidgzip reads these directly.
@@ -295,6 +297,11 @@ LAMBDA_MEMORY_MB="${LAMBDA_MEMORY_MB:-10240}"
 LAMBDA_EPHEMERAL_MB="${LAMBDA_EPHEMERAL_MB:-10240}"
 LAMBDA_TIMEOUT_SEC="${LAMBDA_TIMEOUT_SEC:-900}"
 LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
+S3_CLAIM_PREFIX="${S3_CLAIM_PREFIX:-piscem_claims}"
+S3_CLAIM_PREFIX="${S3_CLAIM_PREFIX#/}"
+S3_CLAIM_PREFIX="${S3_CLAIM_PREFIX%/}"
+CLAIM_LEASE_SECONDS="${CLAIM_LEASE_SECONDS:-180}"
+CLAIM_HEARTBEAT_SECONDS="${CLAIM_HEARTBEAT_SECONDS:-30}"
 
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
@@ -320,6 +327,7 @@ PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
 POST_UPLOAD_PROPAGATION_WAIT_SECONDS="${POST_UPLOAD_PROPAGATION_WAIT_SECONDS:-0}"
 USE_RAPIDGZIP="${USE_RAPIDGZIP:-1}"
+EXECUTION_MODE="${EXECUTION_MODE:-synchronous}"
 
 # Derived values (will be set later)
 RUN_MODE=0
@@ -663,7 +671,6 @@ create_lambda_execution_role() {
     local policies=(
         "arn:aws:iam::aws:policy/AmazonS3FullAccess"
         "arn:aws:iam::aws:policy/service-role/AmazonS3ObjectLambdaExecutionRolePolicy"
-        "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
     )
 
     local max_retries=5
@@ -692,7 +699,19 @@ create_lambda_function_from_image() {
         --arg out "$OUTPUT_MAP_BUCKET" \
         --arg inp "$INPUT_FASTQ_BUCKET" \
         --arg txt "$INPUT_TXT_BUCKET" \
-        '{Variables:{S3_OUTPUT_BUCKET_NAME:$out,S3_INPUT_BUCKET_NAME:$inp,S3_INPUT_TXT_BUCKET_NAME:$txt}}')
+        --arg mem "$mem" \
+        --arg claims "$S3_CLAIM_PREFIX" \
+        --arg lease "$CLAIM_LEASE_SECONDS" \
+        --arg heartbeat "$CLAIM_HEARTBEAT_SECONDS" \
+        '{Variables:{
+            S3_OUTPUT_BUCKET_NAME:$out,
+            S3_INPUT_BUCKET_NAME:$inp,
+            S3_INPUT_TXT_BUCKET_NAME:$txt,
+            LAMBDA_MEMORY_MB:$mem,
+            S3_CLAIM_PREFIX:$claims,
+            CLAIM_LEASE_SECONDS:$lease,
+            CLAIM_HEARTBEAT_SECONDS:$heartbeat
+        }}')
 
     # Check if function already exists
     local existing_arn
@@ -1146,6 +1165,10 @@ process_fastq_bash() {
     log_info "Total input folders: $input_count"
     [[ $input_count -gt 0 ]] || die "No input folders created. Check FASTQ files in $INPUT_FASTQ_BUCKET"
 
+    if [[ "$EXECUTION_MODE" == "async-submit" ]]; then
+        log_info "All shard manifests published; returning without waiting for Lambda (EXECUTION_MODE=async-submit)."
+        return 0
+    fi
 
     # EventBridge propagation was already awaited before splitting. Poll
     # immediately so Lambda execution remains overlapped with shard uploads.
@@ -1349,6 +1372,9 @@ ssm_run_pipeline() {
         --arg mem "$LAMBDA_MEMORY_MB" \
         --arg eph "$LAMBDA_EPHEMERAL_MB" \
         --arg timeout "$LAMBDA_TIMEOUT_SEC" \
+        --arg claim_prefix "$S3_CLAIM_PREFIX" \
+        --arg claim_lease "$CLAIM_LEASE_SECONDS" \
+        --arg claim_heartbeat "$CLAIM_HEARTBEAT_SECONDS" \
         --arg threads "$THREADS" \
         --arg allow_cleanup "$ALLOW_DESTRUCTIVE_CLEANUP" \
         --arg allow_s3_delete "$ALLOW_S3_DELETE" \
@@ -1363,6 +1389,7 @@ ssm_run_pipeline() {
         --arg run_qc "$RUN_QC" \
         --arg split_lines "$SPLIT_LINES" \
         --arg use_rapidgzip "${USE_RAPIDGZIP:-1}" \
+        --arg execution_mode "$EXECUTION_MODE" \
         --arg concurrency "${LAMBDA_CONCURRENCY:-0}" \
         --arg ko_cache "${KO_FASTQ_CACHE_BUCKET:-}" \
         --arg user "$SSH_USER" \
@@ -1375,6 +1402,9 @@ ssm_run_pipeline() {
             ("export LAMBDA_EPHEMERAL_MB=" + $eph),
             ("export LAMBDA_TIMEOUT_SEC=" + $timeout),
             ("export LAMBDA_CONCURRENCY=" + $concurrency),
+            ("export S3_CLAIM_PREFIX=" + $claim_prefix),
+            ("export CLAIM_LEASE_SECONDS=" + $claim_lease),
+            ("export CLAIM_HEARTBEAT_SECONDS=" + $claim_heartbeat),
             ("export THREADS=" + $threads),
             ("export ALLOW_DESTRUCTIVE_CLEANUP=" + $allow_cleanup),
             ("export ALLOW_S3_DELETE=" + $allow_s3_delete),
@@ -1389,6 +1419,7 @@ ssm_run_pipeline() {
             ("export RUN_QC=" + $run_qc),
             ("export SPLIT_LINES=" + $split_lines),
             ("export USE_RAPIDGZIP=" + $use_rapidgzip),
+            ("export EXECUTION_MODE=" + $execution_mode),
             ("export KO_FASTQ_CACHE_BUCKET=" + $ko_cache),
             ("cd /home/" + $user + "/scrna-repo"),
             ("bash scripts/e2e_serverless_pbmc.sh " + $ds + " --run 2>&1 | tee /tmp/pipeline-" + $run_id + ".log")
@@ -1491,6 +1522,14 @@ DATASET="$1"
 if [[ "$DATASET" != "pbmc1k" && "$DATASET" != "pbmc10k" && "$DATASET" != "ko" ]]; then
     die "Unknown dataset: $DATASET (must be pbmc1k, pbmc10k, or ko)"
 fi
+if [[ "$EXECUTION_MODE" != "synchronous" && "$EXECUTION_MODE" != "async-submit" ]]; then
+    die "Unknown EXECUTION_MODE: $EXECUTION_MODE (must be synchronous or async-submit)"
+fi
+[[ -n "$S3_CLAIM_PREFIX" ]] || die "S3_CLAIM_PREFIX cannot be empty"
+[[ "$CLAIM_LEASE_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "CLAIM_LEASE_SECONDS must be positive"
+[[ "$CLAIM_HEARTBEAT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "CLAIM_HEARTBEAT_SECONDS must be positive"
+(( CLAIM_HEARTBEAT_SECONDS < CLAIM_LEASE_SECONDS )) || \
+    die "CLAIM_HEARTBEAT_SECONDS must be less than CLAIM_LEASE_SECONDS"
 if [[ "$DATASET" == "ko" ]]; then
     # Combined 86-line matrix is not useful for the paper QC plots, and the
     # results tarball would be ~200 GB. Table 1 only needs timings.csv.
@@ -2379,6 +2418,9 @@ export LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 export LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 export LAMBDA_CONCURRENCY=$LAMBDA_CONCURRENCY
+export S3_CLAIM_PREFIX=$S3_CLAIM_PREFIX
+export CLAIM_LEASE_SECONDS=$CLAIM_LEASE_SECONDS
+export CLAIM_HEARTBEAT_SECONDS=$CLAIM_HEARTBEAT_SECONDS
 export THREADS=$THREADS
 export ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP
 export ALLOW_S3_DELETE=$ALLOW_S3_DELETE
@@ -2393,6 +2435,7 @@ export RUN_ID=$RUN_ID
 export RUN_QC=$RUN_QC
 export SPLIT_LINES=$SPLIT_LINES
 export USE_RAPIDGZIP=${USE_RAPIDGZIP:-1}
+export EXECUTION_MODE=$EXECUTION_MODE
 export KO_FASTQ_CACHE_BUCKET=${KO_FASTQ_CACHE_BUCKET:-}
 
 cd /home/${SSH_USER}/scrna-repo
@@ -3101,6 +3144,36 @@ EXPECTED_RAD_FOLDERS="$RUN_DIR/expected_rad_folders.txt"
 
 process_fastq_bash "$OUTPUT_DIR" "$EXPECTED_RAD_FOLDERS"
 
+if [[ "$EXECUTION_MODE" == "async-submit" ]]; then
+    ASYNC_STATE_FILE="$RUN_DIR/async_state.env"
+    ASYNC_SUBMITTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat > "$ASYNC_STATE_FILE" <<EOF
+RUN_ID=$RUN_ID
+DATASET=$DATASET
+AWS_REGION=$AWS_REGION
+INPUT_FASTQ_BUCKET=$INPUT_FASTQ_BUCKET
+INPUT_TXT_BUCKET=$INPUT_TXT_BUCKET
+OUTPUT_MAP_BUCKET=$OUTPUT_MAP_BUCKET
+OUTPUT_QUANT_BUCKET=$OUTPUT_QUANT_BUCKET
+LAMBDA_FUNCTION=$LAMBDA_FUNCTION_NAME
+S3_CLAIM_PREFIX=$S3_CLAIM_PREFIX
+EXPECTED_FOLDERS_FILE=$EXPECTED_RAD_FOLDERS
+NOT_BEFORE=$(<"${EXPECTED_RAD_FOLDERS}.not-before")
+SUBMITTED_AT=$ASYNC_SUBMITTED_AT
+EOF
+    aws s3 cp "$ASYNC_STATE_FILE" \
+        "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/async_state.env" \
+        --region "$AWS_REGION" --only-show-errors
+    aws s3 cp "$EXPECTED_RAD_FOLDERS" \
+        "s3://$OUTPUT_QUANT_BUCKET/$RUN_ID/expected_rad_folders.txt" \
+        --region "$AWS_REGION" --only-show-errors
+    log_info "Async submission complete. State: $ASYNC_STATE_FILE"
+    log_info "Check progress: bash scripts/async_lambda_control.sh --state $ASYNC_STATE_FILE status"
+    log_info "Wait only:      bash scripts/async_lambda_control.sh --state $ASYNC_STATE_FILE wait"
+    log_info "Materialize:    bash scripts/async_lambda_control.sh --state $ASYNC_STATE_FILE materialize --output $RUN_DIR/combined/map.rad"
+    exit 0
+fi
+
 log_info "Step 7 complete"
 
 log_info "Lambda processing complete; non-RAD outputs downloaded to $OUTPUT_DIR"
@@ -3270,6 +3343,9 @@ LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 LAMBDA_CONCURRENCY=${LAMBDA_CONCURRENCY:-unrestricted}
+S3_CLAIM_PREFIX=$S3_CLAIM_PREFIX
+CLAIM_LEASE_SECONDS=$CLAIM_LEASE_SECONDS
+CLAIM_HEARTBEAT_SECONDS=$CLAIM_HEARTBEAT_SECONDS
 ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP
 ALLOW_S3_DELETE=$ALLOW_S3_DELETE
 CLEANUP_AWS=$CLEANUP_AWS

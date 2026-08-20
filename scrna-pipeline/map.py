@@ -3,9 +3,12 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from s3transfer import S3Transfer
+from datetime import datetime, timezone
+from boto3.s3.transfer import S3Transfer
+from botocore.exceptions import ClientError
 from urllib.parse import urlparse
 
 # AWS S3 buckets
@@ -14,11 +17,306 @@ S3_OUTPUT_BUCKET_NAME = os.getenv("S3_OUTPUT_BUCKET_NAME","")
 S3_INPUT_BUCKET_NAME = os.getenv("S3_INPUT_BUCKET_NAME", "")
 EXPECTED_INPUT_FILES_BUCKET = os.getenv("S3_INPUT_TXT_BUCKET_NAME", "")
 S3_PREFIX = "piscem_output"
+S3_CLAIM_PREFIX = os.getenv("S3_CLAIM_PREFIX", "piscem_claims").strip("/")
+CLAIM_LEASE_SECONDS = int(os.getenv("CLAIM_LEASE_SECONDS", "180"))
+CLAIM_HEARTBEAT_SECONDS = int(os.getenv("CLAIM_HEARTBEAT_SECONDS", "30"))
 
 print(f"S3_OUTPUT_BUCKET_NAME : {S3_OUTPUT_BUCKET_NAME}")
 print(f"S3_INPUT_BUCKET_NAME : {S3_INPUT_BUCKET_NAME}")
 print(f"EXPECTED_INPUT_FILES_BUCKET : {EXPECTED_INPUT_FILES_BUCKET}")
 s3_client = boto3.client('s3')
+
+
+class ClaimBusyError(RuntimeError):
+    """A different invocation currently owns this manifest."""
+
+
+class ClaimLostError(RuntimeError):
+    """This invocation no longer owns its conditional S3 claim."""
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def is_s3_error(error, *codes):
+    if not isinstance(error, ClientError):
+        return False
+    response = error.response or {}
+    code = str(response.get("Error", {}).get("Code", ""))
+    status = str(response.get("ResponseMetadata", {}).get("HTTPStatusCode", ""))
+    return code in codes or status in codes
+
+
+def completion_marker_key(output_folder):
+    return f"{S3_PREFIX}/{output_folder}/output.txt"
+
+
+def completion_marker_exists(output_folder):
+    try:
+        s3_client.head_object(
+            Bucket=S3_OUTPUT_BUCKET_NAME,
+            Key=completion_marker_key(output_folder),
+        )
+        return True
+    except ClientError as error:
+        if is_s3_error(error, "404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def claim_object_key(output_folder):
+    return f"{S3_CLAIM_PREFIX}/{output_folder}.json"
+
+
+def claim_document(owner, output_folder, input_file_key, state, now_epoch, **extra):
+    document = {
+        "version": 1,
+        "owner": owner,
+        "output_folder": output_folder,
+        "input_file_key": input_file_key,
+        "state": state,
+        "updated_at": utc_now_iso(),
+        "lease_expires_epoch": now_epoch + CLAIM_LEASE_SECONDS,
+    }
+    document.update(extra)
+    return document
+
+
+def put_claim_document(key, document, **conditions):
+    response = s3_client.put_object(
+        Bucket=S3_OUTPUT_BUCKET_NAME,
+        Key=key,
+        Body=json.dumps(document, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+        **conditions,
+    )
+    etag = response.get("ETag")
+    if not etag:
+        etag = s3_client.head_object(
+            Bucket=S3_OUTPUT_BUCKET_NAME,
+            Key=key,
+        )["ETag"]
+    return etag
+
+
+def read_claim_document(key):
+    response = s3_client.get_object(Bucket=S3_OUTPUT_BUCKET_NAME, Key=key)
+    body = response["Body"]
+    try:
+        document = json.loads(body.read().decode("utf-8"))
+    finally:
+        body.close()
+    return document, response["ETag"], response.get("LastModified")
+
+
+def acquire_processing_claim(output_folder, input_file_key, context):
+    """Atomically acquire or take over an expired per-manifest S3 lease."""
+    if completion_marker_exists(output_folder):
+        print(f"CLAIM already_complete folder={output_folder}", flush=True)
+        return {"status": "already_complete"}
+
+    owner = getattr(context, "aws_request_id", None) or "unknown-request"
+    key = claim_object_key(output_folder)
+    now_epoch = int(time.time())
+    document = claim_document(
+        owner,
+        output_folder,
+        input_file_key,
+        "processing",
+        now_epoch,
+        acquired_at=utc_now_iso(),
+    )
+    try:
+        etag = put_claim_document(key, document, IfNoneMatch="*")
+        print(f"CLAIM acquired key={key} owner={owner} etag={etag}", flush=True)
+    except ClientError as error:
+        if not is_s3_error(error, "409", "412", "ConditionalRequestConflict", "PreconditionFailed"):
+            raise
+        if completion_marker_exists(output_folder):
+            print(f"CLAIM duplicate_complete folder={output_folder}", flush=True)
+            return {"status": "already_complete"}
+
+        existing, existing_etag, last_modified = read_claim_document(key)
+        expires_epoch = int(existing.get("lease_expires_epoch", 0) or 0)
+        if not expires_epoch and last_modified is not None:
+            expires_epoch = int(last_modified.timestamp()) + CLAIM_LEASE_SECONDS
+        if now_epoch < expires_epoch:
+            existing_owner = existing.get("owner", "unknown")
+            remaining = expires_epoch - now_epoch
+            print(
+                f"CLAIM busy key={key} owner={existing_owner} "
+                f"lease_remaining_seconds={remaining}",
+                flush=True,
+            )
+            raise ClaimBusyError(
+                f"Manifest {input_file_key} is owned by {existing_owner} "
+                f"for another {remaining}s"
+            )
+
+        document["takeover_of"] = existing.get("owner")
+        document["takeover_at"] = utc_now_iso()
+        try:
+            etag = put_claim_document(key, document, IfMatch=existing_etag)
+        except ClientError as takeover_error:
+            if is_s3_error(
+                takeover_error,
+                "409",
+                "412",
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            ):
+                raise ClaimBusyError(
+                    f"Another invocation took over {input_file_key}"
+                ) from takeover_error
+            raise
+        print(
+            f"CLAIM takeover key={key} owner={owner} previous={document.get('takeover_of')} "
+            f"etag={etag}",
+            flush=True,
+        )
+
+    claim = {
+        "status": "acquired",
+        "key": key,
+        "owner": owner,
+        "etag": etag,
+        "document": document,
+        "mutex": threading.Lock(),
+        "stop": threading.Event(),
+        "lost": threading.Event(),
+        "heartbeat": None,
+    }
+    return claim
+
+
+def refresh_processing_claim(claim):
+    with claim["mutex"]:
+        if claim["lost"].is_set():
+            raise ClaimLostError(f"S3 claim lost: {claim['key']}")
+        document = dict(claim["document"])
+        now_epoch = int(time.time())
+        document["updated_at"] = utc_now_iso()
+        document["lease_expires_epoch"] = now_epoch + CLAIM_LEASE_SECONDS
+        try:
+            etag = put_claim_document(
+                claim["key"], document, IfMatch=claim["etag"]
+            )
+        except ClientError as error:
+            if is_s3_error(
+                error,
+                "409",
+                "412",
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            ):
+                claim["lost"].set()
+                raise ClaimLostError(f"S3 claim lost: {claim['key']}") from error
+            raise
+        claim["etag"] = etag
+        claim["document"] = document
+
+
+def start_claim_heartbeat(claim):
+    def heartbeat():
+        while not claim["stop"].wait(CLAIM_HEARTBEAT_SECONDS):
+            try:
+                refresh_processing_claim(claim)
+                print(
+                    f"CLAIM heartbeat key={claim['key']} owner={claim['owner']}",
+                    flush=True,
+                )
+            except ClaimLostError as error:
+                print(f"CLAIM heartbeat_lost error={error}", flush=True)
+                return
+            except Exception as error:
+                # A transient heartbeat failure is not proof of lost ownership.
+                # The synchronous refresh before upload is authoritative.
+                print(
+                    f"CLAIM heartbeat_warning type={type(error).__name__} error={error}",
+                    flush=True,
+                )
+
+    thread = threading.Thread(
+        target=heartbeat,
+        name="s3-claim-heartbeat",
+        daemon=True,
+    )
+    claim["heartbeat"] = thread
+    thread.start()
+
+
+def stop_claim_heartbeat(claim):
+    if not claim or claim.get("status") != "acquired":
+        return
+    claim["stop"].set()
+    thread = claim.get("heartbeat")
+    if thread is not None:
+        thread.join(timeout=max(1, CLAIM_HEARTBEAT_SECONDS + 1))
+
+
+def mark_claim_completed(claim, timings):
+    stop_claim_heartbeat(claim)
+    with claim["mutex"]:
+        document = dict(claim["document"])
+        document.update(
+            state="completed",
+            completed_at=utc_now_iso(),
+            timings=timings,
+        )
+        document.pop("lease_expires_epoch", None)
+        try:
+            etag = put_claim_document(
+                claim["key"], document, IfMatch=claim["etag"]
+            )
+        except ClientError as error:
+            if is_s3_error(
+                error,
+                "409",
+                "412",
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            ):
+                claim["lost"].set()
+                raise ClaimLostError(f"S3 claim lost: {claim['key']}") from error
+            raise
+        claim["etag"] = etag
+        claim["document"] = document
+        print(
+            f"CLAIM completed key={claim['key']} owner={claim['owner']} etag={etag}",
+            flush=True,
+        )
+
+
+def release_failed_claim(claim):
+    stop_claim_heartbeat(claim)
+    with claim["mutex"]:
+        try:
+            s3_client.delete_object(
+                Bucket=S3_OUTPUT_BUCKET_NAME,
+                Key=claim["key"],
+                IfMatch=claim["etag"],
+            )
+            print(
+                f"CLAIM released_after_failure key={claim['key']} owner={claim['owner']}",
+                flush=True,
+            )
+        except ClientError as error:
+            if not is_s3_error(
+                error,
+                "404",
+                "409",
+                "412",
+                "NoSuchKey",
+                "NotFound",
+                "ConditionalRequestConflict",
+                "PreconditionFailed",
+            ):
+                raise
+            print(
+                f"CLAIM release_skipped key={claim['key']} owner={claim['owner']}",
+                flush=True,
+            )
 
 def read_input_manifest(bucket, input_file_key):
     """Read and validate the S3 URI manifest without materializing it in /tmp."""
@@ -373,8 +671,18 @@ def handler(event, context):
     print("Processing File:", input_file_key)
     print("Extracted Folder Name:", final_folder_name)
 
+    claim = None
     total_started = time.perf_counter()
     try:
+        claim = acquire_processing_claim(final_folder_name, input_file_key, context)
+        if claim["status"] == "already_complete":
+            return {
+                'statusCode': 200,
+                'body': 'Piscem output already complete; duplicate event ignored',
+                'idempotent': True,
+            }
+        start_claim_heartbeat(claim)
+
         manifest_started = time.perf_counter()
         s3_uris = read_input_manifest(bucket, input_file_key)
         manifest_seconds = time.perf_counter() - manifest_started
@@ -389,6 +697,9 @@ def handler(event, context):
 
         piscem_result = run_piscem_streaming(files_r1, files_r2)
 
+        # Prove ownership immediately before publishing output. A stale owner
+        # must not race a takeover and write the same deterministic prefix.
+        refresh_processing_claim(claim)
         upload_started = time.perf_counter()
         print(f"uploading output files to folder {final_folder_name}")
         upload_files_with_completion_marker(
@@ -408,17 +719,39 @@ def handler(event, context):
             "map_rad_bytes": piscem_result["map_rad_bytes"],
         }
         print("PIPELINE_TIMING " + json.dumps(timings, sort_keys=True), flush=True)
+        try:
+            mark_claim_completed(claim, timings)
+        except Exception as claim_error:
+            # output.txt is the durable completion contract. A claim-audit
+            # update must not turn a successfully published shard into a retry.
+            print(
+                f"CLAIM completion_warning type={type(claim_error).__name__} "
+                f"error={claim_error}",
+                flush=True,
+            )
         return {
             'statusCode': 200,
             'body': 'Piscem map is successful',
             'timings': timings,
         }
     except Exception as error:
+        if claim and claim.get("status") == "acquired":
+            try:
+                if not completion_marker_exists(final_folder_name):
+                    release_failed_claim(claim)
+            except Exception as release_error:
+                print(
+                    f"CLAIM release_warning type={type(release_error).__name__} "
+                    f"error={release_error}",
+                    flush=True,
+                )
         print(f"Mapper failed: {type(error).__name__}: {error}", flush=True)
         # An asynchronous Lambda invocation treats a returned HTTP-style 500
         # dictionary as success. Re-raise so Lambda records a failed invocation
         # and applies the configured retry/dead-letter behavior.
         raise
+    finally:
+        stop_claim_heartbeat(claim)
 
 
 # **Testing the Function with an EventBridge Event Format**
