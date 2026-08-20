@@ -30,3 +30,6 @@ Everything (tools, reference data, FASTQs) is downloaded automatically from publ
 | [On-Server Pipeline Guide](docs/ONSERVER_GUIDE.md) | Run the on-server pipeline on any Linux machine — no credentials needed, everything downloaded automatically |
 | [Serverless Pipeline Guide](docs/SERVERLESS_GUIDE.md) | Step-by-step instructions to run the serverless pipeline on your own AWS account (requires AWS, **us-east-2** region) |
 | [Reproducibility Notes](docs/REPRODUCIBILITY_NOTES.md) | Automatic fallbacks for AWS account limits, configuration reference, and local disk requirements |
+| [Direct S3 RAD Materializer](docs/S3_RAD_MATERIALIZER.md) | Ranged-download implementation and PBMC 1K benchmark |
+| [Piscem Single-Shard NVMe Profile](docs/PISCEM_SHARD_PROFILE.md) | Six-thread PBMC shard timings for index loading, mapping, and RAD output |
+| [Cloud Piscem Profiling Handoff](docs/CLOUD_PISCEM_PROFILE_HANDOFF.md) | Reproduce and diagnose one PBMC 1K shard on cloud NVMe |
