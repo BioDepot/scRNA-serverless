@@ -5,6 +5,9 @@ part of one Lambda shard's mapping time. It uses one of the 17 PBMC 1K shards,
 the same Piscem release and reference as the pipeline, six mapper threads, and
 local files on `/storage`.
 
+For the cloud continuation, use the standalone
+[cloud-agent handoff](CLOUD_PISCEM_PROFILE_HANDOFF.md).
+
 ## Result
 
 Index loading was not a bottleneck on this host. The primary, untraced run
