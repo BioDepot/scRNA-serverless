@@ -211,6 +211,9 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | Terminate EC2 after run. `0` to keep. |
 | `DOWNLOAD_RESULTS` | `1` | Download results locally. `0` to skip. |
 | `MATERIALIZER_THREADS` | `32` | Concurrent ranged-S3 workers used to build the final `map.rad`. |
+| `EXECUTION_MODE` | `synchronous` | Use `async-submit` to return after publishing all immediate shard triggers. |
+| `CLAIM_LEASE_SECONDS` | `180` | S3 processing-claim lease; renewed while a Lambda is healthy. |
+| `CLAIM_HEARTBEAT_SECONDS` | `30` | Claim-renewal interval. |
 
 ---
 
@@ -262,6 +265,10 @@ bash scripts/synchronous_s3_rad_materialize.sh \
 Use the timestamp captured immediately before publishing the manifests for
 `--not-before` when a bucket can contain older output under the same keys.
 Neither the handoff script nor the S3 materializer deletes S3 data.
+
+For nonblocking submission, duplicate-delivery claims, recovery, and the
+separate status/materialization controller, see
+[Asynchronous Lambda execution runbook](ASYNC_LAMBDA_RUNBOOK.md).
 
 ---
 
