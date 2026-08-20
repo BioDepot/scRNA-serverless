@@ -190,7 +190,7 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 6. Downloads FASTQs. Split and Upload uses rapidgzip `-P 8` per stream and only as many lanes at once as fit on the box
 7. Lambda functions map each split in parallel (piscem)
 8. If mapping stops making progress for longer than the Lambda timeout plus 3 minutes, the script exits and lists the missing shards
-9. Downloads Lambda outputs, merges .rad files
+9. Downloads the non-RAD Lambda outputs and concurrently range-materializes the S3 `map.rad` shards into one local `combined/map.rad`
 10. Runs alevin-fry (generate-permit-list, collate, quant)
 11. Runs QC (optional), downloads results locally, cleans up
 
@@ -202,10 +202,15 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 |---|---|---|
 | `RUN_QC` | `1` | QC analysis (UMAP + violin). `0` to skip. |
 | `WRITE_H5AD` | `1` | Save `.h5ad` file. Needs `RUN_QC=1`. |
-| `CLEANUP_AWS` | `1` | Delete AWS infrastructure after run. `0` to keep. |
-| `CLEANUP_RESULTS` | `1` | Delete results S3 bucket after run. `0` to keep for manual download. |
+| `ALLOW_DESTRUCTIVE_CLEANUP` | `0` | Master cleanup gate. Must be `1` before any AWS cleanup can run. |
+| `ALLOW_S3_DELETE` | `0` | Additional gate required before any S3 object or bucket deletion. |
+| `CLEANUP_AWS` | `0` | Request AWS resource cleanup; also requires the master gate. |
+| `CLEANUP_RESULTS` | `0` | Request results-bucket cleanup; also requires both cleanup gates. |
+| `DELETE_CLOUDWATCH_LOGS` | `0` | Request Lambda log-group deletion; also requires the master gate. |
+| `SKIP_PREFLIGHT_CLEANUP` | `1` | Keep prior `scrna-*` Lambda/IAM/ECR resources during development. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | Terminate EC2 after run. `0` to keep. |
 | `DOWNLOAD_RESULTS` | `1` | Download results locally. `0` to skip. |
+| `MATERIALIZER_THREADS` | `32` | Concurrent ranged-S3 workers used to build the final `map.rad`. |
 
 ---
 
@@ -218,6 +223,9 @@ serverless_runs/
   <RUN_ID>.log                          <-- Pipeline log
   <RUN_ID>/
   ├── run.env                           <-- Run metadata
+  ├── timings.csv                       <-- End-to-end phase timings
+  ├── rad_materializer_timings.csv      <-- Wait/manifest/materializer timings
+  ├── split_timings/                    <-- Per-lane download/split/upload timings
   ├── combined/
   │   ├── map.rad                       <-- Merged mapping output
   │   └── unmapped_bc_count.bin
@@ -230,6 +238,30 @@ serverless_runs/
       ├── qc_violin.png
       └── pbmc_adata.h5ad               <-- If WRITE_H5AD=1
 ```
+
+The RAD handoff is synchronous, but Lambda launch overlaps split and upload.
+As soon as both mates of one shard are in S3, the uploader publishes that
+shard's `*_input.txt`; EventBridge may start its Lambda while later shards are
+still being produced. The driver records the exact Lambda folder names, waits
+until every folder contains both `map.rad` and the later `output.txt` completion
+marker, and then runs `s3-rad-materialize`. It does not infer completion by
+counting everything already present in the bucket, so retained objects from
+another run are not accepted as new results.
+
+The standalone handoff can also be run after publishing the input manifests:
+
+```bash
+bash scripts/synchronous_s3_rad_materialize.sh \
+  --output-bucket "$OUTPUT_MAP_BUCKET" \
+  --expected-folders expected_rad_folders.txt \
+  --output /mnt/nvme/run/combined/map.rad \
+  --not-before 2026-08-20T07:00:00Z \
+  --threads 32
+```
+
+Use the timestamp captured immediately before publishing the manifests for
+`--not-before` when a bucket can contain older output under the same keys.
+Neither the handoff script nor the S3 materializer deletes S3 data.
 
 ---
 
@@ -269,9 +301,13 @@ Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
 
 ## Cleanup
 
-**Auto-cleanup** (`CLEANUP_AWS=1`, default) deletes: EC2 instance, S3 buckets, Lambda, EventBridge rule, Lambda IAM role, ECR repo, and temp security group. With `CLEANUP_RESULTS=0`, the results S3 bucket is preserved for manual download.
+**Auto-cleanup is disabled during development.** Cleanup only runs when
+`ALLOW_DESTRUCTIVE_CLEANUP=1` and `CLEANUP_AWS=1`. S3 object or bucket
+deletion additionally requires `ALLOW_S3_DELETE=1`. With
+`CLEANUP_RESULTS=0`, the results S3 bucket is preserved.
 
-**On failure:** all AWS resources are always cleaned up regardless of `CLEANUP_AWS`, `CLEANUP_RESULTS`, or `TERMINATE_DRIVER_ON_EXIT` settings. Partial results have no value and leaving orphaned resources wastes money.
+**On failure:** the same master gate applies. With its default value of `0`,
+resources and CloudWatch logs are retained for diagnosis.
 
 **Not cleaned up:** your IAM role (reuse it), the seed AMI (shared resource), and `serverless_runs/` (your results).
 

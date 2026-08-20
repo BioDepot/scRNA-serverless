@@ -54,7 +54,7 @@ m5dn.8xlarge has two instance-store NVMe disks. The script stripes them as RAID 
 | Lambda ephemeral storage | 10,240 MB | 10,240 MB | *(unchanged)* |
 | Piscem threads | 6 | 6 | 2 (at 3,008 MB) |
 | PBMC 1K splitting | Not split (1 Lambda) | Not split (1 Lambda) | 17 parts (at 3,008 MB) |
-| Split threshold | 7 GB | 7 GB | 0 GB (at 3,008 MB — forces splitting) |
+| Split threshold | 7 GB | 2 GB | 0 GB (at 3,008 MB — forces splitting) |
 | Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads | *(unchanged)* |
 | EC2 driver instance | m6id.16xlarge | m5dn.8xlarge | Falls through smaller instances |
 | EBS root volume | 500 GB | 500 GB | *(unchanged)* |
@@ -111,8 +111,11 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLEANUP_AWS` | `1` | `1` = delete AWS infrastructure after run. `0` = keep everything. On failure, always cleans up. |
-| `CLEANUP_RESULTS` | `1` | `1` = delete results S3 bucket after run. `0` = keep for manual download. On failure, always cleans up. |
+| `ALLOW_DESTRUCTIVE_CLEANUP` | `0` | Master gate; no AWS cleanup runs unless this is explicitly `1`. |
+| `ALLOW_S3_DELETE` | `0` | Second gate required before S3 objects or buckets can be deleted. |
+| `CLEANUP_AWS` | `0` | Request AWS infrastructure cleanup; also requires the master gate. |
+| `CLEANUP_RESULTS` | `0` | Request results-bucket cleanup; also requires both cleanup gates. |
+| `DELETE_CLOUDWATCH_LOGS` | `0` | Request log-group deletion; also requires the master gate. |
 | `TERMINATE_DRIVER_ON_EXIT` | `1` | `1` = terminate EC2 when done. `0` = leave it running. |
 | `RUN_QC` | `1` | `1` = generate UMAP + violin plots. `0` = skip QC. |
 | `WRITE_H5AD` | `1` | `1` = save `.h5ad` AnnData file (requires `RUN_QC=1`). `0` = skip. |
@@ -153,8 +156,10 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 export CLEANUP_AWS=0 TERMINATE_DRIVER_ON_EXIT=0 RUN_QC=0 WRITE_H5AD=0
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 
-# Full run with QC + cleanup
-export CLEANUP_AWS=1 TERMINATE_DRIVER_ON_EXIT=1 RUN_QC=1 WRITE_H5AD=1
+# Full run with QC + explicitly authorized cleanup
+export ALLOW_DESTRUCTIVE_CLEANUP=1 ALLOW_S3_DELETE=1
+export CLEANUP_AWS=1 CLEANUP_RESULTS=1 TERMINATE_DRIVER_ON_EXIT=1
+export RUN_QC=1 WRITE_H5AD=1
 bash scripts/e2e_serverless_pbmc.sh pbmc1k
 
 # PBMC 10K

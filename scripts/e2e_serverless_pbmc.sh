@@ -47,13 +47,21 @@
 #   LAMBDA_TIMEOUT_SEC     Lambda timeout in seconds (default: 900)
 #   LAMBDA_CONCURRENCY     Max concurrent Lambda invocations (default: 1000, fallback: 500→100→10). Set 0 for unrestricted.
 #   THREADS                Number of CPU threads (default: nproc)
-#   CLEANUP_AWS            Clean up AWS infrastructure after pipeline (default: 1)
-#   CLEANUP_RESULTS        Delete results S3 bucket after pipeline (default: 1). Set 0 to keep for manual download.
+#   ALLOW_DESTRUCTIVE_CLEANUP Master cleanup gate (default: 0). No AWS cleanup
+#                          runs unless this and the specific cleanup flag are 1.
+#   ALLOW_S3_DELETE        Additional S3 deletion gate (default: 0).
+#   CLEANUP_AWS            Clean up AWS infrastructure after pipeline (default: 0).
+#   CLEANUP_RESULTS        Delete results S3 bucket after pipeline (default: 0).
+#   DELETE_CLOUDWATCH_LOGS Delete Lambda CloudWatch log groups (default: 0).
+#   SKIP_PREFLIGHT_CLEANUP Skip removal of stale scrna resources (default: 1).
 #   TERMINATE_DRIVER_ON_EXIT  Terminate EC2 instance on exit (default: 1)
 #   DOWNLOAD_TO_LOCAL      Download results from EC2 to local machine (default: 1). Alias for DOWNLOAD_RESULTS.
 #   RUN_QC                 Run QC analysis on outputs (default: 1). ONLY step requiring python.
 #   USE_RAPIDGZIP          1 = rapidgzip -P 8 for Split and Upload (default). 0 = zcat.
+#   MATERIALIZER_THREADS   Concurrent S3 RAD materializer workers (default: 32).
 #
+#   LOCAL_FASTQ_DIR        Optional: directory of already-extracted .fastq.gz
+#                          files on the instance. rapidgzip reads these directly.
 #   FASTQ_TAR_PATH         Optional: path to local FASTQ tar file on instance.
 #   FASTQ_TAR_URL          Optional: direct URL to FASTQ tar. Auto-set by DATASET if empty.
 #   WRITE_H5AD             Save h5ad output from QC (default: 1). Only matters if RUN_QC=1.
@@ -72,6 +80,28 @@
 
 set -euo pipefail
 
+# Development-run safety guard. The account contains expensive-to-rebuild S3
+# inputs (including the ENA-backed KO cache). Cleanup requires a master opt-in,
+# and S3 deletion requires a second opt-in. Keep blocked requests visible.
+s3_delete_disabled() {
+    if [[ "${ALLOW_DESTRUCTIVE_CLEANUP:-0}" != "1" || "${ALLOW_S3_DELETE:-0}" != "1" ]]; then
+        echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') S3 deletion gated: aws s3 $*" >&2
+        return 0
+    fi
+    aws s3 "$@"
+}
+
+delete_lambda_log_group() {
+    local function_name="$1"
+    local region="$2"
+    if [[ "${ALLOW_DESTRUCTIVE_CLEANUP:-0}" != "1" || "${DELETE_CLOUDWATCH_LOGS:-0}" != "1" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Keeping CloudWatch log group: /aws/lambda/$function_name" >&2
+        return 0
+    fi
+    aws logs delete-log-group --log-group-name "/aws/lambda/$function_name" \
+        --region "$region" 2>/dev/null || true
+}
+
 # Cleanup temp files on exit (safe under set -u)
 # Cleanup function — called automatically on EXIT/INT/TERM.
 # Ensures ALL AWS resources created by this script are cleaned up if the
@@ -84,6 +114,11 @@ cleanup_on_exit() {
     rm -f "${BASH_SOURCE[0]:+$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)}/scrna-repo-"*.tar.gz 2>/dev/null || true
 
     if [[ "${RUN_MODE:-0}" -ne 0 ]]; then return; fi
+
+    if [[ "${ALLOW_DESTRUCTIVE_CLEANUP:-0}" != "1" ]]; then
+        echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleanup blocked by ALLOW_DESTRUCTIVE_CLEANUP=0." >&2
+        return
+    fi
 
     # On failure: force full cleanup regardless of user settings
     local _force_cleanup=0
@@ -127,8 +162,8 @@ cleanup_on_exit() {
     # --- SSM transfer bucket (infrastructure, always clean up) ---
     if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleaning up SSM transfer bucket ${SSM_TRANSFER_BUCKET}..."
-        aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$_region" 2>/dev/null || true
-        aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$_region" 2>/dev/null || true
+        s3_delete_disabled rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$_region"
+        s3_delete_disabled rb "s3://${SSM_TRANSFER_BUCKET}" --region "$_region"
     fi
 
     # --- Lambda function ---
@@ -139,8 +174,7 @@ cleanup_on_exit() {
         echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting Lambda function ${LAMBDA_FUNCTION_NAME}..."
         aws lambda delete-function --function-name "$LAMBDA_FUNCTION_NAME" \
             --region "$_region" 2>/dev/null || true
-        aws logs delete-log-group --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
-            --region "$_region" 2>/dev/null || true
+        delete_lambda_log_group "$LAMBDA_FUNCTION_NAME" "$_region"
 
         # --- EventBridge rules targeting this Lambda ---
         if [[ -n "$_lambda_arn" && "$_lambda_arn" != "None" ]]; then
@@ -196,8 +230,8 @@ cleanup_on_exit() {
                 continue
             fi
             echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Deleting S3 bucket ${_bucket}..."
-            aws s3 rm "s3://$_bucket" --recursive --region "$_region" 2>/dev/null || true
-            aws s3 rb "s3://$_bucket" --region "$_region" 2>/dev/null || true
+            s3_delete_disabled rm "s3://$_bucket" --recursive --region "$_region"
+            s3_delete_disabled rb "s3://$_bucket" --region "$_region"
         fi
     done
 
@@ -212,7 +246,9 @@ cleanup_on_exit() {
 
     echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') Cleanup complete."
 }
-trap cleanup_on_exit EXIT INT TERM
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 ################################################################################
 # User Configuration (Edit Once)
@@ -262,14 +298,19 @@ LAMBDA_CONCURRENCY="${LAMBDA_CONCURRENCY:-1000}"
 
 # Execution Configuration
 THREADS="${THREADS:-$(nproc)}"
-CLEANUP_AWS="${CLEANUP_AWS:-1}"
-CLEANUP_RESULTS="${CLEANUP_RESULTS:-1}"
+ALLOW_DESTRUCTIVE_CLEANUP="${ALLOW_DESTRUCTIVE_CLEANUP:-0}"
+ALLOW_S3_DELETE="${ALLOW_S3_DELETE:-0}"
+CLEANUP_AWS="${CLEANUP_AWS:-0}"
+CLEANUP_RESULTS="${CLEANUP_RESULTS:-0}"
+DELETE_CLOUDWATCH_LOGS="${DELETE_CLOUDWATCH_LOGS:-0}"
+SKIP_PREFLIGHT_CLEANUP="${SKIP_PREFLIGHT_CLEANUP:-1}"
 TERMINATE_DRIVER_ON_EXIT="${TERMINATE_DRIVER_ON_EXIT:-1}"
 RUN_QC="${RUN_QC:-1}"
 DOWNLOAD_RESULTS="${DOWNLOAD_RESULTS:-${DOWNLOAD_TO_LOCAL:-1}}"  # DOWNLOAD_TO_LOCAL is accepted alias
 LOCAL_RESULTS_DIR="${LOCAL_RESULTS_DIR:-./serverless_runs}"
 
 # FASTQ Configuration
+LOCAL_FASTQ_DIR="${LOCAL_FASTQ_DIR:-}"
 FASTQ_TAR_PATH="${FASTQ_TAR_PATH:-}"
 FASTQ_TAR_URL="${FASTQ_TAR_URL:-}"
 WRITE_H5AD="${WRITE_H5AD:-1}"
@@ -277,6 +318,7 @@ RUN_ID="${RUN_ID:-}"
 SPLIT_LINES="${SPLIT_LINES:-}"
 PROCESS_FASTQ_TIMEOUT_SEC="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_SECONDS:-10}"
+POST_UPLOAD_PROPAGATION_WAIT_SECONDS="${POST_UPLOAD_PROPAGATION_WAIT_SECONDS:-0}"
 USE_RAPIDGZIP="${USE_RAPIDGZIP:-1}"
 
 # Derived values (will be set later)
@@ -915,22 +957,34 @@ phase_end() {
 
 process_fastq_bash() {
     local output_dir="$1"
+    local expected_folders_file="$2"
 
-
-    log_info "Finding FASTQ pairs in S3 bucket $INPUT_FASTQ_BUCKET ..."
 
     declare -A PF_R1_KEYS PF_R2_KEYS
-    local pair_info
-    pair_info=$(find_s3_fastq_pairs "$INPUT_FASTQ_BUCKET")
+    local local_fastq_mode=0
+    if [[ -n "${LOCAL_FASTQ_DIR:-}" && "$DATASET" != "ko" ]]; then
+        local_fastq_mode=1
+        log_info "Using compressed FASTQs directly from NVMe: $LOCAL_FASTQ_DIR"
+        local _local_i _local_base
+        for _local_i in "${!LANE_BASENAMES[@]}"; do
+            _local_base="${DATASET}/${LANE_BASENAMES[$_local_i]}"
+            PF_R1_KEYS["$_local_base"]="${LANE_R1_PATHS[$_local_i]}"
+            PF_R2_KEYS["$_local_base"]="${LANE_R2_PATHS[$_local_i]}"
+        done
+    else
+        log_info "Finding FASTQ pairs in S3 bucket $INPUT_FASTQ_BUCKET ..."
+        local pair_info
+        pair_info=$(find_s3_fastq_pairs "$INPUT_FASTQ_BUCKET")
 
-    while IFS=$'\t' read -r base read_type key; do
-        [[ -z "$base" ]] && continue
-        if [[ "$read_type" == "R1" ]]; then
-            PF_R1_KEYS["$base"]="$key"
-        else
-            PF_R2_KEYS["$base"]="$key"
-        fi
-    done <<< "$pair_info"
+        while IFS=$'\t' read -r base read_type key; do
+            [[ -z "$base" ]] && continue
+            if [[ "$read_type" == "R1" ]]; then
+                PF_R1_KEYS["$base"]="$key"
+            else
+                PF_R2_KEYS["$base"]="$key"
+            fi
+        done <<< "$pair_info"
+    fi
 
     local INPUT_FOLDERS=()
 
@@ -959,23 +1013,44 @@ process_fastq_bash() {
 
         # Check combined file size
         local r1_bytes r2_bytes combined_bytes split_threshold_bytes
-        r1_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r1_key" \
-            --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
-        r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
-            --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+        if (( local_fastq_mode == 1 )); then
+            r1_bytes=$(stat --format=%s "$r1_key")
+            r2_bytes=$(stat --format=%s "$r2_key")
+        else
+            r1_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r1_key" \
+                --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+            r2_bytes=$(aws s3api head-object --bucket "$INPUT_FASTQ_BUCKET" --key "$r2_key" \
+                --region "$AWS_REGION" --query 'ContentLength' --output text 2>/dev/null || echo 0)
+        fi
         combined_bytes=$(( r1_bytes + r2_bytes ))
         TOTAL_INPUT_BYTES=$(( ${TOTAL_INPUT_BYTES:-0} + combined_bytes ))
         # Force splitting when Lambda memory <= 3008 MB (threshold=0) to avoid OOM/timeouts
         if [[ $LAMBDA_MEMORY_MB -le 3008 ]]; then
             split_threshold_bytes=0
         else
-            split_threshold_bytes=$(( 7 * 1024 * 1024 * 1024 ))
+            split_threshold_bytes=$(( 2 * 1024 * 1024 * 1024 ))
         fi
         log_info "Pair $lane_id: combined size $(( combined_bytes / 1048576 )) MB (split threshold: $(( split_threshold_bytes / 1048576 )) MB)"
 
         if [[ $split_threshold_bytes -gt 0 && $combined_bytes -lt $split_threshold_bytes ]]; then
-            local r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_key}"
-            local r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_key}"
+            local r1_s3 r2_s3
+            if (( local_fastq_mode == 1 )); then
+                local r1_object="${base}_R1_001.fastq.gz"
+                local r2_object="${base}_R2_001.fastq.gz"
+                aws s3 cp "$r1_key" "s3://${INPUT_FASTQ_BUCKET}/${r1_object}" \
+                    --region "$AWS_REGION" --only-show-errors &
+                local r1_upload_pid=$!
+                aws s3 cp "$r2_key" "s3://${INPUT_FASTQ_BUCKET}/${r2_object}" \
+                    --region "$AWS_REGION" --only-show-errors &
+                local r2_upload_pid=$!
+                wait "$r1_upload_pid" || die "R1 upload failed for $lane_id"
+                wait "$r2_upload_pid" || die "R2 upload failed for $lane_id"
+                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_object}"
+                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_object}"
+            else
+                r1_s3="s3://${INPUT_FASTQ_BUCKET}/${r1_key}"
+                r2_s3="s3://${INPUT_FASTQ_BUCKET}/${r2_key}"
+            fi
             sleep 3
             create_and_upload_input_txt "$lane_id" "$r1_s3" "$r2_s3" "$base_folder"
             INPUT_FOLDERS+=("${lane_id}_p0")
@@ -1000,10 +1075,16 @@ process_fastq_bash() {
         local _max_lanes=$(( _cores / (DECOMP_THREADS * 2) ))
         (( _max_lanes < 1 )) && _max_lanes=1
 
-        log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (download gzip, then rapidgzip -P $DECOMP_THREADS per file)"
+        if (( local_fastq_mode == 1 )); then
+            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (NVMe gzip, rapidgzip -P $DECOMP_THREADS per file)"
+        else
+            log_info "Splitting ${#SPLIT_LANES[@]} lane pair(s), ${_max_lanes} at a time (download gzip, then rapidgzip -P $DECOMP_THREADS per file)"
+        fi
 
         local parts_dir="$RUN_DIR/split_parts"
         rm -rf "$parts_dir"; mkdir -p "$parts_dir"
+        local split_timings_dir="$RUN_DIR/split_timings"
+        mkdir -p "$split_timings_dir"
 
         local -a split_pids=()
         local i _rc=0
@@ -1013,10 +1094,19 @@ process_fastq_bash() {
                 split_pids=("${split_pids[@]:1}")
             done
             (
-                bash /home/ubuntu/scrna-repo/split_and_upload.sh \
-                    "$INPUT_FASTQ_BUCKET" "${SPLIT_R1[$i]}" "${SPLIT_R2[$i]}" \
-                    "${SPLIT_BASE[$i]}" "$INPUT_TXT_BUCKET" \
-                    > "$parts_dir/${SPLIT_LANES[$i]}.log" 2>&1
+                if (( local_fastq_mode == 1 )); then
+                    SPLIT_TIMINGS_FILE="$split_timings_dir/${SPLIT_LANES[$i]}.csv" \
+                    bash /home/ubuntu/scrna-repo/scripts/split_upload_trigger_local.sh \
+                        "$INPUT_FASTQ_BUCKET" "${SPLIT_R1[$i]}" "${SPLIT_R2[$i]}" \
+                        "${SPLIT_BASE[$i]}" "$INPUT_TXT_BUCKET" "$SPLIT_LINES" \
+                        > "$parts_dir/${SPLIT_LANES[$i]}.log" 2>&1
+                else
+                    SPLIT_TIMINGS_FILE="$split_timings_dir/${SPLIT_LANES[$i]}.csv" \
+                    bash /home/ubuntu/scrna-repo/split_and_upload.sh \
+                        "$INPUT_FASTQ_BUCKET" "${SPLIT_R1[$i]}" "${SPLIT_R2[$i]}" \
+                        "${SPLIT_BASE[$i]}" "$INPUT_TXT_BUCKET" \
+                        > "$parts_dir/${SPLIT_LANES[$i]}.log" 2>&1
+                fi
                 _split_rc=$?
                 tail -1 "$parts_dir/${SPLIT_LANES[$i]}.log" \
                     > "$parts_dir/${SPLIT_LANES[$i]}.parts"
@@ -1045,17 +1135,26 @@ process_fastq_bash() {
 
     local input_count=${#INPUT_FOLDERS[@]}
 
+    # Preserve the exact set expected from this submission.  Counting arbitrary
+    # objects in the output bucket is unsafe when deletion is disabled, and the
+    # direct S3 materializer needs these folders in numeric shard order.
+    printf '%s\n' "${INPUT_FOLDERS[@]}" | LC_ALL=C sort -V -u > "$expected_folders_file"
+    printf '%s\n' "$MAP_POLL_SINCE" > "${expected_folders_file}.not-before"
+
     phase_end
 
     log_info "Total input folders: $input_count"
     [[ $input_count -gt 0 ]] || die "No input folders created. Check FASTQ files in $INPUT_FASTQ_BUCKET"
 
 
-    # Wait 30s for EventBridge propagation (matches process_fastq.py behavior)
-    phase_begin "EventBridge propagation wait [on-server]" 3
-    log_info "Waiting 30s for EventBridge/Lambda warm-up..."
-    sleep 30
-    phase_end
+    # EventBridge propagation was already awaited before splitting. Poll
+    # immediately so Lambda execution remains overlapped with shard uploads.
+    if (( POST_UPLOAD_PROPAGATION_WAIT_SECONDS > 0 )); then
+        phase_begin "EventBridge propagation wait [on-server]" 3
+        log_info "Waiting ${POST_UPLOAD_PROPAGATION_WAIT_SECONDS}s before polling Lambda outputs..."
+        sleep "$POST_UPLOAD_PROPAGATION_WAIT_SECONDS"
+        phase_end
+    fi
 
     # Poll output bucket
     phase_begin "Piscem Map [serverless]" 4
@@ -1152,15 +1251,16 @@ process_fastq_bash() {
     local elapsed_sec=$(( $(date +%s) - poll_start ))
     log_info "All $input_count outputs ready ($((elapsed_sec / 60)) min $((elapsed_sec % 60)) sec)"
 
-    # Download outputs (single bulk sync)
-    phase_begin "Download Files [on-server]" 6
-    log_info "Downloading output files from $OUTPUT_MAP_BUCKET ..."
+    # Download only the non-RAD companion outputs. map.rad shards remain in S3
+    # and are ranged directly into the final combined file in Step 8.
+    phase_begin "Download non-RAD files [on-server]" 6
+    log_info "Downloading non-RAD output files from $OUTPUT_MAP_BUCKET ..."
     mkdir -p "${output_dir}/piscem_output"
     aws s3 sync "s3://${OUTPUT_MAP_BUCKET}/piscem_output/" "${output_dir}/piscem_output/" \
-        --region "$AWS_REGION" --only-show-errors
+        --region "$AWS_REGION" --exclude '*/map.rad' --only-show-errors
     phase_end
 
-    log_info "All output files downloaded to $output_dir"
+    log_info "All non-RAD output files downloaded to $output_dir"
 }
 
 ################################################################################
@@ -1250,8 +1350,12 @@ ssm_run_pipeline() {
         --arg eph "$LAMBDA_EPHEMERAL_MB" \
         --arg timeout "$LAMBDA_TIMEOUT_SEC" \
         --arg threads "$THREADS" \
+        --arg allow_cleanup "$ALLOW_DESTRUCTIVE_CLEANUP" \
+        --arg allow_s3_delete "$ALLOW_S3_DELETE" \
         --arg cleanup "$CLEANUP_AWS" \
         --arg cleanup_results "$CLEANUP_RESULTS" \
+        --arg delete_logs "$DELETE_CLOUDWATCH_LOGS" \
+        --arg skip_preflight "$SKIP_PREFLIGHT_CLEANUP" \
         --arg fastq_path "${FASTQ_TAR_PATH:-}" \
         --arg fastq_url "${FASTQ_TAR_URL:-}" \
         --arg write_h5ad "$WRITE_H5AD" \
@@ -1272,8 +1376,12 @@ ssm_run_pipeline() {
             ("export LAMBDA_TIMEOUT_SEC=" + $timeout),
             ("export LAMBDA_CONCURRENCY=" + $concurrency),
             ("export THREADS=" + $threads),
+            ("export ALLOW_DESTRUCTIVE_CLEANUP=" + $allow_cleanup),
+            ("export ALLOW_S3_DELETE=" + $allow_s3_delete),
             ("export CLEANUP_AWS=" + $cleanup),
             ("export CLEANUP_RESULTS=" + $cleanup_results),
+            ("export DELETE_CLOUDWATCH_LOGS=" + $delete_logs),
+            ("export SKIP_PREFLIGHT_CLEANUP=" + $skip_preflight),
             ("export FASTQ_TAR_PATH=" + $fastq_path),
             ("export FASTQ_TAR_URL=" + $fastq_url),
             ("export WRITE_H5AD=" + $write_h5ad),
@@ -2272,8 +2380,12 @@ export LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 export LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 export LAMBDA_CONCURRENCY=$LAMBDA_CONCURRENCY
 export THREADS=$THREADS
+export ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP
+export ALLOW_S3_DELETE=$ALLOW_S3_DELETE
 export CLEANUP_AWS=$CLEANUP_AWS
 export CLEANUP_RESULTS=$CLEANUP_RESULTS
+export DELETE_CLOUDWATCH_LOGS=$DELETE_CLOUDWATCH_LOGS
+export SKIP_PREFLIGHT_CLEANUP=$SKIP_PREFLIGHT_CLEANUP
 export FASTQ_TAR_PATH=$FASTQ_TAR_PATH
 export FASTQ_TAR_URL=$FASTQ_TAR_URL
 export WRITE_H5AD=$WRITE_H5AD
@@ -2345,13 +2457,14 @@ SSHEOF
         log_error "Pipeline exited with code $RUN_EXIT.  Cleanup will run via trap."
     fi
 
-    # Normal-path cleanup: revoke SG ingress, then terminate+delete.
-    # On failure the trap duplicates this (idempotent AWS calls are safe).
-    if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
-        manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
-    fi
-    
-    if [[ $TERMINATE_DRIVER_ON_EXIT -eq 1 ]]; then
+    # Normal-path cleanup: revoke SG ingress, then terminate+delete. During
+    # development the master gate keeps the whole driver environment intact.
+    if [[ "$ALLOW_DESTRUCTIVE_CLEANUP" != "1" ]]; then
+        log_info "Driver cleanup blocked by ALLOW_DESTRUCTIVE_CLEANUP=0; instance and temporary resources are preserved."
+    elif [[ $TERMINATE_DRIVER_ON_EXIT -eq 1 ]]; then
+        if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
+            manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
+        fi
         log_info "Terminating driver instance $DRIVER_INSTANCE_ID..."
         aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$DRIVER_INSTANCE_ID" >/dev/null 2>&1 || true
         
@@ -2365,14 +2478,17 @@ SSHEOF
         
         if [[ -n "${SSM_TRANSFER_BUCKET:-}" ]]; then
             log_info "Cleaning up SSM transfer bucket: $SSM_TRANSFER_BUCKET"
-            aws s3 rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION" 2>/dev/null || true
-            aws s3 rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION" 2>/dev/null || true
+            s3_delete_disabled rm "s3://${SSM_TRANSFER_BUCKET}" --recursive --region "$AWS_REGION"
+            s3_delete_disabled rb "s3://${SSM_TRANSFER_BUCKET}" --region "$AWS_REGION"
         fi
 
         # Clear DRIVER_INSTANCE_ID so the trap doesn't double-terminate
         DRIVER_INSTANCE_ID=""
         CREATED_SG_ID=""
     else
+        if [[ -n "${CALLER_IP_TO_REVOKE:-}" ]]; then
+            manage_sg_ingress revoke "$CALLER_IP_TO_REVOKE"
+        fi
         log_info "Driver instance $DRIVER_INSTANCE_ID left running (TERMINATE_DRIVER_ON_EXIT=0)"
         log_info "Note: Temporary SG ${CREATED_SG_ID:-} is still in use. Clean it up manually when done."
         # Prevent trap from terminating a kept-alive instance
@@ -2577,8 +2693,13 @@ log_info "Step 1: Preparing FASTQs..."
 # caption which states the times exclude fetching raw sequence data.
 phase_begin "Fetch raw FASTQs" ""
 
-FASTQ_DIR="$RUN_DIR/fastq"
-mkdir -p "$FASTQ_DIR"
+if [[ -n "$LOCAL_FASTQ_DIR" ]]; then
+    [[ -d "$LOCAL_FASTQ_DIR" ]] || die "LOCAL_FASTQ_DIR not found: $LOCAL_FASTQ_DIR"
+    FASTQ_DIR="$LOCAL_FASTQ_DIR"
+else
+    FASTQ_DIR="$RUN_DIR/fastq"
+    mkdir -p "$FASTQ_DIR"
+fi
 
 # Auto-set FASTQ_TAR_URL by dataset if not provided
 if [[ "$DATASET" != "ko" && -z "$FASTQ_TAR_PATH" && -z "$FASTQ_TAR_URL" ]]; then
@@ -2600,6 +2721,8 @@ fi
 # Obtain FASTQs
 if [[ "$DATASET" == "ko" ]]; then
     fetch_ko_fastqs
+elif [[ -n "$LOCAL_FASTQ_DIR" ]]; then
+    log_info "Reusing already-extracted FASTQs from NVMe: $LOCAL_FASTQ_DIR"
 elif [[ -n "$FASTQ_TAR_PATH" ]]; then
     log_info "Extracting FASTQ tar from: $FASTQ_TAR_PATH"
     # Detect format and extract accordingly
@@ -2683,7 +2806,7 @@ for _ob in "$OUTPUT_MAP_BUCKET" "$OUTPUT_QUANT_BUCKET"; do
     [[ "$_stale" == "None" || -z "$_stale" ]] && _stale=0
     if [[ "$_stale" != "0" ]]; then
         log_info "  $_ob: removing $_stale stale object(s) from a previous run"
-        aws s3 rm "s3://${_ob}/" --recursive --region "$AWS_REGION" --only-show-errors || true
+        s3_delete_disabled rm "s3://${_ob}/" --recursive --region "$AWS_REGION" --only-show-errors
     else
         log_info "  $_ob: already empty"
     fi
@@ -2707,6 +2830,8 @@ if [[ "$DATASET" == "ko" ]]; then
     log_info "Copying KO FASTQs from cache to run bucket (S3-to-S3)..."
     aws s3 sync "s3://$KO_FASTQ_CACHE_BUCKET/ko/" "s3://$INPUT_FASTQ_BUCKET/ko/" \
         --region "$AWS_REGION" --only-show-errors
+elif [[ -n "$LOCAL_FASTQ_DIR" ]]; then
+    log_info "Skipping compressed FASTQ upload; split workers will read NVMe inputs directly"
 else
     _upload_pids=()
     for _i in "${!LANE_BASENAMES[@]}"; do
@@ -2754,6 +2879,9 @@ log_info "Build context ready"
 #   Frees reserved concurrency and avoids resource conflicts.
 ################################################################################
 
+if [[ "$ALLOW_DESTRUCTIVE_CLEANUP" != "1" || "$SKIP_PREFLIGHT_CLEANUP" == "1" ]]; then
+    log_info "Pre-flight cleanup gated (ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP, SKIP_PREFLIGHT_CLEANUP=$SKIP_PREFLIGHT_CLEANUP)."
+else
 log_info "Pre-flight cleanup: checking for stale scrna resources from prior runs..."
 
 _stale_lambdas=$(aws lambda list-functions --region "$AWS_REGION" \
@@ -2770,8 +2898,7 @@ if [[ -n "$_stale_lambdas" && "$_stale_lambdas" != "None" ]]; then
             --region "$AWS_REGION" 2>/dev/null || true
         aws lambda delete-function --function-name "$_fn" \
             --region "$AWS_REGION" 2>/dev/null || true
-        aws logs delete-log-group --log-group-name "/aws/lambda/$_fn" \
-            --region "$AWS_REGION" 2>/dev/null || true
+        delete_lambda_log_group "$_fn" "$AWS_REGION"
 
         if [[ -n "$_fn_arn" && "$_fn_arn" != "None" ]]; then
             _stale_rules=$(aws events list-rule-names-by-target --target-arn "$_fn_arn" \
@@ -2835,12 +2962,13 @@ if [[ -n "$_stale_buckets" && "$_stale_buckets" != "None" ]]; then
             continue
         fi
         log_warn "Removing stale S3 bucket: $_sb"
-        aws s3 rm "s3://$_sb" --recursive --region "$AWS_REGION" 2>/dev/null || true
-        aws s3 rb "s3://$_sb" --region "$AWS_REGION" 2>/dev/null || true
+        s3_delete_disabled rm "s3://$_sb" --recursive --region "$AWS_REGION"
+        s3_delete_disabled rb "s3://$_sb" --region "$AWS_REGION"
     done
 fi
 
 log_info "Pre-flight cleanup complete."
+fi
 
 ################################################################################
 # Step 6: Setup Lambda and EventBridge (pure bash — no python)
@@ -2969,12 +3097,13 @@ log_info "Step 7: Processing FASTQs with Lambda (split, upload, wait, download).
 
 OUTPUT_DIR="$RUN_DIR/output"
 mkdir -p "$OUTPUT_DIR"
+EXPECTED_RAD_FOLDERS="$RUN_DIR/expected_rad_folders.txt"
 
-process_fastq_bash "$OUTPUT_DIR"
+process_fastq_bash "$OUTPUT_DIR" "$EXPECTED_RAD_FOLDERS"
 
 log_info "Step 7 complete"
 
-log_info "Lambda processing complete, outputs downloaded to $OUTPUT_DIR"
+log_info "Lambda processing complete; non-RAD outputs downloaded to $OUTPUT_DIR"
 
 ################################################################################
 # Step 8: Combine and Quantify
@@ -2988,13 +3117,28 @@ ulimit -n 2048
 bash /home/ubuntu/scrna-repo/install_scripts/install_alevin_fry.sh
 bash /home/ubuntu/scrna-repo/install_scripts/install_radtk.sh
 
+if ! command -v s3-rad-materialize >/dev/null 2>&1; then
+    _materializer_installer=/home/ubuntu/scrna-repo/install_scripts/install_s3_rad_materializer.sh
+    [[ -f "$_materializer_installer" ]] || \
+        die "s3-rad-materialize is not installed and installer is missing: $_materializer_installer"
+    bash "$_materializer_installer"
+fi
+
 log_info "Running combine scripts..."
 
 COMBINED_DIR="$RUN_DIR/combined"
 mkdir -p "$COMBINED_DIR"
 
-phase_begin "Combined .rad [on-server]" 7
-bash /home/ubuntu/scrna-repo/combine_map_rad.sh "$OUTPUT_DIR" "$COMBINED_DIR"
+phase_begin "Parallel S3 .rad materializer [on-server]" 7
+bash /home/ubuntu/scrna-repo/scripts/synchronous_s3_rad_materialize.sh \
+    --output-bucket "$OUTPUT_MAP_BUCKET" \
+    --expected-folders "$EXPECTED_RAD_FOLDERS" \
+    --output "$COMBINED_DIR/map.rad" \
+    --region "$AWS_REGION" \
+    --threads "${MATERIALIZER_THREADS:-32}" \
+    --timeout-seconds "$PROCESS_FASTQ_TIMEOUT_SEC" \
+    --not-before "$(<"${EXPECTED_RAD_FOLDERS}.not-before")" \
+    --timings-file "$RUN_DIR/rad_materializer_timings.csv"
 phase_end
 
 phase_begin "Concatenate unmapped_bc_count.bin [on-server]" 7
@@ -3126,6 +3270,12 @@ LAMBDA_MEMORY_MB=$LAMBDA_MEMORY_MB
 LAMBDA_EPHEMERAL_MB=$LAMBDA_EPHEMERAL_MB
 LAMBDA_TIMEOUT_SEC=$LAMBDA_TIMEOUT_SEC
 LAMBDA_CONCURRENCY=${LAMBDA_CONCURRENCY:-unrestricted}
+ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP
+ALLOW_S3_DELETE=$ALLOW_S3_DELETE
+CLEANUP_AWS=$CLEANUP_AWS
+CLEANUP_RESULTS=$CLEANUP_RESULTS
+DELETE_CLOUDWATCH_LOGS=$DELETE_CLOUDWATCH_LOGS
+SKIP_PREFLIGHT_CLEANUP=$SKIP_PREFLIGHT_CLEANUP
 RUN_DIR=$RUN_DIR
 BASENAME_WITH_LANE=$BASENAME_WITH_LANE
 PISCEM_VERSION=$PISCEM_VERSION
@@ -3169,7 +3319,7 @@ done
 
 log_info "Step 12: Cleanup..."
 
-if [[ $CLEANUP_AWS -eq 1 ]]; then
+if [[ $ALLOW_DESTRUCTIVE_CLEANUP -eq 1 && $CLEANUP_AWS -eq 1 ]]; then
     log_info "Cleaning up AWS resources..."
     
     # Get Lambda ARN before deleting (needed for EventBridge rule discovery)
@@ -3181,8 +3331,7 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
         --region "$AWS_REGION" 2>/dev/null || true
     
     # Delete Lambda CloudWatch log group
-    aws logs delete-log-group --log-group-name "/aws/lambda/$LAMBDA_FUNCTION_NAME" \
-        --region "$AWS_REGION" 2>/dev/null || true
+    delete_lambda_log_group "$LAMBDA_FUNCTION_NAME" "$AWS_REGION"
     
     # Delete EventBridge rules targeting this Lambda (discover rules dynamically)
     log_info "Discovering EventBridge rules targeting Lambda..."
@@ -3250,13 +3399,13 @@ if [[ $CLEANUP_AWS -eq 1 ]]; then
             continue
         fi
         log_info "Deleting bucket: $bucket"
-        aws s3 rm "s3://$bucket" --recursive --region "$AWS_REGION" 2>/dev/null || true
-        aws s3 rb "s3://$bucket" --region "$AWS_REGION" 2>/dev/null || true
+        s3_delete_disabled rm "s3://$bucket" --recursive --region "$AWS_REGION"
+        s3_delete_disabled rb "s3://$bucket" --region "$AWS_REGION"
     done
     
     log_info "AWS resources cleaned up"
 else
-    log_info "Skipping AWS cleanup (CLEANUP_AWS=0)"
+    log_info "Skipping AWS cleanup (ALLOW_DESTRUCTIVE_CLEANUP=$ALLOW_DESTRUCTIVE_CLEANUP, CLEANUP_AWS=$CLEANUP_AWS)"
 fi
 
 ################################################################################

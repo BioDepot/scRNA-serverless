@@ -1,10 +1,11 @@
-import subprocess
-import os
 import boto3
 import json
+import os
 import shutil
-from s3transfer import S3Transfer, TransferConfig
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+from s3transfer import S3Transfer
 from urllib.parse import urlparse
 
 # AWS S3 buckets
@@ -19,63 +20,156 @@ print(f"S3_INPUT_BUCKET_NAME : {S3_INPUT_BUCKET_NAME}")
 print(f"EXPECTED_INPUT_FILES_BUCKET : {EXPECTED_INPUT_FILES_BUCKET}")
 s3_client = boto3.client('s3')
 
-def download_files_from_input_txt(bucket, input_file_key, local_dir):
-    os.makedirs(local_dir, exist_ok=True)
-    transfer = S3Transfer(s3_client)
-    downloaded_files = []
+def read_input_manifest(bucket, input_file_key):
+    """Read and validate the S3 URI manifest without materializing it in /tmp."""
+    response = s3_client.get_object(Bucket=bucket, Key=input_file_key)
+    body = response["Body"]
+    try:
+        contents = body.read().decode("utf-8")
+    finally:
+        body.close()
 
-    # Download input.txt file
-    input_file_local_path = os.path.join(local_dir, "input.txt")
-    s3_client.download_file(bucket, input_file_key, input_file_local_path)
-
-    # Read input.txt to get list of S3 keys for files to download
-    with open(input_file_local_path, 'r') as f:
-        s3_keys = f.read().splitlines()
-
-    # Download each file listed in input.txt
-    # Function to download a single file
-    def download_file(s3_key, local_dir="/tmp"):
-        """
-        Downloads a file from S3 using only the S3 key (s3://bucket_name/object_key).
-        Skips the download if the file already exists.
-        """
-
-        print(f"📥 Input S3 key: {s3_key}")
-
-        # Parse S3 key to extract bucket and object key
-        parsed_url = urlparse(s3_key)
-        bucket_name = parsed_url.netloc  # Extracts the bucket name
-        object_key = parsed_url.path.lstrip("/")  # Extracts the object key
-        print(f"Bucket Name: {bucket_name}")
-        print(f"Object Key: {object_key}")
-
-        # Local path where the file will be downloaded
-        local_file_path = os.path.join(local_dir, os.path.basename(object_key))
-
-        # Skip if file already exists
-        if os.path.exists(local_file_path):
-            print(f"File {local_file_path} already exists, skipping download.")
-            return local_file_path
-
-        print(f"⬇️ Downloading {object_key} from {bucket_name} to {local_file_path}...")
-
-        # Perform S3 download
-        s3_client.download_file(bucket_name, object_key, local_file_path)
-
-        print(f"Completed downloading {os.path.basename(object_key)}.")
-        return local_file_path
-
-    with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(download_file, s3_key) for s3_key in s3_keys]
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                downloaded_files.append(result)
-
-    return downloaded_files
+    uris = [line.strip() for line in contents.splitlines() if line.strip()]
+    if not uris:
+        raise ValueError(f"Input manifest s3://{bucket}/{input_file_key} is empty")
+    return uris
 
 
-def run_piscem(files_r1, files_r2, input_folder):
+def parse_fastq_uri(uri):
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
+        raise ValueError(f"Invalid S3 FASTQ URI: {uri}")
+
+    object_key = parsed.path.lstrip("/")
+    lower_key = object_key.lower()
+    if lower_key.endswith((".fastq.gz", ".fq.gz")):
+        suffix = ".fastq.gz"
+        compression = "gzip"
+    elif lower_key.endswith((".fastq", ".fq")):
+        suffix = ".fastq"
+        compression = "none"
+    else:
+        raise ValueError(
+            f"Unsupported FASTQ suffix for {uri}; expected .fastq, .fq, "
+            ".fastq.gz, or .fq.gz"
+        )
+
+    basename = os.path.basename(object_key)
+    if "_R1_" in basename:
+        read = "R1"
+    elif "_R2_" in basename:
+        read = "R2"
+    else:
+        raise ValueError(f"Cannot classify FASTQ as R1 or R2: {uri}")
+
+    return {
+        "uri": uri,
+        "bucket": parsed.netloc,
+        "key": object_key,
+        "read": read,
+        "suffix": suffix,
+        "compression": compression,
+    }
+
+
+def create_fastq_fifos(s3_uris, stream_dir):
+    """Create format-preserving FIFO paths for a paired FASTQ manifest."""
+    os.makedirs(stream_dir, exist_ok=True)
+    specs = [parse_fastq_uri(uri) for uri in s3_uris]
+    files_r1 = sorted(
+        (spec for spec in specs if spec["read"] == "R1"),
+        key=lambda spec: spec["uri"],
+    )
+    files_r2 = sorted(
+        (spec for spec in specs if spec["read"] == "R2"),
+        key=lambda spec: spec["uri"],
+    )
+    if not files_r1 or not files_r2 or len(files_r1) != len(files_r2):
+        raise ValueError(
+            f"Expected equal non-zero R1/R2 inputs, got "
+            f"R1={len(files_r1)} R2={len(files_r2)}"
+        )
+
+    for read_specs in (files_r1, files_r2):
+        for index, spec in enumerate(read_specs):
+            fifo_path = os.path.join(
+                stream_dir,
+                f"{spec['read'].lower()}_{index:04d}{spec['suffix']}",
+            )
+            os.mkfifo(fifo_path, 0o600)
+            spec["fifo_path"] = fifo_path
+
+    return files_r1, files_r2
+
+
+def write_s3_object_to_fifo(spec):
+    """Copy one complete S3 object, in order, into a Piscem input FIFO."""
+    started = time.perf_counter()
+    response = None
+    body = None
+    bytes_written = 0
+    first_byte_seconds = None
+    try:
+        # Opening first lets the FIFO apply backpressure before an S3 body is held.
+        with open(spec["fifo_path"], "wb", buffering=0) as output:
+            response = s3_client.get_object(Bucket=spec["bucket"], Key=spec["key"])
+            expected_bytes = int(response["ContentLength"])
+            body = response["Body"]
+            while True:
+                chunk = body.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                if first_byte_seconds is None:
+                    first_byte_seconds = time.perf_counter() - started
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = output.write(remaining)
+                    if not written:
+                        raise IOError(f"Zero-byte FIFO write for {spec['uri']}")
+                    bytes_written += written
+                    remaining = remaining[written:]
+    finally:
+        if body is not None:
+            body.close()
+
+    if bytes_written != expected_bytes:
+        raise IOError(
+            f"Truncated S3 stream for {spec['uri']}: "
+            f"wrote {bytes_written}, expected {expected_bytes} bytes"
+        )
+
+    result = {
+        "uri": spec["uri"],
+        "read": spec["read"],
+        "compression": spec["compression"],
+        "bytes": bytes_written,
+        "seconds": round(time.perf_counter() - started, 6),
+        "first_byte_seconds": round(first_byte_seconds or 0.0, 6),
+    }
+    print("S3_STREAM " + json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
+def close_fds(fds):
+    while fds:
+        try:
+            os.close(fds.pop())
+        except OSError:
+            pass
+
+
+def close_fifo_keeper(keeper_fds, fifo_path):
+    fd = keeper_fds.pop(fifo_path, None)
+    if fd is not None:
+        close_fds([fd])
+
+
+def close_fifo_keepers(keeper_fds):
+    close_fds(list(keeper_fds.values()))
+    keeper_fds.clear()
+
+
+def run_piscem_streaming(files_r1, files_r2):
     home_dir = "/var/task"
     output_dir = "/tmp/output"
     os.makedirs(output_dir, exist_ok=True)
@@ -100,47 +194,135 @@ def run_piscem(files_r1, files_r2, input_folder):
         "/var/task/piscem", "map-sc",
         "-i", f"{home_dir}/index_output_transcriptome/index_output_transcriptome",
         "-g", "chromium_v3",
-        "-1", ",".join(files_r1),
-        "-2", ",".join(files_r2),
+        "-1", ",".join(spec["fifo_path"] for spec in files_r1),
+        "-2", ",".join(spec["fifo_path"] for spec in files_r2),
         "-t", str(num_threads),
         "-o", f"{output_dir}/split_map_output_transcriptome"
     ]
 
+    all_specs = files_r1 + files_r2
+    # Keep every FIFO open until its producer finishes. This prevents an early
+    # EOF race between FIFO creation, producer startup, and Piscem opening it.
+    keeper_fds = {
+        spec["fifo_path"]: os.open(
+            spec["fifo_path"], os.O_RDWR | os.O_NONBLOCK
+        )
+        for spec in all_specs
+    }
+    executor = ThreadPoolExecutor(
+        max_workers=len(all_specs), thread_name_prefix="s3-fastq"
+    )
+    futures = []
+    process = None
+    started = time.perf_counter()
     try:
+        future_specs = {
+            executor.submit(write_s3_object_to_fifo, spec): spec
+            for spec in all_specs
+        }
+        futures = list(future_specs)
         print("Running command")
         print(f"{command}")
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            print("Error:", result.stderr)
-            return
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-        print("Command completed successfully")
-        print(f"uploading output files to folder {input_folder}")
-        upload_files_with_completion_marker(output_dir, input_folder, S3_OUTPUT_BUCKET_NAME, S3_PREFIX)
+        producer_failure = None
+        while process.poll() is None:
+            for future, spec in future_specs.items():
+                if future.done():
+                    # Deliver EOF independently for R1 and R2. Waiting for all
+                    # producers before closing every keeper can deadlock a
+                    # paired reader when one byte stream finishes first.
+                    close_fifo_keeper(keeper_fds, spec["fifo_path"])
+                    if future.exception() is not None:
+                        producer_failure = future.exception()
+                        break
+            if producer_failure is not None or all(future.done() for future in futures):
+                break
+            time.sleep(0.05)
 
-    except Exception as e:
-        print(f"Error running Piscem: {e}")
+        close_fifo_keepers(keeper_fds)
+        if producer_failure is not None:
+            process.terminate()
+
+        stdout, stderr = process.communicate(timeout=30)
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="")
+
+        stream_results = [future.result() for future in futures]
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"Piscem exited with status {process.returncode}: {stderr[-4000:]}"
+            )
+
+        output_prefix = os.path.join(output_dir, "split_map_output_transcriptome")
+        map_rad = os.path.join(output_prefix, "map.rad")
+        map_info_path = os.path.join(output_prefix, "map_info.json")
+        if not os.path.isfile(map_rad) or not os.path.isfile(map_info_path):
+            raise RuntimeError("Piscem completed without map.rad and map_info.json")
+        with open(map_info_path, "r") as map_info_file:
+            map_info = json.load(map_info_file)
+
+        result = {
+            "seconds": round(time.perf_counter() - started, 6),
+            "threads": num_threads,
+            "input_bytes": sum(item["bytes"] for item in stream_results),
+            "inputs": stream_results,
+            "map_rad_bytes": os.path.getsize(map_rad),
+            "num_reads": map_info.get("num_reads"),
+            "num_mapped": map_info.get("num_mapped"),
+        }
+        print("PISCEM_STREAMING " + json.dumps(result, sort_keys=True), flush=True)
+        return result
+    except Exception:
+        close_fifo_keepers(keeper_fds)
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+        raise
+    finally:
+        close_fifo_keepers(keeper_fds)
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def upload_files_with_completion_marker(output_dir, output_folder, s3_bucket_name, s3_prefix):
-    transfer = S3Transfer(s3_client)
-    for root, _, files in os.walk(output_dir):
-        for file in files:
-            local_path = os.path.join(root, file)
-            output_s3_key = os.path.join(s3_prefix, output_folder, file)
-            print(f"s3 prefix is {s3_prefix}")
-            print(f"output folder is {output_folder}")
-            print(f"file is {file}")
-            print(f"output s3 key is {output_s3_key}")
-            transfer.upload_file(local_path, s3_bucket_name, output_s3_key)
-            print(f"Uploaded {local_path} to S3://{s3_bucket_name}/{output_s3_key}")
+    # Do not reuse the streaming client's HTTP connection pool for uploads.
+    # A warm invocation once inherited a malformed/reused S3 response and spent
+    # 30 seconds recovering while uploading a tiny companion file. Closing both
+    # the transfer manager and this dedicated client also prevents its worker
+    # pool from surviving into the next warm invocation.
+    upload_client = boto3.client("s3")
+    try:
+        with S3Transfer(upload_client) as transfer:
+            for root, _, files in os.walk(output_dir):
+                for file in files:
+                    local_path = os.path.join(root, file)
+                    output_s3_key = os.path.join(s3_prefix, output_folder, file)
+                    print(f"s3 prefix is {s3_prefix}")
+                    print(f"output folder is {output_folder}")
+                    print(f"file is {file}")
+                    print(f"output s3 key is {output_s3_key}")
+                    transfer.upload_file(local_path, s3_bucket_name, output_s3_key)
+                    print(f"Uploaded {local_path} to S3://{s3_bucket_name}/{output_s3_key}")
 
-    empty_file_path = os.path.join(output_dir, 'output.txt')
-    with open(empty_file_path, 'w') as empty_file:
-        empty_file.write('')
-    empty_s3_key = os.path.join(s3_prefix, output_folder, 'output.txt')
-    transfer.upload_file(empty_file_path, s3_bucket_name, empty_s3_key)
-    os.remove(empty_file_path)
+            empty_file_path = os.path.join(output_dir, 'output.txt')
+            with open(empty_file_path, 'w') as empty_file:
+                empty_file.write('')
+            empty_s3_key = os.path.join(s3_prefix, output_folder, 'output.txt')
+            transfer.upload_file(empty_file_path, s3_bucket_name, empty_s3_key)
+            os.remove(empty_file_path)
+    finally:
+        upload_client.close()
 
 
 def handler(event, context):
@@ -191,32 +373,52 @@ def handler(event, context):
     print("Processing File:", input_file_key)
     print("Extracted Folder Name:", final_folder_name)
 
-    # Create a local temp directory to store the downloaded file
-    local_dir = "/tmp/input_files"
-    os.makedirs(local_dir, exist_ok=True)
+    total_started = time.perf_counter()
+    try:
+        manifest_started = time.perf_counter()
+        s3_uris = read_input_manifest(bucket, input_file_key)
+        manifest_seconds = time.perf_counter() - manifest_started
 
-    # function for downloading files
-    downloaded_files = download_files_from_input_txt(bucket, input_file_key, local_dir)
+        stream_dir = "/tmp/input_streams"
+        files_r1, files_r2 = create_fastq_fifos(s3_uris, stream_dir)
+        formats = sorted({spec["compression"] for spec in files_r1 + files_r2})
+        print(
+            f"Streaming {len(files_r1)} R1/R2 pair(s); formats={formats}",
+            flush=True,
+        )
 
-    # Separate R1 and R2 files
-    files_r1 = [f for f in downloaded_files if "_R1_" in f]
-    files_r2 = [f for f in downloaded_files if "_R2_" in f]
+        piscem_result = run_piscem_streaming(files_r1, files_r2)
 
-    # Validate if both R1 and R2 files exist
-    if not files_r1 or not files_r2:
-        print("Missing R1 or R2 files")
-        return {
-            'statusCode': 400,
-            'body': 'Missing R1 or R2 files!'
+        upload_started = time.perf_counter()
+        print(f"uploading output files to folder {final_folder_name}")
+        upload_files_with_completion_marker(
+            "/tmp/output", final_folder_name, S3_OUTPUT_BUCKET_NAME, S3_PREFIX
+        )
+        upload_seconds = time.perf_counter() - upload_started
+
+        timings = {
+            "manifest_seconds": round(manifest_seconds, 6),
+            "stream_and_piscem_seconds": piscem_result["seconds"],
+            "upload_seconds": round(upload_seconds, 6),
+            "total_seconds": round(time.perf_counter() - total_started, 6),
+            "formats": formats,
+            "num_reads": piscem_result["num_reads"],
+            "num_mapped": piscem_result["num_mapped"],
+            "input_bytes": piscem_result["input_bytes"],
+            "map_rad_bytes": piscem_result["map_rad_bytes"],
         }
-
-    # Run Piscem processing
-    run_piscem(files_r1, files_r2, final_folder_name)
-
-    return {
-        'statusCode': 200,
-        'body': 'Piscem map is successful'
-    }
+        print("PIPELINE_TIMING " + json.dumps(timings, sort_keys=True), flush=True)
+        return {
+            'statusCode': 200,
+            'body': 'Piscem map is successful',
+            'timings': timings,
+        }
+    except Exception as error:
+        print(f"Mapper failed: {type(error).__name__}: {error}", flush=True)
+        # An asynchronous Lambda invocation treats a returned HTTP-style 500
+        # dictionary as success. Re-raise so Lambda records a failed invocation
+        # and applies the configured retry/dead-letter behavior.
+        raise
 
 
 # **Testing the Function with an EventBridge Event Format**
