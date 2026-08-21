@@ -623,15 +623,30 @@ aws ec2 wait instance-stopped \
 echo "Instance stopped. Waiting for AMI to become available (max attempts: ${AMI_WAIT_MAX_ATTEMPTS}, delay: ${AMI_WAIT_DELAY}s)..."
 echo "This may take several minutes for large snapshots."
 
-# Attempt to wait for AMI availability with configurable timeout
-set +e
-aws ec2 wait image-available \
-    --image-ids "${AMI_ID}" \
-    --region "${AWS_REGION}" \
-    --max-attempts "${AMI_WAIT_MAX_ATTEMPTS}" \
-    --delay "${AMI_WAIT_DELAY}"
-WAIT_EXIT_CODE=$?
-set -e
+# AWS CLI waiters do not expose --max-attempts or --delay. Poll explicitly so
+# these maintainer settings work consistently across AWS CLI v2 releases.
+WAIT_EXIT_CODE=1
+for ((wait_attempt = 1; wait_attempt <= AMI_WAIT_MAX_ATTEMPTS; wait_attempt++)); do
+    AMI_WAIT_STATE=$(aws ec2 describe-images \
+        --image-ids "${AMI_ID}" \
+        --region "${AWS_REGION}" \
+        --query 'Images[0].State' \
+        --output text 2>/dev/null || echo "unknown")
+    if [[ "${AMI_WAIT_STATE}" == "available" ]]; then
+        WAIT_EXIT_CODE=0
+        break
+    fi
+    if [[ "${AMI_WAIT_STATE}" == "failed" ]]; then
+        echo "AMI entered failed state while waiting"
+        break
+    fi
+    if (( wait_attempt == 1 || wait_attempt % 10 == 0 )); then
+        echo "  AMI state=${AMI_WAIT_STATE} (attempt ${wait_attempt}/${AMI_WAIT_MAX_ATTEMPTS})"
+    fi
+    if (( wait_attempt < AMI_WAIT_MAX_ATTEMPTS )); then
+        sleep "${AMI_WAIT_DELAY}"
+    fi
+done
 
 AMI_AVAILABLE=0
 

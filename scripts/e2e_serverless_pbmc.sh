@@ -463,12 +463,22 @@ maybe_fix_pem_perms_windows() {
 # Compute local PEM fingerprint matching the format AWS uses for KeyFingerprint.
 #   SHA-1 (20 bytes / 19 colons) → AWS-created RSA keypairs: SHA1(DER-encoded private key)
 #   MD5  (16 bytes / 15 colons) → imported keypairs: MD5 of public key
+#   Base64 SHA-256 (no colons)   → imported ED25519 public key
 # Usage: compute_local_fp_for_aws <pem_path> <aws_fingerprint>
 compute_local_fp_for_aws() {
     local pem="$1" aws_fp="$2"
     local colon_count fp=""
     colon_count="$(echo "$aws_fp" | tr -cd ':' | wc -c)"
     colon_count="${colon_count// /}"  # trim whitespace from wc
+
+    if [[ "$colon_count" -eq 0 ]]; then
+        # EC2 reports imported ED25519 keys as a raw base64 SHA-256 value,
+        # while ssh-keygen prefixes the same value with "SHA256:".
+        fp="$(ssh-keygen -lf "$pem" 2>/dev/null | awk '{print $2}' | sed 's/^SHA256://g' || true)"
+        [[ "$aws_fp" == *= && "$fp" != *= ]] && fp="${fp}="
+        printf '%s' "$fp"
+        return 0
+    fi
 
     if [[ "$colon_count" -eq 19 ]] || [[ "$colon_count" -ne 15 ]]; then
         # SHA-1 of DER-encoded private key (AWS CreateKeyPair / Console)
@@ -538,7 +548,7 @@ ensure_keypair_and_pem() {
     local aws_fp local_fp
     aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
         --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-    aws_fp="${aws_fp,,}"
+    [[ "$aws_fp" == *:* ]] && aws_fp="${aws_fp,,}"
 
     [[ -n "$aws_fp" ]] || die "Could not read AWS key fingerprint for '$KEY_NAME'."
 
@@ -1818,7 +1828,7 @@ validate_dry_run() {
                 fi
                 aws_fp="$(aws ec2 describe-key-pairs --region "$AWS_REGION" --key-names "$KEY_NAME" \
                     --query 'KeyPairs[0].KeyFingerprint' --output text 2>/dev/null || true)"
-                aws_fp="${aws_fp,,}"
+                [[ "$aws_fp" == *:* ]] && aws_fp="${aws_fp,,}"
                 local_fp="$(compute_local_fp_for_aws "$pem_check" "$aws_fp")"
                 if [[ -z "$aws_fp" || -z "$local_fp" ]]; then
                     log_error "  FAIL: Could not compute fingerprints for mismatch detection"
@@ -1869,12 +1879,21 @@ validate_dry_run() {
         if [[ -z "$EC2_INSTANCE_PROFILE_NAME" ]]; then
             log_error "  FAIL: EC2_INSTANCE_PROFILE_NAME not set"
             fail=$((fail + 1))
-        elif ! aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
-            log_error "  FAIL: Instance profile not found: $EC2_INSTANCE_PROFILE_NAME"
-            fail=$((fail + 1))
         else
-            log_info "  PASS: Instance profile exists"
-            pass=$((pass + 1))
+            local profile_check_err
+            profile_check_err=$(mktemp)
+            if aws iam get-instance-profile \
+                --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" \
+                >/dev/null 2>"$profile_check_err"; then
+                log_info "  PASS: Instance profile exists"
+                pass=$((pass + 1))
+            elif grep -qE 'AccessDenied|UnauthorizedOperation' "$profile_check_err"; then
+                log_warn "  SKIP: Caller cannot inspect IAM instance profiles; EC2 launch will validate '$EC2_INSTANCE_PROFILE_NAME'"
+            else
+                log_error "  FAIL: Instance profile not found: $EC2_INSTANCE_PROFILE_NAME"
+                fail=$((fail + 1))
+            fi
+            rm -f "$profile_check_err"
         fi
     else
         log_info "[CHECK 7/7] (skipped, run mode)"
