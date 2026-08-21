@@ -53,6 +53,7 @@ EXPECTED_MAPPED="${EXPECTED_MAPPED:-3645770776}"
 BASELINE_SECONDS="${BASELINE_SECONDS:-8696.991876}"
 LOCAL_BASELINE_DIR="${LOCAL_BASELINE_DIR:-/mnt/nvme/benchmark-runs/ko-piscem-baseline-20260820-dev1}"
 PREFIX="${S3_PREFIX:-ko}"
+SAMPLE_WORKERS="${SAMPLE_MATERIALIZER_WORKERS:-4}"
 
 bucket_object_count() {
     aws s3api list-objects-v2 --bucket "$1" --prefix "$2" --region "$REGION" \
@@ -72,6 +73,8 @@ create_bucket_if_missing() {
 
 provision() {
     local source role image env_json
+    create_bucket_if_missing "$FASTQ_BUCKET"
+    create_bucket_if_missing "$INPUT_TXT_BUCKET"
     create_bucket_if_missing "$OUTPUT_MAP_BUCKET"
     create_bucket_if_missing "$OUTPUT_QUANT_BUCKET"
     if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >/dev/null 2>&1; then
@@ -87,7 +90,7 @@ provision() {
         --function-name "$FUNCTION_NAME" --package-type Image --code "ImageUri=$image" \
         --role "$role" --architectures x86_64 --memory-size 10240 --timeout 900 \
         --ephemeral-storage Size=10240 --environment "$env_json" --region "$REGION" \
-        --tags benchmark=ko-async-7gib,cleanup=retained >/dev/null
+        --tags benchmark=ko-async-sample-eager-7gib,cleanup=retained >/dev/null
     aws lambda wait function-active-v2 --function-name "$FUNCTION_NAME" --region "$REGION"
     # No reservation is requested: the account currently retains only the
     # mandatory 100-unit unreserved pool after earlier benchmark reservations.
@@ -102,6 +105,7 @@ preflight() {
     command -v jq >/dev/null || die "jq is required"
     command -v aws >/dev/null || die "aws CLI is required"
     command -v s3-rad-materialize >/dev/null || die "s3-rad-materialize is required"
+    [[ "$SAMPLE_WORKERS" =~ ^[1-9][0-9]*$ ]] || die "SAMPLE_MATERIALIZER_WORKERS must be positive"
     for sample in A B C D E F G_1 G_2 H I J L_1 L_2; do
         [[ -f "$LOCAL_BASELINE_DIR/samples/$sample/output/map_info.json" ]] || \
             die "local baseline map metadata is missing for sample $sample"
@@ -128,6 +132,8 @@ preflight() {
 run_benchmark() {
     local start_ns upload_end_ns materialize_start_ns end_ns marker_count map_count
     local last_marker_iso last_marker_ns first_decompressor_ns
+    local first_sample_materializer_ns last_sample_materializer_ns
+    local sample_materialization_window_seconds sample_materializer_sum_seconds
     local sample rad aggregate async_reads async_mapped baseline_reads baseline_mapped status
     local -a folders files
     preflight
@@ -177,7 +183,8 @@ EOF
     printf '%s\n' "$materialize_start_ns" > "$RUN_DIR/materialize-start.ns"
     bash "$SCRIPT_DIR/async_lambda_control.sh" --state "$RUN_DIR/async_state.env" materialize \
         --sample-manifest "$SAMPLE_MANIFEST" --output-dir "$RUN_DIR/samples" \
-        --threads 32 --poll-seconds 1 --timeout-seconds 43200 --rad-only \
+        --threads 32 --sample-workers "$SAMPLE_WORKERS" \
+        --poll-seconds 1 --timeout-seconds 43200 --rad-only \
         2>&1 | tee "$RUN_DIR/materialize.log"
     end_ns=$(date +%s%N)
     printf '%s\n' "$end_ns" > "$RUN_DIR/final-rads-complete.ns"
@@ -239,6 +246,13 @@ EOF
     done
 
     first_decompressor_ns=$(<"$UPLOAD_DIR/first_decompressor_start.ns")
+    first_sample_materializer_ns=$(awk -F '\t' 'NR > 1 && (!seen || $4 < first) {first=$4; seen=1} END {printf "%.0f", first}' \
+        "$RUN_DIR/samples/sample-materialization-timings.tsv")
+    last_sample_materializer_ns=$(awk -F '\t' 'NR > 1 && (!seen || $5 > last) {last=$5; seen=1} END {printf "%.0f", last}' \
+        "$RUN_DIR/samples/sample-materialization-timings.tsv")
+    sample_materialization_window_seconds=$(elapsed "$first_sample_materializer_ns" "$last_sample_materializer_ns")
+    sample_materializer_sum_seconds=$(awk -F '\t' 'NR > 1 {sum += $6} END {printf "%.6f", sum}' \
+        "$RUN_DIR/samples/sample-materialization-timings.tsv")
     aws lambda get-function-configuration --function-name "$FUNCTION_NAME" --region "$REGION" \
         > "$RUN_DIR/lambda-function-configuration.json"
     aws lambda get-function-concurrency --function-name "$FUNCTION_NAME" --region "$REGION" \
@@ -251,11 +265,16 @@ EOF
         "split_pairs=25" \
         "direct_pairs=105" \
         "lambda_invocations=$EXPECTED_SHARDS" \
+        "sample_materializer_workers=$SAMPLE_WORKERS" \
         "scheduler_to_upload_complete_seconds=$(elapsed "$start_ns" "$upload_end_ns")" \
         "first_decompressor_to_upload_complete_seconds=$(elapsed "$first_decompressor_ns" "$upload_end_ns")" \
         "first_decompressor_to_last_lambda_marker_seconds=$(elapsed "$first_decompressor_ns" "$last_marker_ns")" \
         "post_upload_lambda_tail_seconds=$(elapsed "$upload_end_ns" "$last_marker_ns")" \
+        "post_upload_before_first_sample_materializer_seconds=$(elapsed "$upload_end_ns" "$first_sample_materializer_ns")" \
         "materialization_stage_seconds=$(elapsed "$materialize_start_ns" "$end_ns")" \
+        "sample_materialization_window_seconds=$sample_materialization_window_seconds" \
+        "sample_materializer_sum_seconds=$sample_materializer_sum_seconds" \
+        "last_lambda_marker_to_final_sample_rads_seconds=$(elapsed "$last_marker_ns" "$end_ns")" \
         "first_decompressor_to_final_sample_rads_seconds=$(elapsed "$first_decompressor_ns" "$end_ns")" \
         "local_baseline_seconds=$BASELINE_SECONDS" \
         "speedup_vs_local_baseline=$(awk -v base="$BASELINE_SECONDS" -v async="$(elapsed "$first_decompressor_ns" "$end_ns")" 'BEGIN {printf "%.6f",base/async}')" \
