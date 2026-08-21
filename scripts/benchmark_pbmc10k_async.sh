@@ -12,6 +12,7 @@ usage() {
     cat <<'EOF'
 Usage:
   benchmark_pbmc10k_async.sh --preflight
+  benchmark_pbmc10k_async.sh --baseline-only
   benchmark_pbmc10k_async.sh --run
   benchmark_pbmc10k_async.sh --finish-async
 
@@ -73,7 +74,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ACTION="${1:---preflight}"
 [[ $# -eq 1 ]] || { usage >&2; exit 2; }
 case "$ACTION" in
-    --preflight|--run|--finish-async) ;;
+    --preflight|--baseline-only|--run|--finish-async) ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -406,6 +407,11 @@ preflight
 case "$ACTION" in
     --preflight)
         exit 0
+        ;;
+    --baseline-only)
+        [[ ! -e "$BENCHMARK_DIR" ]] || die "benchmark evidence directory already exists: $BENCHMARK_DIR"
+        record_inputs
+        run_baseline
         ;;
     --run)
         [[ ! -e "$BENCHMARK_DIR" ]] || die "benchmark evidence directory already exists: $BENCHMARK_DIR"

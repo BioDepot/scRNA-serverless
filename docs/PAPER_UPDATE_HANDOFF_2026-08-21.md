@@ -4,9 +4,9 @@
 
 This document summarizes the implementation, validation, and development
 benchmarks completed on 2026-08-20 and 2026-08-21. It is intended to support a
-manuscript update. The single-trial performance results below are the current
-validated measurements, but performance claims should be updated from the
-three-trial replicate analysis before they are used in the paper.
+manuscript update. The performance results below are the completed, validated
+three-trial measurements for both the local baseline and final asynchronous
+workflow.
 
 The benchmarked comparison excludes alevin-fry because that stage is identical
 between the local and serverless arms. The local baseline is Piscem mapping on
@@ -28,9 +28,8 @@ Four changes transformed it into a faster workflow:
 4. Parallel ranged-S3 RAD materialization, including sample-eager grouped
    materialization for the 13-sample KO workload.
 
-The current single-trial speedups are 1.323x for PBMC 1K, 2.128x for PBMC 10K,
-and 6.620x for KO. These values are development results, not yet the final
-three-replicate manuscript estimates.
+The speedups computed from the three-trial arm means are 1.319x for PBMC 1K,
+2.112x for PBMC 10K, and 6.639x for KO.
 
 ## Workflow changes
 
@@ -117,16 +116,18 @@ three-replicate manuscript estimates.
 - With the KO 7 GiB cutoff, 105 pairs pass through directly and 25 pairs are
   split, producing 917 Lambda invocations in total.
 
-## Current single-trial production measurements
+## Three-replicate production measurements
 
-All times are wall-clock seconds. `Mean Lambda alignment` is per-invocation and
-overlaps splitting/upload, so it is not additive with the wall stages.
+All cells are the arithmetic mean ± sample standard deviation in wall-clock
+seconds across three trials. `Mean Lambda alignment` is first calculated over
+all invocations within each trial, then summarized across trials. It overlaps
+splitting/upload, so it is not additive with the wall stages.
 
-| Dataset | Local baseline | Split/upload | Mean Lambda alignment | Post-split before merge | Download/merge | Async total | Speedup |
+| Dataset | Local baseline | Split/upload | Mean Lambda alignment | Post-split before merge | Download/merge | Async total | Speedup from arm means |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PBMC 1K | 81.370 | 39.187 | 18.930 | 20.799 | 1.519 | 61.505 | 1.323x |
-| PBMC 10K | 781.663 | 339.549 | 21.173 | 21.165 | 6.621 | 367.335 | 2.128x |
-| KO, 13 samples | 8,696.992 | 1,215.181 | 32.055 | 7.565 | 91.036 | 1,313.782 | 6.620x |
+| PBMC 1K | 80.753 ± 0.537 | 39.063 ± 0.120 | 19.663 ± 0.834 | 20.528 ± 0.969 | 1.613 ± 0.110 | 61.204 ± 0.955 | 1.319x |
+| PBMC 10K | 780.502 ± 1.155 | 338.881 ± 3.780 | 21.463 ± 0.299 | 23.580 ± 2.400 | 7.067 ± 0.519 | 369.528 ± 3.469 | 2.112x |
+| KO, 13 samples | 8,727.677 ± 27.409 | 1,215.728 ± 7.949 | 32.318 ± 0.252 | 7.509 ± 0.053 | 91.355 ± 1.184 | 1,314.592 ± 6.839 | 6.639x |
 
 The additive async definition is:
 
@@ -135,27 +136,27 @@ async_total = split_and_upload + post_split_before_merge + download_and_merge
 speedup = local_baseline / async_total
 ```
 
-## Three-replicate benchmark in progress
-
-Trial 1 uses the validated production measurements above. Two new local
-baseline trials and two new final-async trials are being collected for every
-dataset. Record the individual trials and report the arithmetic mean, standard
-deviation, median, range, mean paired speedup, and speedup computed from the
-arm means. Do not replace replicate distributions with only the fastest run.
+The individual arm times are:
 
 | Dataset | Arm | Trial 1 (s) | Trial 2 (s) | Trial 3 (s) | Mean (s) | SD (s) |
 |---|---|---:|---:|---:|---:|---:|
-| PBMC 1K | Local Piscem | 81.370129 | pending | pending | pending | pending |
-| PBMC 1K | Final async | 61.505086 | pending | pending | pending | pending |
-| PBMC 10K | Local Piscem | 781.662519 | pending | pending | pending | pending |
-| PBMC 10K | Final async | 367.335378 | pending | pending | pending | pending |
-| KO | Local Piscem | 8696.991876 | pending | pending | pending | pending |
-| KO | Final async | 1313.782067 | pending | pending | pending | pending |
+| PBMC 1K | Local Piscem | 81.370129 | 80.492631 | 80.395011 | 80.752590 | 0.537027 |
+| PBMC 1K | Final async | 61.505086 | 60.134026 | 61.972187 | 61.203766 | 0.955408 |
+| PBMC 10K | Local Piscem | 781.662519 | 779.353604 | 780.488986 | 780.501703 | 1.154510 |
+| PBMC 10K | Final async | 367.335378 | 373.526887 | 367.720768 | 369.527678 | 3.468773 |
+| KO | Local Piscem | 8696.991876 | 8736.309241 | 8749.730907 | 8727.677341 | 27.408641 |
+| KO | Final async | 1313.782067 | 1308.194146 | 1321.800187 | 1314.592133 | 6.839097 |
 
 The replicate runner uses a fresh `m5dn.8xlarge` made from the minimal AMI, a
 two-device NVMe RAID0, 32 local Piscem threads, the same four-million-read shard
 contract, and cleanup gates disabled. Provisioning, dataset transfer, image
 construction, and tool installation are outside measured regions.
+
+An initial PBMC 1K trial-2 baseline that read the index cold from root EBS took
+116.303968 seconds, including about 35.5 seconds of index loading. It was
+excluded by the predeclared NVMe-resident baseline contract and replaced with
+the 80.492631-second measurement after the unchanged index was copied to NVMe.
+The independently timed async arm from that run remained valid.
 
 ## Correctness evidence
 
@@ -175,7 +176,7 @@ construction, and tool installation are outside measured regions.
   matrices, because parallel shard completion can change barcode ordering
   without changing counts.
 
-## Lambda profile from the final KO trial
+## Lambda profile from retained KO trial 1
 
 | Measurement | All | Direct gzip | Split FASTQ |
 |---|---:|---:|---:|
@@ -200,8 +201,10 @@ $2.176/hour and x86 Lambda pricing. S3 and ancillary services are excluded.
 | PBMC 10K | $0.472476 | $0.222034 | $0.589648 | $0.811682 |
 | KO | $5.256848 | $0.794108 | $5.095134 | $5.889242 |
 
-These are list-price development estimates before the free tier, Savings
-Plans, credits, taxes, and the three-replicate reruns.
+These are the previously reported trial-1 list-price development estimates,
+before the free tier, Savings Plans, credits, or taxes. They have not been
+silently relabeled as three-trial mean costs; the three-trial timing report is
+the authoritative source for the updated runtime claims.
 
 ## Minimal AMI and reproducibility environment
 
@@ -237,17 +240,32 @@ Plans, credits, taxes, and the three-replicate reruns.
 - `scripts/benchmark_ko_async.sh`: final KO async benchmark.
 - `scripts/calculate_pbmc_benchmark_costs.sh` and
   `scripts/calculate_ko_benchmark_costs.sh`: reproducible cost formulas.
-- `docs/PRODUCTION_BENCHMARK_2026-08-21.md`: current production tables.
+- `scripts/summarize_benchmark_replicates.py`: validates the additive stage
+  accounting and produces per-trial and mean/sample-SD manuscript tables.
+- `docs/three_replicate_benchmark_2026-08-21.tsv`: exact source measurements
+  and original evidence paths for all nine paired trials.
+- `docs/THREE_REPLICATE_BENCHMARK_2026-08-21.md`: generated per-trial,
+  mean/sample-SD, median/range, and speedup report.
+- `docs/PRODUCTION_BENCHMARK_2026-08-21.md`: retained trial-1 production table
+  and cost calculation.
 - `docs/KO_SAMPLE_EAGER_BENCHMARK_2026-08-21.md`: final KO optimization and
   Lambda profile.
 - `docs/ASYNC_LAMBDA_RUNBOOK.md`: execution, idempotency, inspection, and
   recovery runbook.
 - `docs/MINIMAL_AMI_AND_NVME.md`: AMI construction and NVMe setup.
 
+A compact evidence copy is retained on persistent EBS at
+`/home/ubuntu/benchmark-evidence/three-replicate-20260821`. It contains timing
+markers, logs, manifests, Lambda configurations, all CloudWatch timing and
+billing records, checksums, count comparisons, and RAD validation output. The
+multi-gigabyte RAD payloads and `unmapped_bc_count.bin` files were intentionally
+excluded from that compact copy; the original AWS benchmark resources and
+CloudWatch logs were not cleaned up.
+
 ## Manuscript cautions and remaining work
 
-1. Replace the single-trial timing table with the three-trial results and
-   variability statistics before making publication-level speed claims.
+1. Use the three-trial means and sample standard deviations for headline
+   performance claims, while retaining the individual trials and ranges.
 2. State the exact timed boundaries and that alevin-fry is excluded equally
    from both arms.
 3. Report both driver EC2 time and Lambda compute; do not describe the faster
@@ -258,5 +276,10 @@ Plans, credits, taxes, and the three-replicate reruns.
    transaction system. S3 completion markers remain the readiness contract.
 6. Confirm redistribution terms for the bundled reference assets before the
    AMI is made public.
-7. Keep destructive AWS and S3 cleanup gated until the replicate evidence and
-   CloudWatch profiles have been copied and audited.
+7. Keep destructive AWS and S3 cleanup gated. The replicate evidence and
+   CloudWatch profiles have been copied, but the retained cloud resources are
+   still useful for development audit and follow-up profiling.
+8. Update the AMI runtime setup to copy the baked Piscem index from root EBS to
+   instance-store NVMe before timed local baselines, and point both PBMC and KO
+   baseline scripts at that copy. The first cold-EBS setup attempt is excluded
+   from the replicate analysis.

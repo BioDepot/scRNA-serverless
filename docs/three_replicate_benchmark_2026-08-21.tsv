@@ -1,0 +1,10 @@
+dataset	trial	baseline_seconds	split_upload_seconds	mean_lambda_alignment_seconds	post_split_before_merge_seconds	download_merge_seconds	async_total_seconds	baseline_evidence	async_evidence
+PBMC 1K	1	81.370129	39.187000	18.929937667	20.798872	1.519214	61.505086	/mnt/nvme/benchmark-runs/pbmc1k-20260821-rerun1/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc1k-20260821-rerun1/async-serverless
+PBMC 1K	2	80.492631	38.947000	19.489501778	19.452303	1.734723	60.134026	/mnt/nvme/benchmark-runs/pbmc1k-baseline-rep2-20260821/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc1k-rep2-20260821/async-serverless
+PBMC 1K	3	80.395011	39.054000	20.570290167	21.332919	1.585268	61.972187	/mnt/nvme/benchmark-runs/pbmc1k-rep3-20260821/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc1k-rep3-20260821/async-serverless
+PBMC 10K	1	781.662519	339.549000	21.173364503	21.165365	6.621013	367.335378	/mnt/nvme/benchmark-runs/pbmc10k-20260821-rerun1/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc10k-20260821-rerun1/async-serverless
+PBMC 10K	2	779.353604	342.282000	21.443944528	23.608673	7.636214	373.526887	/mnt/nvme/benchmark-runs/pbmc10k-rep2-20260821/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc10k-rep2-20260821/async-serverless
+PBMC 10K	3	780.488986	334.812000	21.771142453	25.964546	6.944222	367.720768	/mnt/nvme/benchmark-runs/pbmc10k-rep3-20260821/baseline-piscem-32t	/mnt/nvme/benchmark-runs/pbmc10k-rep3-20260821/async-serverless
+KO, 13 samples	1	8696.991876	1215.181179	32.054538125	7.565293	91.035595	1313.782067	/mnt/nvme/benchmark-runs/ko-piscem-baseline-20260820-dev1	/mnt/nvme/benchmark-runs/ko-async-sample-eager-20260821-dev1
+KO, 13 samples	2	8736.309241	1208.066521	32.341702863	7.461217	92.666408	1308.194146	/mnt/nvme/benchmark-runs/ko-piscem-baseline-rep2-20260821	/mnt/nvme/benchmark-runs/ko-async-sample-eager-rep2-20260821
+KO, 13 samples	3	8749.730907	1223.935645	32.556917549	7.500613	90.363929	1321.800187	/mnt/nvme/benchmark-runs/ko-piscem-baseline-rep3-20260821	/mnt/nvme/benchmark-runs/ko-async-sample-eager-rep3-20260821

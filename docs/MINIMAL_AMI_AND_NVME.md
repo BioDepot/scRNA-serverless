@@ -100,6 +100,29 @@ other EC2 types with local NVMe. It fails explicitly if no instance-store NVMe
 is available instead of putting FASTQs and intermediate data on the small EBS
 root.
 
+### Runtime index placement follow-up
+
+The seed AMI stores the 187 MiB Piscem index under `/opt/scrna-seed` on the
+small EBS root so it survives instance creation. Before a timed local Piscem
+baseline, runtime setup should copy that directory to instance-store NVMe and
+set `INDEX_PREFIX` or `PISCEM_INDEX_PREFIX` to the NVMe copy. A cold load from
+the baked EBS path added about 35.5 seconds to an otherwise comparable PBMC 1K
+baseline during the three-replicate setup and that attempt was excluded.
+
+Until this copy is automated in the AMI/runtime scripts, use:
+
+```bash
+mkdir -p /mnt/nvme/reference/index_output_transcriptome
+rsync -a /opt/scrna-seed/index_output_transcriptome/ \
+  /mnt/nvme/reference/index_output_transcriptome/
+export INDEX_PREFIX=/mnt/nvme/reference/index_output_transcriptome/index_output_transcriptome
+export PISCEM_INDEX_PREFIX="$INDEX_PREFIX"
+```
+
+The copy and any cache warming are environment preparation and must remain
+outside the measured interval. The Lambda image build can continue to read the
+baked seed from `/opt/scrna-seed`; this note concerns the local EC2 baseline.
+
 ## Clean an instance before snapshotting
 
 `build_seed_ami.sh` streams the cleanup helper to the builder and runs it as its
