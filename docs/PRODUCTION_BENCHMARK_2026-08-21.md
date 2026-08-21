@@ -1,4 +1,8 @@
-# Production asynchronous benchmark
+# Retained trial-1 production asynchronous benchmark
+
+The definitive performance result is now the completed three-replicate report
+in [`THREE_REPLICATE_BENCHMARK_2026-08-21.md`](THREE_REPLICATE_BENCHMARK_2026-08-21.md).
+This file is retained as the exact trial-1 timing and cost record.
 
 This is the production comparison for the final asynchronous workflow. It uses
 the 2026-08-21 PBMC reruns and the final KO Lambda-only rerun with the

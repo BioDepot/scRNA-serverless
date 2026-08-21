@@ -13,8 +13,14 @@
 #
 # How reviewers use it:
 #   The AMI ID is hardcoded in scripts/e2e_serverless_pbmc.sh as
-#   DEFAULT_SEED_AMI_ID. Reviewers just clone the repo and run the pipeline;
-#   the script launches an EC2 instance from this public AMI automatically.
+#   DEFAULT_SEED_AMI_ID after validation and, for external reviewers, explicit
+#   publication. Reviewers clone the repo and run the pipeline; the script
+#   launches an EC2 instance from that AMI automatically.
+#
+# Runtime benchmark follow-up:
+#   Keep the persistent index in /opt on the AMI, but copy it to instance-store
+#   NVMe outside the timed region and point INDEX_PREFIX/PISCEM_INDEX_PREFIX at
+#   the NVMe copy. A cold local baseline must not read the index from root EBS.
 #
 # How the AMI was built (steps performed by this script):
 #   1. Launch a fresh Ubuntu 22.04 EC2 instance
@@ -23,7 +29,7 @@
 #   4. Create an AMI snapshot from the instance
 #   5. Optionally, with explicit confirmation, disable the account-level AMI
 #      public-access block and publish the AMI and its EBS snapshot
-#   7. Terminate the build instance
+#   6. Terminate the build instance
 #
 ################################################################################
 
