@@ -12,6 +12,8 @@ Usage:
   async_lambda_control.sh --state FILE status [--verbose]
   async_lambda_control.sh --state FILE wait [--poll-seconds N] [--timeout-seconds N]
   async_lambda_control.sh --state FILE materialize --output FILE [options]
+  async_lambda_control.sh --state FILE materialize \
+    --sample-manifest FILE --output-dir DIR [options]
 
 Commands:
   status          Report expected, claimed, RAD-ready, and completed shards.
@@ -20,12 +22,17 @@ Commands:
 
 Options:
   --state FILE              async_state.env written by e2e_serverless_pbmc.sh.
-  --output FILE             Required for materialize; preferably on NVMe.
+  --output FILE             Single-sample RAD output; preferably on NVMe.
+  --sample-manifest FILE    Optional TSV with sample and pair_name columns.
+                            Enables one final RAD per sample.
+  --output-dir DIR          Required with --sample-manifest. Outputs are
+                            written as DIR/SAMPLE/{map.rad,unmapped_bc_count.bin}.
   --threads N               Materializer threads (default: 32).
   --poll-seconds N          Poll interval (default: 1).
   --timeout-seconds N       Wait timeout (default: 43200).
   --timings-file FILE       Materializer stage timings.
   --overwrite               Atomically replace an existing local RAD.
+  --rad-only                With --sample-manifest, omit unmapped-count files.
   --verbose                 List incomplete folders during status/wait.
   -h, --help                Show this help.
 
@@ -51,11 +58,14 @@ is_positive_integer() {
 STATE_FILE=""
 COMMAND=""
 OUTPUT_FILE=""
+OUTPUT_DIR=""
+SAMPLE_MANIFEST=""
 THREADS="${MATERIALIZER_THREADS:-32}"
 POLL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 TIMEOUT_SECONDS="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 TIMINGS_FILE=""
 OVERWRITE=0
+RAD_ONLY=0
 VERBOSE=0
 
 while [[ $# -gt 0 ]]; do
@@ -66,6 +76,12 @@ while [[ $# -gt 0 ]]; do
         --output)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             OUTPUT_FILE="$2"; shift 2 ;;
+        --output-dir)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            OUTPUT_DIR="$2"; shift 2 ;;
+        --sample-manifest)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            SAMPLE_MANIFEST="$2"; shift 2 ;;
         --threads)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             THREADS="$2"; shift 2 ;;
@@ -80,6 +96,8 @@ while [[ $# -gt 0 ]]; do
             TIMINGS_FILE="$2"; shift 2 ;;
         --overwrite)
             OVERWRITE=1; shift ;;
+        --rad-only)
+            RAD_ONLY=1; shift ;;
         --verbose)
             VERBOSE=1; shift ;;
         status|wait|materialize)
@@ -232,19 +250,43 @@ case "$COMMAND" in
         wait_for_completion
         ;;
     materialize)
-        [[ -n "$OUTPUT_FILE" ]] || die "--output is required for materialize"
-        args=(
-            --output-bucket "$OUTPUT_MAP_BUCKET"
-            --expected-folders "$EXPECTED_FOLDERS_FILE"
-            --output "$OUTPUT_FILE"
-            --region "$AWS_REGION_VALUE"
-            --threads "$THREADS"
-            --poll-seconds "$POLL_SECONDS"
-            --timeout-seconds "$TIMEOUT_SECONDS"
-        )
-        [[ -n "$NOT_BEFORE" ]] && args+=(--not-before "$NOT_BEFORE")
-        [[ -n "$TIMINGS_FILE" ]] && args+=(--timings-file "$TIMINGS_FILE")
-        (( OVERWRITE == 1 )) && args+=(--overwrite)
-        exec bash "$(dirname "$0")/synchronous_s3_rad_materialize.sh" "${args[@]}"
+        if [[ -n "$SAMPLE_MANIFEST" ]]; then
+            [[ -f "$SAMPLE_MANIFEST" ]] || die "sample manifest not found: $SAMPLE_MANIFEST"
+            [[ -n "$OUTPUT_DIR" ]] || die "--output-dir is required with --sample-manifest"
+            [[ -z "$OUTPUT_FILE" ]] || die "use --output-dir, not --output, with --sample-manifest"
+            [[ -z "$TIMINGS_FILE" ]] || \
+                die "--timings-file is single-sample only; grouped timings are written per sample"
+            args=(
+                --output-bucket "$OUTPUT_MAP_BUCKET"
+                --expected-folders "$EXPECTED_FOLDERS_FILE"
+                --sample-manifest "$SAMPLE_MANIFEST"
+                --output-dir "$OUTPUT_DIR"
+                --region "$AWS_REGION_VALUE"
+                --threads "$THREADS"
+                --poll-seconds "$POLL_SECONDS"
+                --timeout-seconds "$TIMEOUT_SECONDS"
+            )
+            [[ -n "$NOT_BEFORE" ]] && args+=(--not-before "$NOT_BEFORE")
+            (( OVERWRITE == 1 )) && args+=(--overwrite)
+            (( RAD_ONLY == 1 )) && args+=(--rad-only)
+            exec bash "$(dirname "$0")/materialize_sample_groups.sh" "${args[@]}"
+        else
+            [[ -n "$OUTPUT_FILE" ]] || die "--output is required for single-sample materialize"
+            [[ -z "$OUTPUT_DIR" ]] || die "--output-dir requires --sample-manifest"
+            (( RAD_ONLY == 0 )) || die "--rad-only requires --sample-manifest"
+            args=(
+                --output-bucket "$OUTPUT_MAP_BUCKET"
+                --expected-folders "$EXPECTED_FOLDERS_FILE"
+                --output "$OUTPUT_FILE"
+                --region "$AWS_REGION_VALUE"
+                --threads "$THREADS"
+                --poll-seconds "$POLL_SECONDS"
+                --timeout-seconds "$TIMEOUT_SECONDS"
+            )
+            [[ -n "$NOT_BEFORE" ]] && args+=(--not-before "$NOT_BEFORE")
+            [[ -n "$TIMINGS_FILE" ]] && args+=(--timings-file "$TIMINGS_FILE")
+            (( OVERWRITE == 1 )) && args+=(--overwrite)
+            exec bash "$(dirname "$0")/synchronous_s3_rad_materialize.sh" "${args[@]}"
+        fi
         ;;
 esac
