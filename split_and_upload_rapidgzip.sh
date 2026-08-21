@@ -45,18 +45,18 @@ wait
 
 # Rename files to remove zero padding (_p00 -> _p0, _p01 -> _p1, etc.)
 echo "Renaming split files..."
-find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" | while read file; do
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R1_BASE}_p*.fastq" | while read file; do
  new_name=$(echo "$file" | sed -E 's/_p0+([0-9])/_p\1/')
  [[ "$file" != "$new_name" ]] && mv "$file" "$new_name"
 done
 
-find /mnt/nvme/ -type f -name "${R2_BASE}_p*.fastq" | while read file; do
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R2_BASE}_p*.fastq" | while read file; do
  new_name=$(echo "$file" | sed -E 's/_p0+([0-9])/_p\1/')
  [[ "$file" != "$new_name" ]] && mv "$file" "$new_name"
 done
 
 # Count number of file pairs
-PAIR_COUNT=$(find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" | wc -l)
+PAIR_COUNT=$(find /mnt/nvme/ -maxdepth 1 -type f -name "${R1_BASE}_p*.fastq" | wc -l)
 echo "Total file pairs: $PAIR_COUNT"
 
 # Upload R1 and R2 split files
@@ -67,7 +67,7 @@ UPLOAD_LIST_R1R2="/mnt/nvme/${BASENAME_WITH_LANE}_upload_list_r1r2.txt"
 mkdir -p "$(dirname "$UPLOAD_LIST_R1R2")"
 > "$UPLOAD_LIST_R1R2"
 
-find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" | while read r1_file; do
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R1_BASE}_p*.fastq" | while read r1_file; do
  suffix=$(basename "$r1_file" | grep -oP '_p\d+')
  r2_file="/mnt/nvme/${R2_BASE}${suffix}.fastq"
 
@@ -89,7 +89,7 @@ UPLOAD_LIST_INPUT="/mnt/nvme/${BASENAME_WITH_LANE}_upload_list_input.txt"
 mkdir -p "$(dirname "$UPLOAD_LIST_INPUT")"
 > "$UPLOAD_LIST_INPUT"
 
-find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" | while read r1_file; do
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R1_BASE}_p*.fastq" | while read r1_file; do
  suffix=$(basename "$r1_file" | grep -oP '_p\d+')
  r2_file="/mnt/nvme/${R2_BASE}${suffix}.fastq"
 
@@ -120,14 +120,14 @@ echo "Cleaning up local files..."
 rm -f "$R1_LOCAL_PATH" "$R2_LOCAL_PATH"
 
 # Delete R1 and R2 split files
-find /mnt/nvme/ -type f -name "${R1_BASE}_p*.fastq" -exec rm -f {} +
-find /mnt/nvme/ -type f -name "${R2_BASE}_p*.fastq" -exec rm -f {} +
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R1_BASE}_p*.fastq" -exec rm -f {} +
+find /mnt/nvme/ -maxdepth 1 -type f -name "${R2_BASE}_p*.fastq" -exec rm -f {} +
 
 # Remove leading directory from BASENAME_WITH_LANE to match actual filenames
 BASENAME_CLEANED=$(basename "$BASENAME_WITH_LANE")
 
 # Delete input.txt files
-find /mnt/nvme/ -type f -name "${BASENAME_CLEANED}_p*_input.txt" -exec rm -f {} +
+find /mnt/nvme/ -maxdepth 1 -type f -name "${BASENAME_CLEANED}_p*_input.txt" -exec rm -f {} +
 
 # Delete upload list files
 rm -f "$UPLOAD_LIST_R1R2" "$UPLOAD_LIST_INPUT"
