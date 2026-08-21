@@ -2,13 +2,9 @@
 ################################################################################
 # build_seed_ami.sh
 #
-# MAINTAINER-ONLY TOOL — DO NOT RUN
-#
-# This script documents how the public seed AMI (ami-079f71ff8e580ef1f) was
-# created. It is kept in the repository for reproducibility and transparency
-# so reviewers can see exactly how the AMI was built. The AMI is already
-# public in us-east-2 and hardcoded in e2e_serverless_pbmc.sh — there is no
-# need to rebuild it.
+# Maintainer tool for creating the seed AMI. It defaults to a 20 GiB gp3 root,
+# streams archives over SSH instead of staging duplicate copies on EBS, and
+# creates a private AMI. Publishing is a separate, explicitly confirmed mode.
 #
 # What the seed AMI contains:
 #   /opt/scrna-seed/index_output_transcriptome/   (187 MB, 6 piscem index files)
@@ -22,16 +18,19 @@
 #
 # How the AMI was built (steps performed by this script):
 #   1. Launch a fresh Ubuntu 22.04 EC2 instance
-#   2. Upload pre-built piscem index and reference data (from local tar files)
-#   3. Extract to /opt/scrna-seed/ and validate checksums
+#   2. Stream and extract pre-built piscem index and reference data
+#   3. Validate /opt/scrna-seed/ and clean transient builder state
 #   4. Create an AMI snapshot from the instance
-#   5. Disable "Block Public Access for AMIs" (AWS account-level setting)
-#   6. Make the AMI and its EBS snapshot public so any AWS account can use it
+#   5. Optionally, with explicit confirmation, disable the account-level AMI
+#      public-access block and publish the AMI and its EBS snapshot
 #   7. Terminate the build instance
 #
 ################################################################################
 
 set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+AMI_CLEANUP_SCRIPT="$SCRIPT_DIR/cleanup_instance_for_ami.sh"
 
 ################################################################################
 # Configuration and validation
@@ -48,15 +47,31 @@ set -euo pipefail
 : "${REFERENCE_TAR:?ERROR: REFERENCE_TAR must be set (path to reference tar.gz)}"
 
 # Optional with defaults
-SEED_EBS_GB="${SEED_EBS_GB:-120}"
+SEED_EBS_GB="${SEED_EBS_GB:-20}"
+MIN_FREE_GB="${MIN_FREE_GB:-3}"
 UBUNTU_AMI_ID="${UBUNTU_AMI_ID:-}"
-MAKE_PUBLIC="${MAKE_PUBLIC:-1}"
+MAKE_PUBLIC="${MAKE_PUBLIC:-0}"
+CONFIRM_PUBLIC_AMI="${CONFIRM_PUBLIC_AMI:-0}"
 AMI_NAME_PREFIX="${AMI_NAME_PREFIX:-scrna-seed}"
 SSH_MAX_ATTEMPTS="${SSH_MAX_ATTEMPTS:-90}"
 SSH_SLEEP_SECONDS="${SSH_SLEEP_SECONDS:-10}"
 KEEP_INSTANCE_ON_EXIT="${KEEP_INSTANCE_ON_EXIT:-0}"
 AMI_WAIT_MAX_ATTEMPTS="${AMI_WAIT_MAX_ATTEMPTS:-240}"
 AMI_WAIT_DELAY="${AMI_WAIT_DELAY:-15}"
+
+for integer_setting in SEED_EBS_GB MIN_FREE_GB SSH_MAX_ATTEMPTS \
+    SSH_SLEEP_SECONDS AMI_WAIT_MAX_ATTEMPTS AMI_WAIT_DELAY; do
+    [[ "${!integer_setting}" =~ ^[1-9][0-9]*$ ]] || {
+        echo "FAIL: ${integer_setting} must be a positive integer"
+        exit 1
+    }
+done
+[[ "$MAKE_PUBLIC" =~ ^[01]$ ]] || { echo "FAIL: MAKE_PUBLIC must be 0 or 1"; exit 1; }
+[[ "$CONFIRM_PUBLIC_AMI" =~ ^[01]$ ]] || { echo "FAIL: CONFIRM_PUBLIC_AMI must be 0 or 1"; exit 1; }
+if [[ "$MAKE_PUBLIC" -eq 1 && "$CONFIRM_PUBLIC_AMI" -ne 1 ]]; then
+    echo "FAIL: publishing changes an account-level safety setting; set CONFIRM_PUBLIC_AMI=1 to confirm"
+    exit 1
+fi
 
 # Validate required files exist
 if [[ ! -f "${KEY_PEM_PATH}" ]]; then
@@ -74,6 +89,11 @@ if [[ ! -f "${REFERENCE_TAR}" ]]; then
     exit 1
 fi
 
+if [[ ! -r "${AMI_CLEANUP_SCRIPT}" ]]; then
+    echo "FAIL: AMI cleanup script is missing: ${AMI_CLEANUP_SCRIPT}"
+    exit 1
+fi
+
 # Generate timestamp for unique resource names
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 INSTANCE_NAME="seed-ami-builder-${TIMESTAMP}"
@@ -86,7 +106,8 @@ echo "AWS Region:         ${AWS_REGION}"
 echo "AWS Account:        ${AWS_ACCOUNT_ID}"
 echo "Subnet:             ${SUBNET_ID}"
 echo "Security Group:     ${SECURITY_GROUP_ID}"
-echo "EBS Size:           ${SEED_EBS_GB} GB"
+echo "EBS Size:           ${SEED_EBS_GB} GiB"
+echo "Required free space: ${MIN_FREE_GB} GiB"
 echo "Instance Name:      ${INSTANCE_NAME}"
 echo "Target AMI Name:    ${AMI_NAME}"
 echo "Make Public:        ${MAKE_PUBLIC}"
@@ -237,6 +258,25 @@ if [[ -z "${UBUNTU_AMI_ID}" ]]; then
     echo "Found Ubuntu AMI: ${UBUNTU_AMI_ID}"
 fi
 
+UBUNTU_ROOT_DEVICE=$(aws ec2 describe-images \
+    --region "${AWS_REGION}" \
+    --image-ids "${UBUNTU_AMI_ID}" \
+    --query 'Images[0].RootDeviceName' \
+    --output text)
+UBUNTU_ROOT_GB=$(aws ec2 describe-images \
+    --region "${AWS_REGION}" \
+    --image-ids "${UBUNTU_AMI_ID}" \
+    --query "Images[0].BlockDeviceMappings[?DeviceName=='${UBUNTU_ROOT_DEVICE}'].Ebs.VolumeSize | [0]" \
+    --output text)
+[[ "$UBUNTU_ROOT_GB" =~ ^[1-9][0-9]*$ ]] || {
+    echo "FAIL: Could not determine Ubuntu AMI root snapshot size"
+    exit 1
+}
+if (( SEED_EBS_GB < UBUNTU_ROOT_GB )); then
+    echo "FAIL: SEED_EBS_GB=${SEED_EBS_GB} is below the Ubuntu AMI minimum of ${UBUNTU_ROOT_GB} GiB"
+    exit 1
+fi
+
 ################################################################################
 # Launch EC2 instance
 ################################################################################
@@ -252,7 +292,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
     --instance-type t3.xlarge \
     --key-name "${KEY_NAME}" \
     --network-interfaces "DeviceIndex=0,SubnetId=${SUBNET_ID},Groups=${SECURITY_GROUP_ID},AssociatePublicIpAddress=true" \
-    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":${SEED_EBS_GB},\"VolumeType\":\"gp3\"}}]" \
+    --block-device-mappings "[{\"DeviceName\":\"${UBUNTU_ROOT_DEVICE}\",\"Ebs\":{\"VolumeSize\":${SEED_EBS_GB},\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=${INSTANCE_NAME}}]" \
     --query 'Instances[0].InstanceId' \
     --output text)
@@ -386,43 +426,41 @@ if [[ ${SSH_READY} -eq 0 ]]; then
 fi
 
 ################################################################################
-# Upload tar files
+# Stream and extract tar files
 ################################################################################
 
 echo ""
 echo "========================================================================"
-echo "Step 3: Uploading reference data..."
+echo "Step 3: Streaming and extracting reference data..."
 echo "========================================================================"
 
-echo "Uploading INDEX_TAR ($(du -h "${INDEX_TAR}" | cut -f1))..."
-scp -i "${KEY_PEM_PATH}" \
+ssh -i "${KEY_PEM_PATH}" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=120 \
-    "${INDEX_TAR}" \
-    "ubuntu@${INSTANCE_IP}:/tmp/index.tar.gz"
+    "ubuntu@${INSTANCE_IP}" \
+    "sudo rm -rf /opt/scrna-seed && sudo mkdir -p /opt/scrna-seed/.index-staging /opt/scrna-seed/.reference-staging"
 
-echo "Uploading REFERENCE_TAR ($(du -h "${REFERENCE_TAR}" | cut -f1))..."
-scp -i "${KEY_PEM_PATH}" \
+echo "Streaming INDEX_TAR ($(du -h "${INDEX_TAR}" | cut -f1)) directly into EBS..."
+ssh -i "${KEY_PEM_PATH}" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=120 \
-    "${REFERENCE_TAR}" \
-    "ubuntu@${INSTANCE_IP}:/tmp/reference.tar.gz"
+    "ubuntu@${INSTANCE_IP}" \
+    "sudo tar -xzf - -C /opt/scrna-seed/.index-staging" < "${INDEX_TAR}"
 
-echo "Upload complete."
+echo "Streaming REFERENCE_TAR ($(du -h "${REFERENCE_TAR}" | cut -f1)) directly into EBS..."
+ssh -i "${KEY_PEM_PATH}" \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=120 \
+    "ubuntu@${INSTANCE_IP}" \
+    "sudo tar -xzf - -C /opt/scrna-seed/.reference-staging" < "${REFERENCE_TAR}"
 
-################################################################################
-# Extract and organize data on instance
-################################################################################
-
-echo ""
-echo "========================================================================"
-echo "Step 4: Extracting and organizing data..."
-echo "========================================================================"
-
+echo "Organizing extracted data..."
 ssh -i "${KEY_PEM_PATH}" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
@@ -431,14 +469,8 @@ ssh -i "${KEY_PEM_PATH}" \
     "ubuntu@${INSTANCE_IP}" bash <<'EOF'
 set -euo pipefail
 
-echo "Creating /opt/scrna-seed directory..."
-sudo mkdir -p /opt/scrna-seed
-sudo rm -rf /opt/scrna-seed/index_output_transcriptome /opt/scrna-seed/reference
-
 # ---- INDEX TAR ----
-echo "Extracting index_output_transcriptome..."
-idx_tmp=$(mktemp -d)
-tar -xzf /tmp/index.tar.gz -C "$idx_tmp"
+idx_tmp=/opt/scrna-seed/.index-staging
 if [[ -d "$idx_tmp/index_output_transcriptome" ]]; then
   echo "  Found index_output_transcriptome/ folder in archive"
   sudo mv "$idx_tmp/index_output_transcriptome" /opt/scrna-seed/
@@ -448,12 +480,10 @@ else
   shopt -s dotglob nullglob
   sudo mv "$idx_tmp"/* /opt/scrna-seed/index_output_transcriptome/
 fi
-rm -rf "$idx_tmp"
+sudo rm -rf "$idx_tmp"
 
 # ---- REFERENCE TAR ----
-echo "Extracting reference..."
-ref_tmp=$(mktemp -d)
-tar -xzf /tmp/reference.tar.gz -C "$ref_tmp"
+ref_tmp=/opt/scrna-seed/.reference-staging
 if [[ -d "$ref_tmp/reference" ]]; then
   echo "  Found reference/ folder in archive"
   sudo mv "$ref_tmp/reference" /opt/scrna-seed/
@@ -463,18 +493,14 @@ else
   shopt -s dotglob nullglob
   sudo mv "$ref_tmp"/* /opt/scrna-seed/reference/
 fi
-rm -rf "$ref_tmp"
+sudo rm -rf "$ref_tmp"
 
 # Set permissions and show structure
 sudo chmod -R a+rX /opt/scrna-seed
 sudo ls -lah /opt/scrna-seed
 sudo du -sh /opt/scrna-seed/index_output_transcriptome /opt/scrna-seed/reference
 
-# Clean up tar files
-echo "Cleaning up temporary files..."
-rm -f /tmp/index.tar.gz /tmp/reference.tar.gz
-
-echo "Extraction complete."
+echo "Streaming extraction complete."
 EOF
 
 ################################################################################
@@ -483,7 +509,7 @@ EOF
 
 echo ""
 echo "========================================================================"
-echo "Step 5: Validating extracted data..."
+echo "Step 4: Validating extracted data..."
 echo "========================================================================"
 
 ssh -i "${KEY_PEM_PATH}" \
@@ -539,6 +565,24 @@ echo "PASS: All data validated successfully."
 EOF
 
 ################################################################################
+# Remove builder-only state and enforce root-volume headroom
+################################################################################
+
+echo ""
+echo "========================================================================"
+echo "Step 5: Cleaning builder state and checking free space..."
+echo "========================================================================"
+
+ssh -i "${KEY_PEM_PATH}" \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=120 \
+    "ubuntu@${INSTANCE_IP}" \
+    "sudo bash -s -- --yes --min-free-gib ${MIN_FREE_GB}" \
+    < "${AMI_CLEANUP_SCRIPT}"
+
+################################################################################
 # Create AMI
 ################################################################################
 
@@ -552,6 +596,7 @@ AMI_ID=$(aws ec2 create-image \
     --instance-id "${INSTANCE_ID}" \
     --name "${AMI_NAME}" \
     --description "Seed AMI for scRNA-serverless pipeline with pre-installed reference data" \
+    --no-reboot \
     --region "${AWS_REGION}" \
     --tag-specifications "ResourceType=image,Tags=[{Key=Name,Value=${AMI_NAME}},{Key=Purpose,Value=scRNA-serverless-seed}]" \
     --query 'ImageId' \
