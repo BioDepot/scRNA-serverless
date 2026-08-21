@@ -1934,6 +1934,11 @@ fi
 if ! need_cmd aws; then
     if [[ $RUN_MODE -eq 1 ]]; then
         log_info "AWS CLI v2 not found — installing..."
+        if ! command -v unzip >/dev/null 2>&1; then
+            log_info "Installing the small unzip bootstrap dependency..."
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip
+        fi
         curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
         (cd /tmp && unzip -qo awscliv2.zip && sudo ./aws/install --update 2>&1) >&2
         rm -rf /tmp/awscliv2.zip /tmp/aws
@@ -1992,10 +1997,18 @@ if [[ $RUN_MODE -eq 0 ]]; then
     if [[ -z "$EC2_INSTANCE_PROFILE_NAME" ]]; then
         die "EC2_INSTANCE_PROFILE_NAME must be set for driver mode."
     fi
-    if ! aws iam get-instance-profile --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
+    profile_check_err=$(mktemp)
+    if aws iam get-instance-profile \
+        --instance-profile-name "$EC2_INSTANCE_PROFILE_NAME" \
+        >/dev/null 2>"$profile_check_err"; then
+        log_info "Instance profile verified: $EC2_INSTANCE_PROFILE_NAME"
+    elif grep -qE 'AccessDenied|UnauthorizedOperation' "$profile_check_err"; then
+        log_warn "Caller cannot inspect IAM instance profiles; EC2 launch will validate '$EC2_INSTANCE_PROFILE_NAME'"
+    else
+        rm -f "$profile_check_err"
         die "Instance profile '$EC2_INSTANCE_PROFILE_NAME' not found in IAM."
     fi
-    log_info "Instance profile verified: $EC2_INSTANCE_PROFILE_NAME"
+    rm -f "$profile_check_err"
 
     # Keypair (when SSH may be used)
     if [[ "$USE_SSM" != "1" ]]; then
@@ -2548,7 +2561,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
     # few runs have accumulated, which is enough to break the upload.
     tar --exclude='serverless_runs' --exclude='onserver_runs' --exclude='runs' \
         --exclude='standalone_runs' --exclude='benchmark_results' \
-        --exclude='data' --exclude='tools' \
+        --exclude='data' \
         --exclude='.git' --exclude='*.log' --exclude='scrna-repo-*.tar.gz' \
         --exclude='MASTER_PROMPT.md' --exclude='.vscode' --exclude='.idea' \
         -czf "$TARBALL_LOCAL" -C "$(dirname "$REPO_DIR")" "$(basename "$REPO_DIR")"
