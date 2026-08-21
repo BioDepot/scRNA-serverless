@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-# Reproduce one PBMC 10K local Piscem baseline and one optimized asynchronous
-# serverless run from the four R1/R2 gzip files already on NVMe.  The serverless
-# clock begins immediately before the first rapidgzip worker starts and ends
-# after the final RAD has been materialized from S3.
+# Reproduce one PBMC local Piscem baseline and one optimized asynchronous
+# serverless run from the four R1/R2 gzip files already on NVMe. DATASET may be
+# pbmc1k or pbmc10k (the historical default). The serverless clock begins
+# immediately before the first rapidgzip worker starts and ends after the final
+# RAD has been materialized from S3.
 
 set -euo pipefail
 
@@ -15,6 +16,7 @@ Usage:
   benchmark_pbmc10k_async.sh --finish-async
 
 Options are selected with environment variables:
+  DATASET            pbmc1k or pbmc10k (default: pbmc10k).
   BENCHMARK_ID       Unique evidence name (default: UTC timestamp).
   RESULTS_ROOT       Evidence parent (default: /mnt/nvme/benchmark-runs).
   FASTQ_DIR          PBMC 10K FASTQ directory on NVMe.
@@ -77,18 +79,40 @@ case "$ACTION" in
 esac
 
 AWS_REGION="${AWS_REGION:-us-east-2}"
-FASTQ_DIR="${FASTQ_DIR:-/mnt/nvme/datasets/pbmc10k/pbmc_10k_v3_fastqs}"
+DATASET="${DATASET:-pbmc10k}"
+case "$DATASET" in
+    pbmc1k)
+        DATASET_LABEL="PBMC 1K"
+        DATASET_STEM="pbmc_1k_v3"
+        ASYNC_PREFIX="p1k"
+        DEFAULT_FASTQ_DIR="/mnt/nvme/datasets/pbmc1k/pbmc_1k_v3_fastqs"
+        L001_READS=33436697
+        L002_READS=33165190
+        ;;
+    pbmc10k)
+        DATASET_LABEL="PBMC 10K"
+        DATASET_STEM="pbmc_10k_v3"
+        ASYNC_PREFIX="p10k"
+        DEFAULT_FASTQ_DIR="/mnt/nvme/datasets/pbmc10k/pbmc_10k_v3_fastqs"
+        L001_READS=320936855
+        L002_READS=317964164
+        ;;
+    *)
+        die "DATASET must be pbmc1k or pbmc10k: $DATASET"
+        ;;
+esac
+FASTQ_DIR="${FASTQ_DIR:-$DEFAULT_FASTQ_DIR}"
 PISCEM_BIN="${PISCEM_BIN:-/mnt/nvme/benchmark-runs/piscem-cloud-profile.um6E5m/piscem-x86_64-unknown-linux-gnu/piscem}"
 INDEX_PREFIX="${INDEX_PREFIX:-/mnt/nvme/benchmark-runs/piscem-cloud-profile.um6E5m/index_output_transcriptome/index_output_transcriptome}"
 RADTK_BIN="${RADTK_BIN:-/usr/local/bin/radtk}"
 RESULTS_ROOT="${RESULTS_ROOT:-/mnt/nvme/benchmark-runs}"
-BENCHMARK_ID="${BENCHMARK_ID:-pbmc10k-$(date -u +%Y%m%d-%H%M%S)}"
+BENCHMARK_ID="${BENCHMARK_ID:-${DATASET}-$(date -u +%Y%m%d-%H%M%S)}"
 BENCHMARK_DIR="${RESULTS_ROOT}/${BENCHMARK_ID}"
 BASELINE_DIR="${BENCHMARK_DIR}/baseline-piscem-32t"
 ASYNC_DIR="${BENCHMARK_DIR}/async-serverless"
 BENCHMARK_TOKEN=$(printf '%s' "$BENCHMARK_ID" | tr '[:upper:]_' '[:lower:]-' | \
-    sed -E 's/^pbmc10k-//; s/[^a-z0-9-]//g')
-ASYNC_RUN_ID="${ASYNC_RUN_ID:-p10k-${BENCHMARK_TOKEN:0:20}}"
+    sed -E "s/^${DATASET}-//; s/[^a-z0-9-]//g")
+ASYNC_RUN_ID="${ASYNC_RUN_ID:-${ASYNC_PREFIX}-${BENCHMARK_TOKEN:0:20}}"
 ASYNC_RUN_DIR="/mnt/nvme/runs/${ASYNC_RUN_ID}"
 ASYNC_STATE_FILE="${ASYNC_RUN_DIR}/async_state.env"
 
@@ -97,20 +121,18 @@ MATERIALIZER_THREADS=32
 DECOMP_THREADS=8
 READS_PER_SHARD=4000000
 SPLIT_LINES=$((READS_PER_SHARD * 4))
-L001_READS=320936855
-L002_READS=317964164
 EXPECTED_TOTAL_READS=$((L001_READS + L002_READS))
 EXPECTED_L001_SHARDS=$(ceil_div "$L001_READS" "$READS_PER_SHARD")
 EXPECTED_L002_SHARDS=$(ceil_div "$L002_READS" "$READS_PER_SHARD")
 EXPECTED_SHARDS=$((EXPECTED_L001_SHARDS + EXPECTED_L002_SHARDS))
 
 R1_FILES=(
-    "${FASTQ_DIR}/pbmc_10k_v3_S1_L001_R1_001.fastq.gz"
-    "${FASTQ_DIR}/pbmc_10k_v3_S1_L002_R1_001.fastq.gz"
+    "${FASTQ_DIR}/${DATASET_STEM}_S1_L001_R1_001.fastq.gz"
+    "${FASTQ_DIR}/${DATASET_STEM}_S1_L002_R1_001.fastq.gz"
 )
 R2_FILES=(
-    "${FASTQ_DIR}/pbmc_10k_v3_S1_L001_R2_001.fastq.gz"
-    "${FASTQ_DIR}/pbmc_10k_v3_S1_L002_R2_001.fastq.gz"
+    "${FASTQ_DIR}/${DATASET_STEM}_S1_L001_R2_001.fastq.gz"
+    "${FASTQ_DIR}/${DATASET_STEM}_S1_L002_R2_001.fastq.gz"
 )
 R1_COMMA=$(IFS=,; echo "${R1_FILES[*]}")
 R2_COMMA=$(IFS=,; echo "${R2_FILES[*]}")
@@ -138,14 +160,20 @@ preflight() {
     aws sts get-caller-identity --region "$AWS_REGION" >/dev/null
 
     cores=$(nproc)
-    (( cores >= THREADS )) || die "PBMC 10K benchmark requires at least $THREADS cores; found $cores"
-    [[ "$EXPECTED_TOTAL_READS" -eq 638901019 ]] || die "internal read-count contract is inconsistent"
-    [[ "$EXPECTED_L001_SHARDS" -eq 81 && "$EXPECTED_L002_SHARDS" -eq 80 ]] || \
-        die "derived shard contract is inconsistent"
+    (( cores >= THREADS )) || die "$DATASET_LABEL benchmark requires at least $THREADS cores; found $cores"
+    if [[ "$DATASET" == "pbmc1k" ]]; then
+        [[ "$EXPECTED_TOTAL_READS" -eq 66601887 ]] || die "internal read-count contract is inconsistent"
+        [[ "$EXPECTED_L001_SHARDS" -eq 9 && "$EXPECTED_L002_SHARDS" -eq 9 ]] || \
+            die "derived shard contract is inconsistent"
+    else
+        [[ "$EXPECTED_TOTAL_READS" -eq 638901019 ]] || die "internal read-count contract is inconsistent"
+        [[ "$EXPECTED_L001_SHARDS" -eq 81 && "$EXPECTED_L002_SHARDS" -eq 80 ]] || \
+            die "derived shard contract is inconsistent"
+    fi
     [[ "$ASYNC_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{0,27}$ ]] || \
         die "ASYNC_RUN_ID must be lowercase, S3-safe, and at most 28 characters: $ASYNC_RUN_ID"
 
-    log "PBMC 10K inputs: 2 lane pairs / 4 R1-R2 gzip files (I1 excluded)"
+    log "$DATASET_LABEL inputs: 2 lane pairs / 4 R1-R2 gzip files (I1 excluded)"
     log "Read contract: L001=$L001_READS, L002=$L002_READS, total=$EXPECTED_TOTAL_READS"
     log "Shard plan: $READS_PER_SHARD reads ($SPLIT_LINES FASTQ lines), derived $EXPECTED_L001_SHARDS+$EXPECTED_L002_SHARDS=$EXPECTED_SHARDS manifests"
     log "Decompression plan: 4 files on $cores cores -> rapidgzip -P $DECOMP_THREADS per file; lanes are not concatenated"
@@ -155,7 +183,7 @@ preflight() {
 record_inputs() {
     mkdir -p "$BENCHMARK_DIR"
     {
-        printf 'dataset\tpbmc10k\n'
+        printf 'dataset\t%s\n' "$DATASET"
         printf 'fastq_dir\t%s\n' "$FASTQ_DIR"
         printf 'r1r2_files\t4\n'
         printf 'l001_reads\t%s\n' "$L001_READS"
@@ -266,7 +294,7 @@ submit_async() {
         export CLEANUP_RESULTS=0
         export DELETE_CLOUDWATCH_LOGS=0
         export SKIP_PREFLIGHT_CLEANUP=1
-        bash "$REPO_ROOT/scripts/e2e_serverless_pbmc.sh" pbmc10k --run
+        bash "$REPO_ROOT/scripts/e2e_serverless_pbmc.sh" "$DATASET" --run
     ) 2>&1 | tee "$ASYNC_DIR/submit.log"
     rc=${PIPESTATUS[0]}
     set -e
@@ -350,7 +378,7 @@ write_summary() {
             'BEGIN { printf "%.6f %.6f %.4f\n", baseline-async, baseline/async, 100*(baseline-async)/baseline }'
     )
     cat > "$BENCHMARK_DIR/RESULTS.md" <<EOF
-# PBMC 10K local versus asynchronous serverless benchmark
+# ${DATASET_LABEL} local versus asynchronous serverless benchmark
 
 - Local Piscem baseline (32 threads): **${baseline_seconds} seconds**
 - Async serverless, first rapidgzip start through final RAD: **${async_seconds} seconds**
