@@ -21,7 +21,10 @@ The pipeline launches an EC2 instance from a pre-built AMI, maps reads in parall
 
 **EC2 instance:** The script launches **m5dn.8xlarge** (32 vCPU, two NVMe disks). That is the machine used for the completed 1K, 10K, and KO runs. You do not launch the instance yourself. If that type is unavailable, the script tries smaller types. See [Reproducibility Notes](REPRODUCIBILITY_NOTES.md).
 
-**Storage:** The script creates a 500 GB EBS root volume (matching the paper). A 500 GB volume for a 15-minute run costs ~$0.03-$0.05. Override with `export ROOT_VOL_GB=50` for PBMC 1K.
+**Storage:** The script requests a 20 GiB gp3 root and puts FASTQs,
+intermediates, and container layers on instance-store NVMe. The request is
+raised automatically when an older seed AMI has a larger root snapshot; the
+current public AMI therefore uses 30 GiB. See [Minimal AMI and NVMe Setup](MINIMAL_AMI_AND_NVME.md).
 
 **Local disk space:** Keep at least **5 GB free** (PBMC 1K) or **30 GB free** (PBMC 10K) on the drive where you cloned this repository. The script creates a temporary file during setup and downloads results to `serverless_runs/`.
 
@@ -184,7 +187,7 @@ The log is saved automatically to `serverless_runs/<RUN_ID>.log`.
 
 1. Launches an EC2 instance from the public seed AMI
 2. Uploads the repository code to the instance
-3. If two or more NVMe instance-store disks are present, stripes them as RAID 0 at `/mnt/nvme`
+3. Safely discovers instance-store NVMe, stripes two or more disks as RAID 0 at `/mnt/nvme`, and puts container storage there
 4. Builds a Docker image with piscem + reference index, pushes to ECR
 5. Creates S3 buckets, Lambda function, and EventBridge rule
 6. Downloads FASTQs. Split and Upload uses rapidgzip `-P 8` per stream and only as many lanes at once as fit on the box
@@ -278,7 +281,7 @@ separate status/materialization controller, see
 |---|---|
 | Lambda memory quota too low | Falls back to 3,008 MB automatically |
 | EC2 vCPU quota too low | Falls through instance chain automatically |
-| No NVMe storage | Uses EBS root volume |
+| No NVMe storage | Fails explicitly instead of filling the small EBS root |
 | Two or more NVMe disks | RAID 0 at `/mnt/nvme` |
 | SSH blocked | Falls back to SSM automatically |
 | Lambda shard dies mid-map | Stops polling after timeout + 3 min with no new `output.txt` |
@@ -292,17 +295,17 @@ For details on automatic fallbacks (instance types, memory, threads, splitting),
 
 Edit `scripts/e2e_serverless_pbmc.sh` to change defaults:
 
-| Setting | Line | Default | Effect |
-|---|---|---|---|
-| `DEFAULT_SEED_AMI_ID` | 219 | `ami-079f71ff8e580ef1f` | Seed AMI |
-| `DEFAULT_AWS_REGION` | 215 | `us-east-2` | Region |
-| `INSTANCE_TYPE` | 241 | `m5dn.8xlarge` | EC2 type |
-| `ROOT_VOL_GB` | 235 | `500` | EBS size (GB) |
-| `LAMBDA_MEMORY_MB` | 248 | `10240` | Lambda RAM |
-| `LAMBDA_TIMEOUT_SEC` | 250 | `900` | Lambda timeout |
-| `RUN_QC` | 258 | `1` | QC on/off |
-| `WRITE_H5AD` | 265 | `1` | h5ad on/off |
-| `LOCAL_RESULTS_DIR` | 260 | `./serverless_runs` | Output dir |
+| Setting | Default | Effect |
+|---|---|---|
+| `DEFAULT_SEED_AMI_ID` | `ami-079f71ff8e580ef1f` | Seed AMI |
+| `DEFAULT_AWS_REGION` | `us-east-2` | Region |
+| `INSTANCE_TYPE` | `m5dn.8xlarge` | EC2 type |
+| `ROOT_VOL_GB` | `20` | Requested EBS size in GiB; raised to AMI minimum |
+| `LAMBDA_MEMORY_MB` | `10240` | Lambda RAM |
+| `LAMBDA_TIMEOUT_SEC` | `900` | Lambda timeout |
+| `RUN_QC` | `1` | QC on/off |
+| `WRITE_H5AD` | `1` | h5ad on/off |
+| `LOCAL_RESULTS_DIR` | `./serverless_runs` | Output dir |
 
 ---
 
@@ -355,7 +358,8 @@ aws ec2 describe-security-groups \
 | S3 + ECR | <$0.01 | <$0.01 |
 | **Total** | **~$0.35** | **~$1.00** |
 
-With `t3.xlarge`: EC2 drops to ~$0.01-$0.03 for PBMC 1K.
+These benchmark estimates use the NVMe-backed production instance. EBS-only
+instance types are not valid fallbacks for the small-root configuration.
 
 ---
 

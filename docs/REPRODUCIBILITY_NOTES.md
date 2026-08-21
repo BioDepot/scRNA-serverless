@@ -31,20 +31,23 @@ The script uses **m5dn.8xlarge** (32 vCPU, 128 GB RAM, two NVMe disks). That is 
 | m6id.8xlarge | 32 | 128 GB | NVMe |
 | m6id.4xlarge | 16 | 64 GB | |
 | m6id.xlarge | 4 | 16 GB | |
-| m6i.xlarge | 4 | 16 GB | EBS only, no NVMe |
-| t3.2xlarge | 8 | 32 GB | |
-| t3.xlarge | 4 | 16 GB | Min for PBMC 10K |
-| t3.large | 2 | 8 GB | Min for PBMC 1K |
 
 To use the paper's m6id.16xlarge instead: `export INSTANCE_TYPE=m6id.16xlarge`
 
-### EBS root volume: 500 GB (unchanged)
+### EBS root volume: 20 GiB requested
 
-The script defaults to **500 GB**, matching the paper. On m5dn.8xlarge, FASTQs and intermediates go on the RAID 0 NVMe, so the EBS root is lightly used. Override with `export ROOT_VOL_GB=50` for PBMC 1K to save costs.
+The script requests a **20 GiB** gp3 root because FASTQs, container layers, and
+intermediates go on RAID 0 NVMe. EBS snapshots cannot be restored to a smaller
+volume, so the request is automatically raised to the selected AMI's root
+snapshot size. The existing public seed AMI therefore launches with 30 GiB;
+a seed AMI built with `scripts/build_seed_ami.sh` launches with 20 GiB.
 
-### NVMe storage fallback
+### NVMe storage requirement
 
-m5dn.8xlarge has two instance-store NVMe disks. The script stripes them as RAID 0 at `/mnt/nvme`. If the instance has no NVMe (m6i, t3), it uses the EBS root volume.
+m5dn.8xlarge has two instance-store NVMe disks. The script safely discovers
+only EC2 instance-store devices, stripes them as RAID 0 at `/mnt/nvme`, and
+places Docker/containerd storage there. EBS-only fallback types are excluded;
+the driver fails rather than filling the intentionally small root volume.
 
 ### Configuration summary
 
@@ -57,8 +60,8 @@ m5dn.8xlarge has two instance-store NVMe disks. The script stripes them as RAID 
 | Split threshold | 7 GB | 2 GB | 0 GB (at 3,008 MB — forces splitting) |
 | Split chunk size | 16M lines / 4M reads | 16M lines / 4M reads | *(unchanged)* |
 | EC2 driver instance | m6id.16xlarge | m5dn.8xlarge | Falls through smaller instances |
-| EBS root volume | 500 GB | 500 GB | *(unchanged)* |
-| NVMe storage | Available (m6id) | RAID 0 when 2+ disks | EBS root volume (m6i/t3 families) |
+| EBS root volume | 500 GB | 20 GiB requested | Raised to the AMI snapshot minimum |
+| NVMe storage | Available (m6id) | RAID 0 when 2+ disks | Tries another NVMe instance type |
 | Split decompression | zcat | rapidgzip `-P 8` | zcat if rapidgzip is missing |
 | Split lane concurrency | all lanes at once | `nproc / (8 * 2)` | 1 lane if the box is small |
 | Lambda timeout | 900 s | 900 s | Stops polling after 900s + 3 min with no new output |
@@ -72,7 +75,7 @@ The script creates a temporary tarball (~200 MB) in the repo directory during se
 | PBMC 1K | ~200 MB | ~1 GB | ~5 GB |
 | PBMC 10K | ~200 MB | ~9 GB | ~30 GB |
 
-The FASTQs and intermediate files stay on the EC2 instance (500 GB EBS). Only the final count matrix, QC plots, and merged .rad file are downloaded locally.
+The FASTQs and intermediate files stay on EC2 instance-store NVMe. Only the final count matrix, QC plots, and merged .rad file are downloaded locally.
 
 All other steps (alevin-fry generate-permit-list, collate, quant, resource creation, cleanup) are identical.
 
@@ -137,7 +140,7 @@ bash scripts/e2e_serverless_pbmc.sh <dataset> [--dry-run]
 > aws s3 rb s3://scrna-quant-<ACCOUNT_ID>-us-east-2-<RUN_ID> --force --region us-east-2
 > ```
 | `INSTANCE_TYPE` | `m5dn.8xlarge` | Preferred EC2 type (auto-fallback if quota is too low). |
-| `ROOT_VOL_GB` | `500` | EBS root volume size in GB. |
+| `ROOT_VOL_GB` | `20` | Requested EBS root size in GiB; raised to the AMI snapshot minimum. |
 | `LAMBDA_MEMORY_MB` | `10240` | Lambda memory in MB (falls back to 3008 if quota exceeded). |
 | `LAMBDA_EPHEMERAL_MB` | `10240` | Lambda ephemeral storage in MB. |
 | `LAMBDA_TIMEOUT_SEC` | `900` | Lambda function timeout in seconds. |

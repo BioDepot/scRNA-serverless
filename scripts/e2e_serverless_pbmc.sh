@@ -29,7 +29,8 @@
 #   SEED_AMI_ID            Required in driver mode. AMI with pre-installed reference data.
 #   AWS_REGION             AWS region (default: us-east-2)
 #   INSTANCE_TYPE          EC2 instance type (default: m5dn.8xlarge)
-#   ROOT_VOL_GB            EBS root volume size in GB (default: 500)
+#   ROOT_VOL_GB            Requested EBS root size in GiB (default: 20). It is
+#                          raised to the AMI snapshot minimum when necessary.
 #   KEY_NAME               Required in driver mode when USE_SSM=0. Existing EC2 keypair name.
 #   KEY_PEM_PATH           Required in driver mode when USE_SSM=0. Path to .pem file for SSH.
 #   SUBNET_ID              Required in driver mode. VPC subnet ID.
@@ -284,7 +285,7 @@ AWS_REGION="${AWS_REGION:-$DEFAULT_AWS_REGION}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
 SEED_AMI_ID="${SEED_AMI_ID:-$DEFAULT_SEED_AMI_ID}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-m5dn.8xlarge}"
-ROOT_VOL_GB="${ROOT_VOL_GB:-500}"
+ROOT_VOL_GB="${ROOT_VOL_GB:-20}"
 KEY_NAME="${KEY_NAME:-$DEFAULT_KEY_NAME}"
 KEY_PEM_PATH="${KEY_PEM_PATH:-$DEFAULT_KEY_PEM_PATH}"
 SUBNET_ID="${SUBNET_ID:-}"
@@ -2204,6 +2205,28 @@ if [[ $RUN_MODE -eq 0 ]]; then
     [[ -n "$SUBNET_ID" ]] || die "SUBNET_ID must be set (use AUTO_PICK_SUBNET=1 or set it explicitly)"
     [[ -n "$SG_ID" ]] || die "SG_ID must be set (use AUTO_CREATE_SG=1 or set it explicitly)"
     [[ -n "$EC2_INSTANCE_PROFILE_NAME" ]] || die "EC2_INSTANCE_PROFILE_NAME is required for reviewer-proof execution (no credentials baked into AMI)."
+    [[ "$ROOT_VOL_GB" =~ ^[1-9][0-9]*$ ]] || die "ROOT_VOL_GB must be a positive integer"
+
+    # An EBS volume created from a snapshot cannot be smaller than that
+    # snapshot. Preserve the 20 GiB request for the minimal AMI while keeping
+    # the current 30 GiB public seed AMI launchable without manual overrides.
+    AMI_ROOT_DEVICE=$(aws ec2 describe-images \
+        --region "$AWS_REGION" \
+        --image-ids "$SEED_AMI_ID" \
+        --query 'Images[0].RootDeviceName' \
+        --output text)
+    AMI_ROOT_VOL_GB=$(aws ec2 describe-images \
+        --region "$AWS_REGION" \
+        --image-ids "$SEED_AMI_ID" \
+        --query "Images[0].BlockDeviceMappings[?DeviceName=='${AMI_ROOT_DEVICE}'].Ebs.VolumeSize | [0]" \
+        --output text)
+    [[ "$AMI_ROOT_VOL_GB" =~ ^[1-9][0-9]*$ ]] || \
+        die "Could not determine the root snapshot size for AMI $SEED_AMI_ID"
+    if (( ROOT_VOL_GB < AMI_ROOT_VOL_GB )); then
+        log_warn "ROOT_VOL_GB=$ROOT_VOL_GB is below AMI $SEED_AMI_ID's ${AMI_ROOT_VOL_GB} GiB minimum; using ${AMI_ROOT_VOL_GB} GiB"
+        ROOT_VOL_GB="$AMI_ROOT_VOL_GB"
+    fi
+    log_info "Driver root volume: ${ROOT_VOL_GB} GiB gp3 (pipeline workspace uses instance-store NVMe)"
     
     # Resume logic: check for existing instance
     if [[ -z "$DRIVER_INSTANCE_ID" ]]; then
@@ -2251,15 +2274,16 @@ if [[ $RUN_MODE -eq 0 ]]; then
             KEY_NAME_ARGS=(--key-name "$KEY_NAME")
         fi
         
-        # Instance type fallback: try requested type first, then progressively smaller
-        # alternatives if launch fails due to vCPU quota or capacity issues.
+        # Instance type fallback: try requested type first, then progressively
+        # smaller alternatives with local NVMe. Do not silently fall back to an
+        # EBS-only type: the root is intentionally too small for pipeline data.
         # Default is m5dn.8xlarge (32 vCPU, 2x NVMe). That is the box 1K, 10K,
         # and KO actually completed on with RAID 0, rapidgzip -P 8, and 2 lanes.
         INSTANCE_FALLBACKS=("$INSTANCE_TYPE")
         if [[ "$INSTANCE_TYPE" == "m5dn.8xlarge" ]]; then
-            INSTANCE_FALLBACKS+=("m5dn.4xlarge" "m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "t3.large")
+            INSTANCE_FALLBACKS+=("m5dn.4xlarge" "m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge")
         elif [[ "$INSTANCE_TYPE" == "m6id.16xlarge" ]]; then
-            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge" "m6i.xlarge" "t3.2xlarge" "t3.xlarge" "m7i-flex.large" "t3.large" "c7i-flex.large" "t3.medium" "t3.small" "t3.micro")
+            INSTANCE_FALLBACKS+=("m6id.8xlarge" "m6id.4xlarge" "m6id.xlarge")
         fi
         
         # Build list of subnets to try: auto-picked subnets across AZs, or just the one set
@@ -2284,7 +2308,7 @@ if [[ $RUN_MODE -eq 0 ]]; then
                     --subnet-id "$_try_subnet" \
                     --security-group-ids "$SG_ID" \
                     "${IAM_PROFILE_ARGS[@]}" \
-                    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3}" \
+                    --block-device-mappings "DeviceName=$AMI_ROOT_DEVICE,Ebs={VolumeSize=$ROOT_VOL_GB,VolumeType=gp3,DeleteOnTermination=true}" \
                     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=scrna-e2e-$RUN_ID}]" \
                     --query "Instances[0].InstanceId" \
                     --output text 2>"$_launch_err"); then
@@ -2711,67 +2735,18 @@ fi
 # Initialize resource names now that AWS_ACCOUNT_ID is known
 init_resource_names
 
-# Setup NVMe storage if available
-log_info "Setting up NVMe storage..."
-
+# Setup the ephemeral workspace. Automatic discovery selects only devices whose
+# EC2 model is "Amazon EC2 NVMe Instance Storage", never the EBS root. Container
+# layers are bound to the same workspace so a 20 GiB root does not fill during
+# Lambda image builds.
+log_info "Setting up instance-store NVMe workspace..."
 MOUNT_POINT="/mnt/nvme"
-
-if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-    log_info "$MOUNT_POINT already mounted — reusing"
-else
-    # Collect every unmounted NVMe instance-store device (skip mounted ones, e.g. root EBS on nvme0n1).
-    # Storage layout follows install_scripts/install.sh: RAID 0 across all instance-store
-    # devices, XFS with RAID-aware geometry, and the same mount/scheduler/read-ahead tuning.
-    NVMe_DEVICES=()
-    while read -r dev; do
-        dev_path="/dev/$dev"
-        # Skip if this device (or a partition of it) is already mounted
-        if mount | grep -q "^${dev_path}"; then
-            log_info "Skipping $dev_path (already mounted)"
-            continue
-        fi
-        [[ -b "$dev_path" ]] && NVMe_DEVICES+=("$dev_path")
-    done < <(lsblk -d -n -l -o NAME | grep nvme)
-
-    NVMe_COUNT=${#NVMe_DEVICES[@]}
-    log_info "Unmounted NVMe instance-store devices found: $NVMe_COUNT (${NVMe_DEVICES[*]:-none})"
-
-    if [[ $NVMe_COUNT -gt 0 ]]; then
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm xfsprogs >/dev/null 2>&1 || true
-
-        for d in "${NVMe_DEVICES[@]}"; do
-            sudo wipefs -a "$d" >/dev/null 2>&1 || true
-            base=$(basename "$d")
-            echo "none" | sudo tee "/sys/block/$base/queue/scheduler" >/dev/null 2>&1 || true
-        done
-
-        if [[ $NVMe_COUNT -ge 2 ]]; then
-            log_info "Creating RAID 0 across $NVMe_COUNT devices (256K chunk)..."
-            sudo mdadm --create --verbose /dev/md0 --level=0 \
-                --raid-devices="$NVMe_COUNT" --chunk=256K --run "${NVMe_DEVICES[@]}"
-            NVMe_TARGET="/dev/md0"
-            log_info "Creating XFS on $NVMe_TARGET (su=256k,sw=$NVMe_COUNT)..."
-            sudo mkfs.xfs -f -d "su=256k,sw=$NVMe_COUNT" "$NVMe_TARGET"
-        else
-            NVMe_TARGET="${NVMe_DEVICES[0]}"
-            log_warn "Only one instance-store device present; no RAID 0 possible"
-            log_info "Creating XFS on $NVMe_TARGET..."
-            sudo mkfs.xfs -f "$NVMe_TARGET"
-        fi
-
-        log_info "Mounting $NVMe_TARGET to $MOUNT_POINT..."
-        sudo mkdir -p "$MOUNT_POINT"
-        sudo mount -o noatime,nodiratime,logbufs=8,logbsize=256k,allocsize=64m \
-            "$NVMe_TARGET" "$MOUNT_POINT"
-        sudo blockdev --setra 65536 "$NVMe_TARGET" || true
-        sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
-        log_info "NVMe storage ready: $(df -h "$MOUNT_POINT" | tail -1)"
-    else
-        log_info "No unmounted NVMe device found; using default storage"
-        sudo mkdir -p "$MOUNT_POINT"
-        sudo chown -R ubuntu:ubuntu "$MOUNT_POINT"
-    fi
-fi
+NVME_SETUP_SCRIPT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/setup_instance_store_nvme.sh
+[[ -x "$NVME_SETUP_SCRIPT" ]] || die "NVMe setup script is missing or not executable: $NVME_SETUP_SCRIPT"
+bash "$NVME_SETUP_SCRIPT" \
+    --yes --mount-point "$MOUNT_POINT" --owner "$(id -un):$(id -gn)" \
+    --bind-container-storage --discard-container-cache
+log_info "NVMe workspace ready: $(df -h "$MOUNT_POINT" | tail -1)"
 
 # rapidgzip: parallel gzip decompression for Split and Upload. Falls back to
 # zcat if the install below does not land on PATH.
