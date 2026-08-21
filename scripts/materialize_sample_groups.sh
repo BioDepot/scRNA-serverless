@@ -27,8 +27,11 @@ Options:
   --rad-prefix PREFIX        Prefix above each shard (default: piscem_output).
   --threads N                RAD and companion transfer concurrency (default: 32).
   --poll-seconds N           S3 polling interval (default: 1).
-  --timeout-seconds N        Readiness timeout per sample (default: 43200).
+  --timeout-seconds N        Global readiness timeout (default: 43200).
   --not-before TIME          Ignore output objects older than this time.
+  --readiness-inventory FILE Use a previously captured global readiness
+                             inventory instead of listing S3. If omitted, the
+                             script polls once globally and records one.
   --materializer FILE        s3-rad-materialize executable override.
   --overwrite                Atomically replace existing local outputs.
   --rad-only                 Do not create SAMPLE/unmapped_bc_count.bin.
@@ -64,6 +67,7 @@ THREADS="${MATERIALIZER_THREADS:-32}"
 POLL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 TIMEOUT_SECONDS="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 NOT_BEFORE=""
+READINESS_INVENTORY=""
 MATERIALIZER="${MATERIALIZER:-s3-rad-materialize}"
 OVERWRITE=0
 RAD_ONLY=0
@@ -103,6 +107,9 @@ while [[ $# -gt 0 ]]; do
         --not-before)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             NOT_BEFORE="$2"; shift 2 ;;
+        --readiness-inventory)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            READINESS_INVENTORY="$2"; shift 2 ;;
         --materializer)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             MATERIALIZER="$2"; shift 2 ;;
@@ -123,6 +130,8 @@ done
 [[ -n "$OUTPUT_DIR" ]] || die "--output-dir is required"
 [[ -f "$EXPECTED_FOLDERS_FILE" ]] || die "expected-folder file not found: $EXPECTED_FOLDERS_FILE"
 [[ -f "$SAMPLE_MANIFEST" ]] || die "sample manifest not found: $SAMPLE_MANIFEST"
+[[ -z "$READINESS_INVENTORY" || -f "$READINESS_INVENTORY" ]] || \
+    die "readiness inventory not found: $READINESS_INVENTORY"
 [[ -n "$RAD_PREFIX" ]] || die "--rad-prefix cannot be empty"
 is_positive_integer "$THREADS" || die "--threads must be a positive integer"
 is_positive_integer "$POLL_SECONDS" || die "--poll-seconds must be a positive integer"
@@ -166,6 +175,101 @@ done
 
 AWS_ARGS=(--region "$AWS_REGION_VALUE")
 [[ -n "$AWS_PROFILE_VALUE" ]] && AWS_ARGS+=(--profile "$AWS_PROFILE_VALUE")
+
+wait_for_global_readiness() {
+    local inventory_file="$1" listing key modified relative folder object_epoch object_kind
+    local started_ns started_utc started_epoch now elapsed ready list_calls=0
+    local end_ns end_utc seconds
+    local not_before_epoch="" partial="${inventory_file}.partial.$$"
+    local -A expected=() have_rad=() have_marker=()
+
+    while IFS= read -r folder; do
+        [[ -n "$folder" ]] || continue
+        expected["$folder"]=1
+    done < "$EXPECTED_FOLDERS_FILE"
+    (( ${#expected[@]} > 0 )) || die "expected-folder contract is empty"
+    if [[ -n "$NOT_BEFORE" ]]; then
+        not_before_epoch=$(date -u -d "$NOT_BEFORE" +%s 2>/dev/null) || \
+            die "--not-before is not a valid date: $NOT_BEFORE"
+    fi
+
+    started_ns=$(date +%s%N)
+    started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    started_epoch=$(date +%s)
+    while true; do
+        if ! listing=$(aws s3api list-objects-v2 \
+            --bucket "$OUTPUT_BUCKET" --prefix "${RAD_PREFIX}/" \
+            --query 'Contents[].[Key,LastModified]' --output text \
+            "${AWS_ARGS[@]}" 2>&1); then
+            log "Global S3 readiness listing failed; retrying: $(printf '%s' "$listing" | tail -1)"
+            sleep "$POLL_SECONDS"
+            continue
+        fi
+        list_calls=$((list_calls + 1))
+        have_rad=()
+        have_marker=()
+        while IFS=$'\t' read -r key modified _rest; do
+            [[ -n "${key:-}" && -n "${modified:-}" ]] || continue
+            relative="${key#${RAD_PREFIX}/}"
+            if [[ "$relative" == */map.rad ]]; then
+                folder="${relative%/map.rad}"
+                [[ -n "${expected[$folder]:-}" ]] || continue
+                object_kind=rad
+            elif [[ "$relative" == */output.txt ]]; then
+                folder="${relative%/output.txt}"
+                [[ -n "${expected[$folder]:-}" ]] || continue
+                object_kind=marker
+            else
+                continue
+            fi
+            if [[ -n "$not_before_epoch" ]]; then
+                object_epoch=$(date -u -d "$modified" +%s 2>/dev/null || echo 0)
+                (( object_epoch >= not_before_epoch )) || continue
+            fi
+            if [[ "$object_kind" == rad ]]; then
+                have_rad["$folder"]=1
+            else
+                have_marker["$folder"]=1
+            fi
+        done <<< "$listing"
+
+        ready=0
+        for folder in "${!expected[@]}"; do
+            if [[ -n "${have_rad[$folder]:-}" && -n "${have_marker[$folder]:-}" ]]; then
+                ready=$((ready + 1))
+            fi
+        done
+        log "Global Lambda output progress: $ready/${#expected[@]} (S3 listings=$list_calls)"
+        if (( ready == ${#expected[@]} )); then
+            printf '%s\n' "$listing" > "$partial"
+            mv -f -- "$partial" "$inventory_file"
+            break
+        fi
+        now=$(date +%s)
+        elapsed=$((now - started_epoch))
+        (( elapsed < TIMEOUT_SECONDS )) || \
+            die "timed out after ${elapsed}s waiting for the global Lambda output contract"
+        sleep "$POLL_SECONDS"
+    done
+
+    end_ns=$(date +%s%N)
+    end_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    seconds=$(awk -v start="$started_ns" -v end="$end_ns" \
+        'BEGIN {printf "%.6f",(end-start)/1000000000}')
+    printf 'stage,start_utc,end_utc,seconds,s3_list_calls\n' \
+        > "$OUTPUT_DIR/group-readiness.timings.csv"
+    printf 'global_lambda_readiness,%s,%s,%s,%s\n' \
+        "$started_utc" "$end_utc" "$seconds" "$list_calls" \
+        >> "$OUTPUT_DIR/group-readiness.timings.csv"
+    log "Global readiness validated with $list_calls S3 listing(s) in ${seconds}s"
+}
+
+if [[ -z "$READINESS_INVENTORY" ]]; then
+    READINESS_INVENTORY="$OUTPUT_DIR/s3-readiness-inventory.tsv"
+    wait_for_global_readiness "$READINESS_INVENTORY"
+else
+    log "Using supplied shared readiness inventory: $READINESS_INVENTORY"
+fi
 
 download_unmapped_counts() {
     local expected_file="$1" output_file="$2"
@@ -228,6 +332,7 @@ for sample in "${SAMPLES[@]}"; do
         --manifest "$sample_dir/map.rad.shards.txt"
         --timings-file "$sample_dir/map.rad.timings.csv"
         --materializer "$MATERIALIZER"
+        --readiness-inventory "$READINESS_INVENTORY"
     )
     [[ -n "$AWS_PROFILE_VALUE" ]] && materialize_args+=(--profile "$AWS_PROFILE_VALUE")
     [[ -n "$NOT_BEFORE" ]] && materialize_args+=(--not-before "$NOT_BEFORE")

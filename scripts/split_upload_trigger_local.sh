@@ -28,6 +28,11 @@ PIPELINE_START_FILE="${PIPELINE_START_FILE:-}"
 # Optional driver-side core scheduler. Each R1/R2 producer returns its static
 # CPU allocation independently when decompression and split have finished.
 CORE_RELEASE_FIFO="${CORE_RELEASE_FIFO:-}"
+# Optional direct asynchronous invocation.  This is useful when the caller does
+# not have EventBridge-management permission: publish the manifest first, then
+# enqueue the same EventBridge-shaped event directly with Lambda.
+ASYNC_LAMBDA_FUNCTION="${ASYNC_LAMBDA_FUNCTION:-}"
+LAMBDA_INVOKE_LOG_DIR="${LAMBDA_INVOKE_LOG_DIR:-}"
 
 [[ -f "$R1_GZ" ]] || { echo "ERROR: R1 gzip not found: $R1_GZ" >&2; exit 1; }
 [[ -f "$R2_GZ" ]] || { echo "ERROR: R2 gzip not found: $R2_GZ" >&2; exit 1; }
@@ -43,6 +48,14 @@ command -v "$FASTQ_DECOMPRESSOR" >/dev/null 2>&1 || {
     exit 1
 }
 command -v aws >/dev/null 2>&1 || { echo "ERROR: aws not found" >&2; exit 1; }
+if [[ -n "$ASYNC_LAMBDA_FUNCTION" ]]; then
+    command -v jq >/dev/null 2>&1 || { echo "ERROR: jq not found" >&2; exit 1; }
+    [[ -n "$LAMBDA_INVOKE_LOG_DIR" ]] || {
+        echo "ERROR: LAMBDA_INVOKE_LOG_DIR is required with ASYNC_LAMBDA_FUNCTION" >&2
+        exit 1
+    }
+    mkdir -p "$LAMBDA_INVOKE_LOG_DIR"
+fi
 [[ -z "$CORE_RELEASE_FIFO" || -p "$CORE_RELEASE_FIFO" ]] || {
     echo "ERROR: CORE_RELEASE_FIFO is not a named pipe: $CORE_RELEASE_FIFO" >&2
     exit 1
@@ -83,6 +96,29 @@ record_timing() {
         fi
         printf '%s,%s\n' "$stage" "$seconds" >> "$SPLIT_TIMINGS_FILE"
     fi
+}
+
+invoke_lambda_async() {
+    local manifest_key="$1" output_folder="$2" payload response response_file status
+    [[ -n "$ASYNC_LAMBDA_FUNCTION" ]] || return 0
+    payload=$(jq -cn \
+        --arg bucket "$INPUT_TXT_BUCKET" \
+        --arg key "$manifest_key" \
+        '{"version":"0","id":"direct-async-benchmark","detail-type":"Object Created","source":"aws.s3","detail":{"bucket":{"name":$bucket},"object":{"key":$key}}}')
+    response_file="$LAMBDA_INVOKE_LOG_DIR/${output_folder}.json"
+    response=$(aws lambda invoke \
+        --function-name "$ASYNC_LAMBDA_FUNCTION" \
+        --invocation-type Event \
+        --cli-binary-format raw-in-base64-out \
+        --payload "$payload" \
+        --region "$AWS_REGION_VALUE" \
+        /dev/null)
+    status=$(jq -r '.StatusCode // 0' <<< "$response")
+    [[ "$status" == "202" ]] || {
+        echo "ERROR: Lambda rejected async invocation for $manifest_key: $response" >&2
+        return 1
+    }
+    printf '%s\n' "$response" > "$response_file"
 }
 
 status_rc() {
@@ -188,10 +224,12 @@ while true; do
         printf '%s\n%s\n' "$R1_URI" "$R2_URI" > "$MANIFEST"
         MANIFEST_UPLOAD_START_NS=$(now_ns)
         [[ -n "$FIRST_MANIFEST_UPLOAD_NS" ]] || FIRST_MANIFEST_UPLOAD_NS="$MANIFEST_UPLOAD_START_NS"
+        MANIFEST_KEY="${S3_BASE}_p${PAIR_INDEX}_input.txt"
         aws s3 cp "$MANIFEST" \
-            "s3://${INPUT_TXT_BUCKET}/${S3_BASE}_p${PAIR_INDEX}_input.txt" \
+            "s3://${INPUT_TXT_BUCKET}/${MANIFEST_KEY}" \
             --region "$AWS_REGION_VALUE" --only-show-errors --no-progress
         LAST_MANIFEST_UPLOAD_NS=$(now_ns)
+        invoke_lambda_async "$MANIFEST_KEY" "${LANE}_p${PAIR_INDEX}"
 
         record_timing "shard_p${PAIR_INDEX}_fastq_upload" \
             "$FASTQ_UPLOAD_START_NS" "$LAST_FASTQ_UPLOAD_NS"

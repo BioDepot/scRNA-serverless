@@ -36,6 +36,9 @@ Options:
   --not-before TIME          Ignore output objects older than this ISO-8601
                              time. Use the time recorded before input.txt files
                              were uploaded when a bucket may contain old data.
+  --readiness-inventory FILE Reuse a previously validated S3 listing instead
+                             of issuing ListObjectsV2. The file must contain
+                             KEY and LastModified as tab-separated columns.
   --manifest FILE            Ordered RAD URI manifest output
                              (default: OUTPUT.shards.txt).
   --timings-file FILE        Stage timing CSV
@@ -86,6 +89,7 @@ THREADS="${THREADS:-32}"
 POLL_SECONDS="${POLL_INTERVAL_SECONDS:-5}"
 TIMEOUT_SECONDS="${PROCESS_FASTQ_TIMEOUT_SEC:-1800}"
 NOT_BEFORE=""
+READINESS_INVENTORY=""
 MANIFEST_FILE=""
 TIMINGS_FILE=""
 MATERIALIZER="${MATERIALIZER:-s3-rad-materialize}"
@@ -124,6 +128,9 @@ while [[ $# -gt 0 ]]; do
         --not-before)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             NOT_BEFORE="$2"; shift 2 ;;
+        --readiness-inventory)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            READINESS_INVENTORY="$2"; shift 2 ;;
         --manifest)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             MANIFEST_FILE="$2"; shift 2 ;;
@@ -150,6 +157,8 @@ done
 [[ -n "$AWS_REGION_VALUE" ]] || die "--region or AWS_REGION is required"
 [[ -n "$RAD_PREFIX" ]] || die "--rad-prefix cannot be empty"
 [[ -f "$EXPECTED_FOLDERS_FILE" ]] || die "expected-folder file not found: $EXPECTED_FOLDERS_FILE"
+[[ -z "$READINESS_INVENTORY" || -f "$READINESS_INVENTORY" ]] || \
+    die "readiness inventory not found: $READINESS_INVENTORY"
 is_positive_integer "$THREADS" || die "--threads must be a positive integer"
 is_positive_integer "$POLL_SECONDS" || die "--poll-seconds must be a positive integer"
 is_positive_integer "$TIMEOUT_SECONDS" || die "--timeout-seconds must be a positive integer"
@@ -210,39 +219,58 @@ WAIT_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 WAIT_START_EPOCH=$(date +%s)
 LAST_PROGRESS=""
 
-log "Waiting for ${#EXPECTED_FOLDERS[@]} Lambda RAD shard(s) in s3://${OUTPUT_BUCKET}/${RAD_PREFIX}/"
+if [[ -n "$READINESS_INVENTORY" ]]; then
+    log "Validating ${#EXPECTED_FOLDERS[@]} Lambda RAD shard(s) from shared readiness inventory"
+else
+    log "Waiting for ${#EXPECTED_FOLDERS[@]} Lambda RAD shard(s) in s3://${OUTPUT_BUCKET}/${RAD_PREFIX}/"
+fi
 if [[ -n "$NOT_BEFORE" ]]; then
     log "Ignoring output objects older than $NOT_BEFORE"
 fi
 
 while true; do
     LISTING=""
-    if ! LISTING=$(aws s3api list-objects-v2 \
-        --bucket "$OUTPUT_BUCKET" \
-        --prefix "${RAD_PREFIX}/" \
-        --query 'Contents[].[Key,LastModified]' \
-        --output text "${AWS_ARGS[@]}" 2>&1); then
-        log "S3 listing failed; retrying: $(printf '%s' "$LISTING" | tail -1)"
-        sleep "$POLL_SECONDS"
-        continue
+    if [[ -n "$READINESS_INVENTORY" ]]; then
+        LISTING=$(<"$READINESS_INVENTORY")
+    else
+        if ! LISTING=$(aws s3api list-objects-v2 \
+            --bucket "$OUTPUT_BUCKET" \
+            --prefix "${RAD_PREFIX}/" \
+            --query 'Contents[].[Key,LastModified]' \
+            --output text "${AWS_ARGS[@]}" 2>&1); then
+            log "S3 listing failed; retrying: $(printf '%s' "$LISTING" | tail -1)"
+            sleep "$POLL_SECONDS"
+            continue
+        fi
     fi
 
     declare -A HAVE_RAD=() HAVE_MARKER=()
     while IFS=$'\t' read -r key modified _rest; do
         [[ -n "${key:-}" && -n "${modified:-}" ]] || continue
 
+        relative="${key#${RAD_PREFIX}/}"
+        if [[ "$relative" == */map.rad ]]; then
+            folder="${relative%/map.rad}"
+            [[ -n "${EXPECTED_SET[$folder]:-}" ]] || continue
+            object_kind=rad
+        elif [[ "$relative" == */output.txt ]]; then
+            folder="${relative%/output.txt}"
+            [[ -n "${EXPECTED_SET[$folder]:-}" ]] || continue
+            object_kind=marker
+        else
+            continue
+        fi
+
+        # Apply the timestamp check only to objects in this sample's contract.
+        # A shared inventory may contain thousands of objects for other samples.
         if [[ -n "$NOT_BEFORE_EPOCH" ]]; then
             object_epoch=$(date -u -d "$modified" +%s 2>/dev/null || echo 0)
             (( object_epoch >= NOT_BEFORE_EPOCH )) || continue
         fi
-
-        relative="${key#${RAD_PREFIX}/}"
-        if [[ "$relative" == */map.rad ]]; then
-            folder="${relative%/map.rad}"
-            [[ -n "${EXPECTED_SET[$folder]:-}" ]] && HAVE_RAD["$folder"]=1
-        elif [[ "$relative" == */output.txt ]]; then
-            folder="${relative%/output.txt}"
-            [[ -n "${EXPECTED_SET[$folder]:-}" ]] && HAVE_MARKER["$folder"]=1
+        if [[ "$object_kind" == rad ]]; then
+            HAVE_RAD["$folder"]=1
+        else
+            HAVE_MARKER["$folder"]=1
         fi
     done <<< "$LISTING"
 
@@ -261,6 +289,19 @@ while true; do
 
     if (( READY == ${#EXPECTED_FOLDERS[@]} )); then
         break
+    fi
+
+    if [[ -n "$READINESS_INVENTORY" ]]; then
+        echo "Missing or incomplete Lambda shards in shared readiness inventory:" >&2
+        for folder in "${EXPECTED_FOLDERS[@]}"; do
+            if [[ -z "${HAVE_RAD[$folder]:-}" || -z "${HAVE_MARKER[$folder]:-}" ]]; then
+                printf '  %s (map.rad=%s, output.txt=%s)\n' \
+                    "$folder" \
+                    "$([[ -n "${HAVE_RAD[$folder]:-}" ]] && echo yes || echo no)" \
+                    "$([[ -n "${HAVE_MARKER[$folder]:-}" ]] && echo yes || echo no)" >&2
+            fi
+        done
+        die "shared readiness inventory does not satisfy the expected-folder contract"
     fi
 
     ELAPSED=$(( $(date +%s) - WAIT_START_EPOCH ))
