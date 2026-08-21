@@ -28,6 +28,8 @@ Options:
   --output-dir DIR          Required with --sample-manifest. Outputs are
                             written as DIR/SAMPLE/{map.rad,unmapped_bc_count.bin}.
   --threads N               Materializer threads (default: 32).
+  --sample-workers N        Grouped mode only: samples materialized in
+                            parallel (default: 4).
   --poll-seconds N          Poll interval (default: 1).
   --timeout-seconds N       Wait timeout (default: 43200).
   --timings-file FILE       Materializer stage timings.
@@ -61,6 +63,7 @@ OUTPUT_FILE=""
 OUTPUT_DIR=""
 SAMPLE_MANIFEST=""
 THREADS="${MATERIALIZER_THREADS:-32}"
+SAMPLE_WORKERS="${SAMPLE_MATERIALIZER_WORKERS:-4}"
 POLL_SECONDS="${POLL_INTERVAL_SECONDS:-1}"
 TIMEOUT_SECONDS="${PROCESS_FASTQ_TIMEOUT_SEC:-43200}"
 TIMINGS_FILE=""
@@ -85,6 +88,9 @@ while [[ $# -gt 0 ]]; do
         --threads)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             THREADS="$2"; shift 2 ;;
+        --sample-workers)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            SAMPLE_WORKERS="$2"; shift 2 ;;
         --poll-seconds)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             POLL_SECONDS="$2"; shift 2 ;;
@@ -114,6 +120,7 @@ done
 [[ -f "$STATE_FILE" ]] || die "state file not found: $STATE_FILE"
 [[ -n "$COMMAND" ]] || die "status, wait, or materialize is required"
 is_positive_integer "$THREADS" || die "--threads must be a positive integer"
+is_positive_integer "$SAMPLE_WORKERS" || die "--sample-workers must be a positive integer"
 is_positive_integer "$POLL_SECONDS" || die "--poll-seconds must be a positive integer"
 is_positive_integer "$TIMEOUT_SECONDS" || die "--timeout-seconds must be a positive integer"
 command -v aws >/dev/null 2>&1 || die "required command not found: aws"
@@ -263,6 +270,7 @@ case "$COMMAND" in
                 --output-dir "$OUTPUT_DIR"
                 --region "$AWS_REGION_VALUE"
                 --threads "$THREADS"
+                --sample-workers "$SAMPLE_WORKERS"
                 --poll-seconds "$POLL_SECONDS"
                 --timeout-seconds "$TIMEOUT_SECONDS"
             )

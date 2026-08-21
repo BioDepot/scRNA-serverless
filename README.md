@@ -44,5 +44,7 @@ The driver launches an **m5dn.8xlarge**, stripes both NVMe disks as RAID 0, spli
 | [Asynchronous Lambda Runbook](docs/ASYNC_LAMBDA_RUNBOOK.md) | Nonblocking shard submission, atomic S3 claims, duplicate delivery, recovery, and later RAD materialization |
 | [Reproducibility Notes](docs/REPRODUCIBILITY_NOTES.md) | Automatic fallbacks for AWS account limits, configuration reference, and local disk requirements |
 | [Direct S3 RAD Materializer](docs/S3_RAD_MATERIALIZER.md) | Ranged-download implementation and PBMC 1K benchmark |
+| [Production Async Benchmark](docs/PRODUCTION_BENCHMARK_2026-08-21.md) | Final PBMC and KO runtime and cost tables |
+| [KO Sample-Eager Benchmark](docs/KO_SAMPLE_EAGER_BENCHMARK_2026-08-21.md) | Four-way grouped materialization, Lambda profile, and retained evidence |
 | [Piscem Single-Shard NVMe Profile](docs/PISCEM_SHARD_PROFILE.md) | Six-thread PBMC shard timings for index loading, mapping, and RAD output |
 | [Cloud Piscem Profiling Handoff](docs/CLOUD_PISCEM_PROFILE_HANDOFF.md) | Reproduce and diagnose one PBMC 1K shard on cloud NVMe |

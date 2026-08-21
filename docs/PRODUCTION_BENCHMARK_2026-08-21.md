@@ -1,9 +1,9 @@
 # Production asynchronous benchmark
 
 This is the production comparison for the final asynchronous workflow. It uses
-the 2026-08-21 PBMC reruns and the KO result with the final one-inventory
-grouped materializer. The local Piscem measurements are used only to calculate
-speedup; they are not separate rows in these tables.
+the 2026-08-21 PBMC reruns and the final KO Lambda-only rerun with the
+sample-eager grouped materializer. The local Piscem measurements are used only
+to calculate speedup; they are not separate rows in these tables.
 
 ## Runtime
 
@@ -13,7 +13,7 @@ All times are wall-clock seconds.
 |---|---:|---:|---:|---:|---:|---:|
 | PBMC 1K | 39.187 | 18.930 | 20.799 | 1.519 | 61.505 | 1.323x |
 | PBMC 10K | 339.549 | 21.173 | 21.165 | 6.621 | 367.335 | 2.128x |
-| KO, 13 samples | 1,206.075 | 31.556 | 13.063 | 186.625 | 1,405.763 | 6.187x |
+| KO, 13 samples | 1,215.181 | 32.055 | 7.565 | 91.036 | 1,313.782 | 6.620x |
 
 `Mean Lambda alignment` is the mean per-invocation
 `stream_and_piscem_seconds` recorded by the Lambda instrumentation: 18
@@ -31,17 +31,19 @@ total = split_and_upload + post_split_before_merge + download_and_merge
 ```
 
 `Post-split, before merge` therefore includes the controller transition,
-remaining Lambda readiness wait, ordered-manifest preparation, and other small
-coordination costs. `Download and merge` is the measured parallel direct-S3 RAD
-materializer time.
+ordered-manifest preparation, and other small coordination costs. `Download
+and merge` is the measured parallel direct-S3 RAD materializer wall time. Some
+remaining Lambda readiness can overlap sample materialization, so it is not a
+separate additive stage in the KO row.
 
-The KO total is the final reconstructed production path. It replaces the
-original 288.948232-second per-sample-listing materialization with the tested
-197.452990-second one-inventory grouped materialization. The final download and
-merge column is the 186.624613 seconds spent in the sample materializers; the
-remaining inventory and validation overhead falls in the post-split column.
-The 13 regenerated KO RADs were byte-identical to the original outputs and all
-passed `radtk` parsing.
+The KO row is a directly measured Lambda-only rerun; the local baseline was not
+rerun. One global readiness poller launched up to four complete samples at a
+time, with eight materializer threads per sample and 32 threads in aggregate.
+The sample materializers performed 335.188445 seconds of summed work in a
+91.035595-second wall window. The full grouped coordinator took 96.169761
+seconds, including the last Lambda readiness wait. All 13 RADs passed `radtk`,
+and all per-sample read and mapped-read totals exactly matched the retained
+local baseline.
 
 ## Cost
 
@@ -52,7 +54,7 @@ ancillary services are excluded.
 |---|---:|---:|---:|
 | PBMC 1K | $0.037176 | $0.060743 | $0.097920 |
 | PBMC 10K | $0.222034 | $0.589648 | $0.811682 |
-| KO, 13 samples | $0.849705 | $5.024941 | $5.874646 |
+| KO, 13 samples | $0.794108 | $5.095134 | $5.889242 |
 
 Costs use an on-demand Linux `m5dn.8xlarge` in `us-east-2` at $2.176/hour.
 Lambda cost includes x86 compute at $0.0000166667/GB-second, requests at

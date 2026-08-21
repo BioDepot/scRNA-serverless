@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
 # Calculate EC2 and Lambda list-price costs for the retained KO baseline and
-# asynchronous benchmark. S3 and ancillary AWS services are intentionally
-# excluded. The optimized async row reuses the measured Lambda billing and the
-# reconstructed end-to-end time from the one-inventory materialization test.
+# final sample-eager asynchronous benchmark. S3 and ancillary AWS services are
+# intentionally excluded.
 
 set -euo pipefail
 
@@ -20,7 +19,6 @@ Defaults reproduce the retained 2026-08-20/21 KO calculation. Overrides:
   LAMBDA_EPHEMERAL_RATE         default: 0.0000000309 USD/GB-second
   KO_BASELINE_DIR
   KO_ASYNC_DIR
-  KO_OPTIMIZED_DIR
   OUTPUT_FILE                   optional Markdown output path
 
 The calculator uses the retained Lambda configuration and CloudWatch REPORT
@@ -95,7 +93,7 @@ calculate_costs() {
 }
 
 emit_report() {
-    local original_json="$1" optimized_json="$2"
+    local final_json="$1"
 
     cat <<EOF
 # KO benchmark EC2 and Lambda cost calculation
@@ -130,11 +128,8 @@ credits, or taxes. S3 and ancillary services are excluded.
 |---|---:|---:|---:|---:|---:|---:|---:|
 EOF
     jq -r '
-      "| Original measured async | \(.baseline_seconds) | $\(.baseline_ec2_cost * 1000000 | round / 1000000) | \(.async_seconds) | $\(.async_ec2_cost * 1000000 | round / 1000000) | $\(.lambda_total_cost * 1000000 | round / 1000000) | $\(.async_total_cost * 1000000 | round / 1000000) | \(.async_to_baseline_cost_ratio * 1000 | round / 1000)x |"' \
-        <<<"$original_json"
-    jq -r '
-      "| Optimized materialization | \(.baseline_seconds) | $\(.baseline_ec2_cost * 1000000 | round / 1000000) | \(.async_seconds) | $\(.async_ec2_cost * 1000000 | round / 1000000) | $\(.lambda_total_cost * 1000000 | round / 1000000) | $\(.async_total_cost * 1000000 | round / 1000000) | \(.async_to_baseline_cost_ratio * 1000 | round / 1000)x |"' \
-        <<<"$optimized_json"
+      "| Final sample-eager async | \(.baseline_seconds) | $\(.baseline_ec2_cost * 1000000 | round / 1000000) | \(.async_seconds) | $\(.async_ec2_cost * 1000000 | round / 1000000) | $\(.lambda_total_cost * 1000000 | round / 1000000) | $\(.async_total_cost * 1000000 | round / 1000000) | \(.async_to_baseline_cost_ratio * 1000 | round / 1000)x |"' \
+        <<<"$final_json"
 
     cat <<EOF
 
@@ -145,15 +140,14 @@ EOF
 - Billed duration: **${billed_ms} ms**
 - Memory: **${memory_mb} MB**
 - Ephemeral storage: **${ephemeral_mb} MB**
-- Lambda compute: **\$$(jq -r '.lambda_compute_cost' <<<"$original_json")**
-- Lambda requests: **\$$(jq -r '.lambda_request_cost' <<<"$original_json")**
-- Lambda additional ephemeral storage: **\$$(jq -r '.lambda_ephemeral_cost' <<<"$original_json")**
-- Lambda total: **\$$(jq -r '.lambda_total_cost' <<<"$original_json")**
+- Lambda compute: **\$$(jq -r '.lambda_compute_cost' <<<"$final_json")**
+- Lambda requests: **\$$(jq -r '.lambda_request_cost' <<<"$final_json")**
+- Lambda additional ephemeral storage: **\$$(jq -r '.lambda_ephemeral_cost' <<<"$final_json")**
+- Lambda total: **\$$(jq -r '.lambda_total_cost' <<<"$final_json")**
 
-The optimized row is reconstructed from the original measured end-to-end run
-by replacing its 288.948232-second materialization with the independently
-measured 197.452990-second one-inventory materialization. It does not represent
-a second Lambda run, so the measured Lambda bill is unchanged.
+This is the directly measured 2026-08-21 Lambda-only rerun with four concurrent
+sample materializers and a shared 32-thread budget. It is not reconstructed
+from an earlier run.
 
 An unused monthly Lambda free tier would reduce compute and request charges,
 but this report does not assume that account-level allowance is available.
@@ -169,8 +163,7 @@ LAMBDA_COMPUTE_RATE="${LAMBDA_COMPUTE_RATE:-0.0000166667}"
 LAMBDA_REQUEST_RATE="${LAMBDA_REQUEST_RATE:-0.0000002}"
 LAMBDA_EPHEMERAL_RATE="${LAMBDA_EPHEMERAL_RATE:-0.0000000309}"
 KO_BASELINE_DIR="${KO_BASELINE_DIR:-/mnt/nvme/benchmark-runs/ko-piscem-baseline-20260820-dev1}"
-KO_ASYNC_DIR="${KO_ASYNC_DIR:-/mnt/nvme/benchmark-runs/ko-async-7gib-20260820-dev1}"
-KO_OPTIMIZED_DIR="${KO_OPTIMIZED_DIR:-/mnt/nvme/benchmark-runs/ko-grouped-single-inventory-20260821}"
+KO_ASYNC_DIR="${KO_ASYNC_DIR:-/mnt/nvme/benchmark-runs/ko-async-sample-eager-20260821-dev1}"
 OUTPUT_FILE="${OUTPUT_FILE:-}"
 
 for command_name in jq sed awk; do
@@ -182,18 +175,16 @@ done
 
 baseline_result="$KO_BASELINE_DIR/result.txt"
 async_result="$KO_ASYNC_DIR/result.txt"
-optimized_result="$KO_OPTIMIZED_DIR/result.txt"
 expected_file="$KO_ASYNC_DIR/expected_rad_folders.txt"
 function_config="$KO_ASYNC_DIR/lambda-function-configuration.json"
 report_events="$KO_ASYNC_DIR/cloudwatch-report-events.json"
-for evidence_file in "$baseline_result" "$async_result" "$optimized_result" \
+for evidence_file in "$baseline_result" "$async_result" \
     "$expected_file" "$function_config" "$report_events"; do
     require_file "$evidence_file"
 done
 
 baseline_seconds=$(result_value wall_seconds "$baseline_result")
-original_async_seconds=$(result_value first_decompressor_to_final_sample_rads_seconds "$async_result")
-optimized_async_seconds=$(result_value reconstructed_pipeline_seconds "$optimized_result")
+final_async_seconds=$(result_value first_decompressor_to_final_sample_rads_seconds "$async_result")
 expected_invocations=$(awk 'NF {count++} END {print count + 0}' "$expected_file")
 report_count=$(jq '[.events[] | select(.message | contains("REPORT RequestId:"))] | length' "$report_events")
 billed_ms=$(jq -r '.events[].message' "$report_events" \
@@ -205,8 +196,7 @@ architecture=$(jq -r '.Architectures[0]' "$function_config")
 
 for numeric_pair in \
     "baseline_seconds:$baseline_seconds" \
-    "original_async_seconds:$original_async_seconds" \
-    "optimized_async_seconds:$optimized_async_seconds" \
+    "final_async_seconds:$final_async_seconds" \
     "billed_ms:$billed_ms"; do
     require_positive_number "${numeric_pair%%:*}" "${numeric_pair#*:}"
 done
@@ -214,14 +204,12 @@ done
 (( report_count == expected_invocations )) || \
     die "retained KO evidence has $report_count REPORT records for $expected_invocations expected shards"
 
-original_json=$(calculate_costs "$baseline_seconds" "$original_async_seconds" \
-    "$billed_ms" "$report_count" "$memory_mb" "$ephemeral_mb")
-optimized_json=$(calculate_costs "$baseline_seconds" "$optimized_async_seconds" \
+final_json=$(calculate_costs "$baseline_seconds" "$final_async_seconds" \
     "$billed_ms" "$report_count" "$memory_mb" "$ephemeral_mb")
 
 if [[ -n "$OUTPUT_FILE" ]]; then
     mkdir -p "$(dirname "$OUTPUT_FILE")"
-    emit_report "$original_json" "$optimized_json" | tee "$OUTPUT_FILE"
+    emit_report "$final_json" | tee "$OUTPUT_FILE"
 else
-    emit_report "$original_json" "$optimized_json"
+    emit_report "$final_json"
 fi
