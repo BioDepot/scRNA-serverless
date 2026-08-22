@@ -17,10 +17,11 @@
 #   publication. Reviewers clone the repo and run the pipeline; the script
 #   launches an EC2 instance from that AMI automatically.
 #
-# Runtime benchmark follow-up:
-#   Keep the persistent index in /opt on the AMI, but copy it to instance-store
-#   NVMe outside the timed region and point INDEX_PREFIX/PISCEM_INDEX_PREFIX at
-#   the NVMe copy. A cold local baseline must not read the index from root EBS.
+# Runtime setup policy:
+#   Keep only persistent seed assets in the AMI. After launch, download
+#   scripts/bootstrap_ami_runtime.sh from GitHub. It prepares instance-store
+#   NVMe, checks out the resolved repository commit, and copies the index there
+#   outside the timed region. Runtime-script changes do not require a new AMI.
 #
 # How the AMI was built (steps performed by this script):
 #   1. Launch a fresh Ubuntu 22.04 EC2 instance

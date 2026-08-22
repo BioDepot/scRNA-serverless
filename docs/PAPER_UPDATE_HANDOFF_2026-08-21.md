@@ -118,16 +118,17 @@ The speedups computed from the three-trial arm means are 1.319x for PBMC 1K,
 
 ## Three-replicate production measurements
 
-All cells are the arithmetic mean ± sample standard deviation in wall-clock
-seconds across three trials. `Mean Lambda alignment` is first calculated over
-all invocations within each trial, then summarized across trials. It overlaps
-splitting/upload, so it is not additive with the wall stages.
+All cells are the arithmetic mean ± standard error in wall-clock seconds
+across three trials, where `SE = sample SD / sqrt(3)`. `Mean Lambda alignment`
+is first calculated over all invocations within each trial, then summarized
+across trials. It overlaps splitting/upload, so it is not additive with the
+wall stages.
 
 | Dataset | Local baseline | Split/upload | Mean Lambda alignment | Post-split before merge | Download/merge | Async total | Speedup from arm means |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PBMC 1K | 80.753 ± 0.537 | 39.063 ± 0.120 | 19.663 ± 0.834 | 20.528 ± 0.969 | 1.613 ± 0.110 | 61.204 ± 0.955 | 1.319x |
-| PBMC 10K | 780.502 ± 1.155 | 338.881 ± 3.780 | 21.463 ± 0.299 | 23.580 ± 2.400 | 7.067 ± 0.519 | 369.528 ± 3.469 | 2.112x |
-| KO, 13 samples | 8,727.677 ± 27.409 | 1,215.728 ± 7.949 | 32.318 ± 0.252 | 7.509 ± 0.053 | 91.355 ± 1.184 | 1,314.592 ± 6.839 | 6.639x |
+| PBMC 1K | 80.753 ± 0.310 | 39.063 ± 0.069 | 19.663 ± 0.481 | 20.528 ± 0.560 | 1.613 ± 0.064 | 61.204 ± 0.552 | 1.319x |
+| PBMC 10K | 780.502 ± 0.667 | 338.881 ± 2.182 | 21.463 ± 0.173 | 23.580 ± 1.385 | 7.067 ± 0.299 | 369.528 ± 2.003 | 2.112x |
+| KO, 13 samples | 8,727.677 ± 15.824 | 1,215.728 ± 4.589 | 32.318 ± 0.146 | 7.509 ± 0.030 | 91.355 ± 0.684 | 1,314.592 ± 3.949 | 6.639x |
 
 The additive async definition is:
 
@@ -138,14 +139,14 @@ speedup = local_baseline / async_total
 
 The individual arm times are:
 
-| Dataset | Arm | Trial 1 (s) | Trial 2 (s) | Trial 3 (s) | Mean (s) | SD (s) |
+| Dataset | Arm | Trial 1 (s) | Trial 2 (s) | Trial 3 (s) | Mean (s) | SE (s) |
 |---|---|---:|---:|---:|---:|---:|
-| PBMC 1K | Local Piscem | 81.370129 | 80.492631 | 80.395011 | 80.752590 | 0.537027 |
-| PBMC 1K | Final async | 61.505086 | 60.134026 | 61.972187 | 61.203766 | 0.955408 |
-| PBMC 10K | Local Piscem | 781.662519 | 779.353604 | 780.488986 | 780.501703 | 1.154510 |
-| PBMC 10K | Final async | 367.335378 | 373.526887 | 367.720768 | 369.527678 | 3.468773 |
-| KO | Local Piscem | 8696.991876 | 8736.309241 | 8749.730907 | 8727.677341 | 27.408641 |
-| KO | Final async | 1313.782067 | 1308.194146 | 1321.800187 | 1314.592133 | 6.839097 |
+| PBMC 1K | Local Piscem | 81.370129 | 80.492631 | 80.395011 | 80.752590 | 0.310053 |
+| PBMC 1K | Final async | 61.505086 | 60.134026 | 61.972187 | 61.203766 | 0.551605 |
+| PBMC 10K | Local Piscem | 781.662519 | 779.353604 | 780.488986 | 780.501703 | 0.666557 |
+| PBMC 10K | Final async | 367.335378 | 373.526887 | 367.720768 | 369.527678 | 2.002697 |
+| KO | Local Piscem | 8696.991876 | 8736.309241 | 8749.730907 | 8727.677341 | 15.824386 |
+| KO | Final async | 1313.782067 | 1308.194146 | 1321.800187 | 1314.592133 | 3.948554 |
 
 The replicate runner uses a fresh `m5dn.8xlarge` made from the minimal AMI, a
 two-device NVMe RAID0, 32 local Piscem threads, the same four-million-read shard
@@ -215,6 +216,10 @@ the authoritative source for the updated runtime claims.
   keys or AWS credential directories.
 - Instance-store setup discovers only EC2 NVMe instance-store devices, creates
   RAID0 plus XFS, and never selects the EBS root automatically.
+- Runtime setup is downloaded from GitHub rather than frozen into the AMI. It
+  resolves the requested ref to an exact commit, records that revision, and
+  copies and verifies the baked Piscem index on instance-store NVMe before any
+  timed local baseline.
 - AWS CLI v2 is installed/configured at runtime, and benchmark instances use an
   IAM instance profile rather than baked credentials.
 - A clean boot, secret check, PBMC 1K Lambda run, materialization, and
@@ -226,6 +231,8 @@ the authoritative source for the updated runtime claims.
 
 - `scripts/e2e_serverless_pbmc.sh`: generalized driver/run workflow, CPU
   policy, async submission, timing, cleanup gates, and AMI runtime bootstrap.
+- `scripts/bootstrap_ami_runtime.sh`: GitHub-resolved mutable runtime bootstrap,
+  pinned-revision support, NVMe preparation, and verified index staging.
 - `scripts/split_upload_trigger_local.sh`: streaming split/upload/trigger path.
 - `scrna-pipeline/map.py`: S3 claims, FIFO streaming, Piscem execution, and
   timing instrumentation.
@@ -241,11 +248,12 @@ the authoritative source for the updated runtime claims.
 - `scripts/calculate_pbmc_benchmark_costs.sh` and
   `scripts/calculate_ko_benchmark_costs.sh`: reproducible cost formulas.
 - `scripts/summarize_benchmark_replicates.py`: validates the additive stage
-  accounting and produces per-trial and mean/sample-SD manuscript tables.
+  accounting and produces exact per-trial and mean/standard-error manuscript
+  tables.
 - `docs/three_replicate_benchmark_2026-08-21.tsv`: exact source measurements
   and original evidence paths for all nine paired trials.
 - `docs/THREE_REPLICATE_BENCHMARK_2026-08-21.md`: generated per-trial,
-  mean/sample-SD, median/range, and speedup report.
+  mean/standard-error, median/range, and speedup report.
 - `docs/PRODUCTION_BENCHMARK_2026-08-21.md`: retained trial-1 production table
   and cost calculation.
 - `docs/KO_SAMPLE_EAGER_BENCHMARK_2026-08-21.md`: final KO optimization and
@@ -264,8 +272,8 @@ CloudWatch logs were not cleaned up.
 
 ## Manuscript cautions and remaining work
 
-1. Use the three-trial means and sample standard deviations for headline
-   performance claims, while retaining the individual trials and ranges.
+1. Use the three-trial means and standard errors for headline performance
+   claims, while retaining the individual trials and ranges.
 2. State the exact timed boundaries and that alevin-fry is excluded equally
    from both arms.
 3. Report both driver EC2 time and Lambda compute; do not describe the faster
@@ -279,7 +287,6 @@ CloudWatch logs were not cleaned up.
 7. Keep destructive AWS and S3 cleanup gated. The replicate evidence and
    CloudWatch profiles have been copied, but the retained cloud resources are
    still useful for development audit and follow-up profiling.
-8. Update the AMI runtime setup to copy the baked Piscem index from root EBS to
-   instance-store NVMe before timed local baselines, and point both PBMC and KO
-   baseline scripts at that copy. The first cold-EBS setup attempt is excluded
-   from the replicate analysis.
+8. Use a pinned Git commit or release tag, rather than mutable `master`, for
+   publication runs. The first cold-EBS setup attempt remains excluded from
+   the replicate analysis.

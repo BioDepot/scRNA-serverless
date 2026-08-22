@@ -48,6 +48,11 @@ After validation, set `DEFAULT_SEED_AMI_ID` in
 made, the existing 30 GiB public AMI remains the default and the driver's
 snapshot-minimum check prevents an invalid 20 GiB launch request.
 
+The validated 20 GiB seed created on 2026-08-21 is private AMI
+`ami-0aec4fdc8adb765ce` in `us-east-2`. Account users can select it now with
+`SEED_AMI_ID=ami-0aec4fdc8adb765ce`. Runtime-script updates are supplied by the
+GitHub bootstrap below and do not require replacing this AMI.
+
 ## Prepare the SSD/NVMe workspace
 
 For a new runtime host, the combined installer installs AWS CLI v2, configures
@@ -100,28 +105,58 @@ other EC2 types with local NVMe. It fails explicitly if no instance-store NVMe
 is available instead of putting FASTQs and intermediate data on the small EBS
 root.
 
-### Runtime index placement follow-up
+### GitHub runtime bootstrap
 
 The seed AMI stores the 187 MiB Piscem index under `/opt/scrna-seed` on the
-small EBS root so it survives instance creation. Before a timed local Piscem
-baseline, runtime setup should copy that directory to instance-store NVMe and
-set `INDEX_PREFIX` or `PISCEM_INDEX_PREFIX` to the NVMe copy. A cold load from
-the baked EBS path added about 35.5 seconds to an otherwise comparable PBMC 1K
-baseline during the three-replicate setup and that attempt was excluded.
+small EBS root so it survives instance creation. Runtime behavior is kept out
+of the AMI: a bootstrap downloaded from GitHub resolves the requested branch,
+tag, or commit, downloads the matching NVMe helper, prepares instance-store,
+checks out that exact repository revision on NVMe, and copies and verifies the
+index there. Runtime setup can therefore change without rebuilding the AMI.
 
-Until this copy is automated in the AMI/runtime scripts, use:
+Download the bootstrap before executing it so it can be inspected:
 
 ```bash
-mkdir -p /mnt/nvme/reference/index_output_transcriptome
-rsync -a /opt/scrna-seed/index_output_transcriptome/ \
-  /mnt/nvme/reference/index_output_transcriptome/
-export INDEX_PREFIX=/mnt/nvme/reference/index_output_transcriptome/index_output_transcriptome
-export PISCEM_INDEX_PREFIX="$INDEX_PREFIX"
+curl --fail --location --silent --show-error \
+  https://raw.githubusercontent.com/BioDepot/scRNA-serverless/master/scripts/bootstrap_ami_runtime.sh \
+  --output /tmp/scrna-bootstrap.sh
+
+bash /tmp/scrna-bootstrap.sh --dry-run
+bash /tmp/scrna-bootstrap.sh --yes --discard-container-cache
+source /mnt/nvme/scrna-runtime.env
 ```
 
-The copy and any cache warming are environment preparation and must remain
-outside the measured interval. The Lambda image build can continue to read the
-baked seed from `/opt/scrna-seed`; this note concerns the local EC2 baseline.
+The default `master` ref intentionally follows current repository updates. For
+a reproducible or publication run, pin both the downloaded bootstrap and its
+checkout to the same immutable commit or release tag:
+
+```bash
+SCRNA_REF=<git-commit-or-tag>
+curl --fail --location --silent --show-error \
+  "https://raw.githubusercontent.com/BioDepot/scRNA-serverless/${SCRNA_REF}/scripts/bootstrap_ami_runtime.sh" \
+  --output /tmp/scrna-bootstrap.sh
+bash /tmp/scrna-bootstrap.sh --dry-run --ref "$SCRNA_REF"
+bash /tmp/scrna-bootstrap.sh --yes --discard-container-cache --ref "$SCRNA_REF"
+source /mnt/nvme/scrna-runtime.env
+```
+
+The bootstrap writes the resolved 40-character commit, bootstrap and
+downloaded-helper SHA-256 values, paths, and index-copy timestamps to
+`/mnt/nvme/scrna-runtime-bootstrap.tsv`. It writes shell exports for
+`SCRNA_REPO_ROOT`, `SCRNA_RUNTIME_COMMIT`, `INDEX_PREFIX`, and
+`PISCEM_INDEX_PREFIX` to `/mnt/nvme/scrna-runtime.env`.
+
+The bootstrap requires `--yes` before the NVMe helper may format automatically
+discovered EC2 instance-store devices. The helper still refuses to select the
+EBS root. Omit `--discard-container-cache` when an existing root-volume Docker
+cache must be preserved; setup will stop instead of removing it.
+
+The index copy and any cache warming are environment preparation and must
+remain outside the measured interval. A cold load from the baked EBS path added
+about 35.5 seconds to an otherwise comparable PBMC 1K baseline during the
+three-replicate setup, and that attempt was excluded. The Lambda image build
+can continue to read the baked seed from `/opt/scrna-seed`; the NVMe copy is for
+the local EC2 baseline.
 
 ## Clean an instance before snapshotting
 
